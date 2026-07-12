@@ -1,0 +1,9 @@
+---
+# pgAdmin stack defaults (was roles/pgadmin/defaults/main.yml).
+pgadmin_version: "9.16"
+pgadmin_image: "dpage/pgadmin4:{{ pgadmin_version }}"
+pgadmin_port: 5050
+
+# pgAdmin login credentials
+pgadmin_email: "admin@local.dev"
+pgadmin_password: "changeme"

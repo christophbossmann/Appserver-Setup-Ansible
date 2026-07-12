@@ -1,0 +1,9 @@
+# Per-stack settings for compose_stack (see roles/compose_stack/defaults/main.yml).
+dir: "{{ komodo_data_dir }}"
+compose_mode: "0600"   # compose file contains credentials
+dirs:
+  - backups
+  - "{{ komodo_periphery_root_dir }}"
+health_url: "http://127.0.0.1:{{ komodo_port }}"
+health_status: [200, 301, 302]
+health_retries: 20

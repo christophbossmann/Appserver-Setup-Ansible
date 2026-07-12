@@ -1,0 +1,15 @@
+---
+# Postgres stack defaults (was roles/postgres/defaults/main.yml).
+# Credentials are overridden per play via vars/postgres.yml.
+# Image convention (repo-wide): templates reference ONLY <name>_image;
+# <service>_version is the bump knob the _image default is composed from.
+# Override _image entirely for registry mirrors or @sha256 digest pins.
+postgres_version: "16"
+postgres_image: "postgres:{{ postgres_version }}"
+postgres_data_dir: /opt/postgres/data
+postgres_port: 5432
+
+# Credentials — override in vars
+postgres_user: "n8n"
+postgres_password: "changeme"
+postgres_db: "n8n"

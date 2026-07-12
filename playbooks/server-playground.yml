@@ -1,0 +1,38 @@
+---
+# =============================================================================
+# Claude Playground – deploy/iterate playbook (with public Caddy route)
+#
+# Routes playground.<global_host> through your existing host Caddy via a
+# loopback-published port, protected by HTTP Basic Auth.
+#
+# Requires (all auto-loaded):
+#   - group_vars/all/playground.yml     (app config) + vault.yml (secrets)
+#   - group_vars/all/proxy_routes.yml   (proxy_routes_base: the *.<host> wildcards)
+#   - host_vars/<host>.yml              (global_host, internal_host, acme_dns config)
+#
+# Usage:
+#   ansible-playbook -i inventory.ini playbooks/server-playground.yml --limit myserver
+#
+# Idempotent, safe to re-run. The caddy role re-renders the FULL Caddyfile from
+# whatever proxy_routes_* are loaded this run, so run it with the vars of every
+# service that should stay routed on this host (here: base + playground).
+# =============================================================================
+
+- name: Claude Playground
+  hosts: all
+  become: true
+  # No vars_files: app config lives in group_vars/all/playground.yml (auto-
+  # loaded), secrets in group_vars/all/vault.yml (vault_* convention).
+  # Every role is tag-gated with its own name (fast single-service deploys,
+  # e.g. --tags playground,caddy); the edge roles share the extra tag 'caddy'
+  # so one tag reruns the whole route pipeline (render + tunnel + DNS + check).
+  roles:
+    - { role: hardening, tags: [hardening] }
+    - { role: tailscale, tags: [tailscale] }
+    - { role: users, tags: [users] }
+    - { role: docker, tags: [docker] }            # idempotent; remove if Docker is guaranteed present
+    - { role: claude_playground, tags: [playground] }
+    - { role: caddy, tags: [caddy] }                             # renders playground.<global_host> (route selected via caddy_services)
+    - { role: cloudflared, tags: [caddy, cloudflared] }          # tunnel ingress (when cloudflared_manage_public_hostnames=true)
+    - { role: cloudflare_dns, tags: [caddy, cloudflare_dns] }    # CNAME -> <tunnel-id>.cfargotunnel.com (when cloudflare_manage_dns_records=true)
+    - { role: caddy_post_check, tags: [caddy, caddy_post_check] }

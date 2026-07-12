@@ -1,0 +1,44 @@
+---
+# === Default playground app =========================================================
+# Seeds the workspace docker-compose.yml (a tiny "Welcome to Playground" text
+# page on the fixed public port) and brings it up via the broker, so the
+# playground.<host> route has a backend out of the box.
+#
+# force: false -> if a docker-compose.yml already exists (e.g. the AI replaced
+# it), it is left untouched. Bringing it "up" is idempotent and simply starts
+# whatever stack currently lives in the workspace.
+
+- name: Seed the default playground compose (only if none exists)
+  ansible.builtin.template:
+    src: landing-compose.yml.j2
+    dest: "{{ playground_ctl_workspace }}/docker-compose.yml"
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "0664"
+    force: false
+
+- name: Seed the default landing page (only if none exists)
+  ansible.builtin.copy:
+    src: landing-index.html
+    dest: "{{ playground_ctl_workspace }}/index.html"
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "0644"   # world-readable so the nginx container can serve it
+    force: false
+
+# Uses the broker on purpose (dogfoods the exact path the AI uses). Runs as root,
+# which owns the broker socket. Idempotent: a no-op if the stack is already up.
+- name: Ensure the workspace stack is running
+  ansible.builtin.command:
+    cmd: "{{ playground_ctl_bin }} playground compose up"
+  register: _pgctl_app_up
+  changed_when: "(_pgctl_app_up.stdout + _pgctl_app_up.stderr) is search('Started|Creating|Created|Recreating|Recreated|Built')"
+  failed_when: _pgctl_app_up.rc != 0
+
+- name: Default playground app
+  ansible.builtin.debug:
+    msg: >-
+      Playground app is up on 127.0.0.1:{{ playground_public_port }}.
+      The playground.<host> route proxies here. Replace
+      {{ playground_ctl_workspace }}/docker-compose.yml to run something else
+      (keep publishing on 127.0.0.1:{{ playground_public_port }}).

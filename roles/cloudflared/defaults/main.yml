@@ -1,0 +1,69 @@
+---
+# Install cloudflared package only. This does not create or attach a tunnel by itself.
+cloudflared_install: true
+
+# Cloudflared release package to install.
+cloudflared_package_url: "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
+cloudflared_package_dest: "/tmp/cloudflared.deb"
+
+# Cloudflared configuration directory for locally managed tunnels.
+cloudflared_config_dir: "/etc/cloudflared"
+cloudflared_config_dir_mode: "0755"
+
+# Optional local files to copy from the controller to the server.
+# Use these for classic/local config-file tunnels.
+cloudflared_config_src: ""
+cloudflared_config_dest: "{{ cloudflared_config_dir }}/config.yml"
+cloudflared_credentials_src: ""
+cloudflared_credentials_dest: "{{ cloudflared_config_dir }}/creds.json"
+
+# Service installation is opt-in.
+# false = install cloudflared binary/package only; do not attach to a tunnel.
+cloudflared_service_install: false
+
+# For remotely managed Cloudflare Tunnel connectors created in the Zero Trust UI.
+cloudflared_tunnel_connector_token: ""
+
+# Service state after installation.
+cloudflared_service_enabled: true
+cloudflared_service_state: started
+
+
+# Optional: manage remotely configured Cloudflare Tunnel public hostnames via API.
+# This role updates the remotely managed Tunnel ingress configuration.
+# Hostnames represented in proxy_routes are treated as managed: setting
+# tunnel_enabled=false removes that hostname from the Tunnel routing. Other
+# existing Tunnel hostnames are preserved unless cloudflared_prune_public_hostnames=true.
+cloudflared_manage_public_hostnames: false
+cloudflared_prune_public_hostnames: false
+cloudflared_account_id: ""
+cloudflared_tunnel_id: ""
+cloudflare_api_token: ""
+
+# Explicit public hostname definitions. Prefer proxy_routes for new configs.
+# Example:
+# cloudflared_public_hostnames:
+#   - hostname: n8n.cfdev.example.com
+#     service: https://localhost:443
+#     origin_request:
+#       originServerName: n8n.cfdev.example.com
+cloudflared_public_hostnames: []
+
+# Derive Cloudflare Tunnel public hostnames from proxy_routes when:
+#   tunnel_enabled: true
+#   tunnel_type: cloudflare (or omitted, when cloudflared_default_tunnel_type=cloudflare)
+# Route fields used here:
+#   tunnel_enabled: true/false
+#   tunnel_type: cloudflare
+#   tunnel_service: service URL cloudflared forwards to, default cloudflared_default_tunnel_service
+#   tunnel_origin_server_name: optional TLS SNI/origin server name
+#   tunnel_origin_request: optional originRequest map merged into the public hostname
+#   tunnel_manage_dns: optional; consumed by cloudflare_dns, defaults to true there
+cloudflared_routes_from_proxy_routes: true
+cloudflared_default_tunnel_type: "cloudflare"
+cloudflared_default_tunnel_service: "https://localhost:443"
+cloudflared_fallback_service: "http_status:404"
+cloudflared_origin_request: {}
+
+# Neutral route model shared with the Caddy role.
+proxy_routes: []

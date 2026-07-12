@@ -1,0 +1,8 @@
+[sshd]
+enabled  = true
+port     = 22
+logpath  = %(sshd_log)s
+backend  = systemd
+maxretry = {{ hardening_fail2ban_maxretry }}
+findtime = {{ hardening_fail2ban_findtime }}
+bantime  = {{ hardening_fail2ban_bantime }}

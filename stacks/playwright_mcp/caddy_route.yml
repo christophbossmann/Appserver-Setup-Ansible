@@ -1,0 +1,11 @@
+# Caddy route for this stack — loaded explicitly by the caddy role.
+# basic_auth hash lives in group_vars/all/vault.yml (generate a new one with
+# `caddy hash-password`).
+caddy_route_playwright_mcp:
+  name: playwright-mcp
+  hostname_label: playwright
+  caddy_upstream: "127.0.0.1:6080"
+  caddy_extra: |
+    basic_auth {
+      admin {{ vault_basicauth_hash_playwright }}
+    }

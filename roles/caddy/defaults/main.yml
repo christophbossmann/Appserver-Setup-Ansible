@@ -1,0 +1,208 @@
+---
+# Install Caddy from the official Cloudsmith repository. This package provides
+# the system user and systemd service. When caddy_tls_mode=cloudflare_dns,
+# the role can replace the package binary with a custom xcaddy build.
+caddy_package_repo_enabled: true
+
+# Caddy configuration file location.
+caddy_config_path: /etc/caddy/Caddyfile
+
+# TLS behavior (global default, can be overridden per site via caddy_tls_mode on a proxy_route):
+#   auto           = Caddy obtains public certs automatically via Let's Encrypt
+#                    HTTP-01 or TLS-ALPN-01. Use on a public VServer with DNS A/AAAA records.
+#   inherit        = No TLS provisioning for this site. Caddy reuses a matching wildcard cert
+#                    already obtained by another site entry (e.g. *.example.de with acme_dns).
+#                    Ansible validates that a wildcard entry exists in caddy_effective_sites.
+#   off            = HTTP-only. Use behind Cloudflare Tunnel or other TLS-terminating proxy.
+#   internal       = Caddy serves HTTPS with its internal CA. Useful for local testing.
+#   cloudflare_dns = Caddy obtains public certs via DNS-01 using Cloudflare API token.
+#                    Requires the Cloudflare DNS plugin; this role builds it with xcaddy.
+#   acme_dns       = DNS-01 via acme-dns relay (https://github.com/joohoi/acme-dns).
+#                    One-time CNAME at registrar, then fully automatic renewal. Ideal
+#                    for DNS providers without API (e.g. shared hosting). Requires xcaddy build.
+#   tailscale      = Caddy uses certs obtained via `tailscale cert` (works with Headscale too).
+#                    Ansible fetches the cert for each site and sets up automatic renewal
+#                    via a systemd timer. The cert/key are stored under caddy_tailscale_cert_dir.
+#   manual_cert    = Pre-obtained cert/key files (e.g. from acme.sh or an internal CA).
+#                    Set caddy_tls_cert_file/caddy_tls_key_file globally or per site.
+caddy_tls_mode: auto
+
+# Directory where tailscale-mode TLS certs are stored.
+# Only used when caddy_tls_mode == 'tailscale' (globally or per site).
+caddy_tailscale_cert_dir: /etc/caddy/certs
+
+# Optional email used by ACME certificate issuers.
+caddy_email: ""
+
+# Custom root CAs for Caddy's internal PKI (used with caddy_tls_mode=internal).
+# Caddy supports multiple named CAs. "local" is the built-in default CA name.
+# All cert/key paths must point to files already present on the remote host.
+# Leave empty to let Caddy auto-generate its own root CA.
+# Example:
+# caddy_pki_cas:
+#   - name: local
+#     cert: /etc/caddy/pki/root.crt
+#     key:  /etc/caddy/pki/root.key
+caddy_pki_cas: []
+
+# Global default CA name for sites with caddy_tls_mode=internal.
+# Empty = Caddy uses its auto-generated "local" CA (renders: tls internal).
+# When set, renders: tls { ca <name> } — the CA must be listed in caddy_pki_cas.
+# Can be overridden per route via caddy_pki_ca on a proxy_routes entry.
+caddy_pki_default_ca: ""
+
+# Global cert/key for caddy_tls_mode=manual_cert.
+# Typically a wildcard cert covering all sites on this server (e.g. *.prod.example.com).
+# Applied to every manual_cert site unless overridden per-site via caddy_cert_file/caddy_key_file
+# on a proxy_routes or caddy_sites entry.
+# Paths must point to files already present on the remote host (e.g. deployed by acme.sh).
+caddy_tls_cert_file: ""
+caddy_tls_key_file: ""
+
+# Required only for caddy_tls_mode=cloudflare_dns.
+# Store this in Ansible Vault in real use.
+caddy_cloudflare_api_token: ""
+caddy_cloudflare_env_file: /etc/caddy/cloudflare.env
+caddy_systemd_override_dir: /etc/systemd/system/caddy.service.d
+caddy_systemd_override_file: "{{ caddy_systemd_override_dir }}/10-cloudflare-dns.conf"
+
+# If true, the role builds/replaces /usr/bin/caddy with the Cloudflare DNS plugin.
+# Leave as auto: it is automatically enabled when caddy_tls_mode == 'cloudflare_dns'.
+caddy_build_cloudflare_dns_plugin: "{{ caddy_tls_mode == 'cloudflare_dns' }}"
+caddy_xcaddy_path: /root/go/bin/xcaddy
+caddy_custom_binary_tmp: /tmp/caddy
+caddy_cloudflare_module_name: dns.providers.cloudflare
+
+# Required only for caddy_tls_mode=acme_dns.
+# acme-dns is a minimal DNS server purpose-built for ACME DNS-01 challenges.
+# It accepts TXT record updates via a simple HTTP API and serves them to ACME CAs.
+# The public instance at https://auth.acme-dns.io is free to use and requires
+# only a one-time CNAME record at your registrar. Self-hosting is also supported.
+caddy_acme_dns_api_url: "https://auth.acme-dns.io"
+caddy_acme_dns_credentials_file: /etc/caddy/acmedns.json
+# Marker files per domain — created after user confirms CNAME is set.
+# A missing marker means the CNAME was never confirmed; Ansible will show
+# the CNAME reminder again on the next run.
+caddy_acme_dns_markers_dir: /etc/caddy/acmedns.d
+caddy_acme_dns_module_name: dns.providers.acmedns
+caddy_build_acme_dns_plugin: "{{ caddy_tls_mode == 'acme_dns' }}"
+# How long CertMagic waits for the TXT record to propagate before giving up.
+# -1 disables the self-check entirely (required for acmedns: libdns/acmedns
+# does not implement GetRecords, so the check always times out with no error).
+caddy_acme_dns_propagation_timeout: "-1"
+# Nameserver to use when verifying CNAME propagation in the pause prompt.
+# Override with your registrar's authoritative NS for instant verification
+# (bypasses TTL-based caching). E.g. ns1.manitu.net for Manitu customers.
+caddy_acme_dns_verify_ns: "8.8.8.8"
+
+# After the CNAME pause, the record is actively verified against the registered
+# fulldomain before the confirmation marker is written (fail fast on typos).
+# Retries cover DNS propagation delay: 6 x 10s = 1 minute.
+caddy_acme_dns_confirm_retries: 6
+caddy_acme_dns_confirm_delay: 10
+
+# After Caddy (re)starts, wait until every acme_dns certificate actually exists
+# in the store before letting the play continue. DNS-01 + LE issuance normally
+# takes 30-90s; 30 x 10s = 5 minutes of headroom. On timeout the play fails
+# with the real tls.obtain errors from the journal.
+caddy_acme_cert_wait_retries: 30
+caddy_acme_cert_wait_delay: 10
+
+# Seed acme-dns credentials for fresh servers to avoid re-registration.
+# If set and the credentials file does not yet exist on the server, these
+# credentials are written before the registration check runs. The check then
+# finds the domains already registered and skips re-registration — no new
+# CNAME needed.
+#
+# DEFAULT: automatically restore from the controller-side backup that the
+# fetch task below maintains (caddy_acme_dns_credentials_backup_path). A wiped
+# /etc/caddy (e.g. apt purge caddy) is then transparently re-seeded and the
+# existing CNAME keeps working. Override with an explicit dict (e.g. from
+# Vault) or set to {} to force a fresh registration.
+caddy_acme_dns_seed_credentials: >-
+  {{
+    ((lookup('file', caddy_acme_dns_credentials_backup_path | expanduser, errors='ignore') or '{}') | from_json)
+    if (caddy_acme_dns_credentials_backup_path | length > 0) else {}
+  }}
+
+# Optional: local path on the Ansible controller where the current acmedns.json is
+# fetched after each run. Use this to seed caddy_acme_dns_seed_credentials on a
+# fresh server without re-registering (which would require a new CNAME at the registrar).
+# Example: "~/.ansible/acmedns/{{ inventory_hostname }}.json"
+caddy_acme_dns_credentials_backup_path: ""
+
+# Optional: if true, allow local firewall ports 80/443 using UFW.
+# Keep false if UFW is managed by the hardening role.
+caddy_manage_ufw: false
+
+# Sites Caddy should serve.
+# Explicit Caddy-only sites. Prefer proxy_routes for new configs when the same
+# service should also drive Cloudflare Tunnel and/or Cloudflare DNS.
+#
+# Optional per-site access controls:
+#   caddy_upstream:         Caddy reverse_proxy upstream.
+#   caddy_tls_mode:         Per-site TLS override: auto, off, internal, cloudflare_dns, tailscale, manual_cert.
+#                           Defaults to the global caddy_tls_mode when omitted.
+#   caddy_cert_file:        Path to cert file on host. Required when caddy_tls_mode=manual_cert.
+#   caddy_key_file:         Path to key file on host. Required when caddy_tls_mode=manual_cert.
+#   caddy_bind_interfaces:  local interfaces whose IPv4 addresses are resolved and used
+#                           for Caddy's bind directive. If omitted/empty, Caddy uses
+#                           its default listener behavior.
+#   caddy_allowed_ranges:   client source IP/CIDR ranges allowed by Caddy's remote_ip
+#                           matcher. If omitted/empty, no source IP restriction is applied.
+# Example:
+# caddy_sites:
+#   - hostname: n8n.example.com
+#     caddy_upstream: localhost:5678
+#   - hostname: grafana.meinserver.ts.net
+#     caddy_upstream: localhost:3000
+#     caddy_tls_mode: tailscale
+#     caddy_allowed_ranges:
+#       - 100.64.0.0/10
+#       - 192.168.0.0/16
+#   - hostname: n8n-tunnel.example.com
+#     caddy_upstream: localhost:5678
+#     caddy_tls_mode: off   # behind Cloudflare Tunnel
+caddy_sites: []
+
+
+# Shared route model used by multiple roles.
+# Prefer defining services once in proxy_routes and let Caddy/cloudflared/DNS
+# derive their config from it.
+#
+# Fields used by the Caddy role:
+#   caddy_enabled:          enable/disable Caddy vhost generation for the route
+#   caddy_upstream:         Caddy reverse_proxy upstream
+#   caddy_tls_mode:         Per-site TLS override (see caddy_sites docs above)
+#   caddy_bind_interfaces:  local interfaces whose IPv4 addresses are resolved and used for Caddy's bind directive
+#   caddy_allowed_ranges:   client source IP/CIDR ranges allowed by Caddy's remote_ip matcher
+#
+# Fields used by the Cloudflared role:
+#   tunnel_enabled:             enable/disable Cloudflare Tunnel public hostname routing
+#   tunnel_type:                tunnel provider/type, currently cloudflare
+#   tunnel_service:             service URL cloudflared forwards to, e.g. https://localhost:443
+#   tunnel_origin_server_name:  optional TLS SNI/origin server name for the origin request
+#   tunnel_manage_dns:          optional; when true, Cloudflare DNS CNAME is derived automatically
+#
+# Standalone DNS records that are not tied to a Tunnel belong in cloudflare_dns_records.
+#
+# Example:
+# proxy_routes:
+#   - name: n8n
+#     hostname: n8n.example.com
+#     caddy_enabled: true
+#     caddy_upstream: localhost:5678
+#     caddy_bind_interfaces: []
+#     caddy_allowed_ranges: []
+#     tunnel_enabled: true
+#     tunnel_service: https://localhost:443
+#     tunnel_origin_server_name: n8n.example.com
+#     tunnel_manage_dns: true
+proxy_routes: []
+
+# Re-verification of already-confirmed acme-dns CNAMEs (see tasks/acme_dns_verify.yml).
+# Caddy's certificate store (default storage path for the caddy systemd user).
+caddy_acme_cert_store: /var/lib/caddy/.local/share/caddy
+# A cert counts as "valid" only if it still has at least this many seconds left
+# (default 7 days). Below that, a broken CNAME blocks instead of just warning.
+caddy_acme_cert_min_seconds: 604800

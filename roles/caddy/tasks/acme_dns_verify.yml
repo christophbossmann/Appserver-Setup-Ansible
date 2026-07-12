@@ -1,0 +1,72 @@
+---
+# Re-verify that the CNAME for ALREADY-CONFIRMED acme-dns domains is still set.
+# The confirmation marker (acmedns.d/<domain>) only records that the CNAME was
+# set ONCE and is never re-checked; if it is later removed/changed, Caddy fails
+# to issue/renew silently. Here we actively dig the record on every run:
+#   CNAME ok                      -> nothing
+#   CNAME broken, NO valid cert   -> re-add to pending (reminder + PAUSE)
+#   CNAME broken, valid cert      -> non-blocking WARNING (renewal will fail later)
+# Guarded by the caller to caddy_tls_mode == 'acme_dns'.
+
+- name: Ensure dig is available for acme-dns CNAME verification
+  ansible.builtin.apt:
+    name: bind9-dnsutils
+    state: present
+  failed_when: false
+
+- name: Build the set of confirmed acme-dns domains to re-verify
+  ansible.builtin.set_fact:
+    _acme_dns_recheck: >-
+      {{ _acme_dns_sites | default([])
+         | map(attribute='hostname')
+         | map('regex_replace', '^\*\.', '')
+         | select('in', _acme_dns_confirmed_domains | default([]))
+         | select('in', (_acme_dns_creds | default({})).keys() | list)
+         | unique | list }}
+
+- name: Re-check CNAME + cert state for confirmed acme-dns domains
+  ansible.builtin.shell: |
+    set -o pipefail
+    if ! command -v dig >/dev/null 2>&1; then echo "SKIP nodig"; exit 0; fi
+    dom="{{ item }}"
+    exp="{{ (_acme_dns_creds[item].fulldomain) | regex_replace('\.$', '') }}"
+    got=$(dig +short CNAME "_acme-challenge.${dom}" @{{ caddy_acme_dns_verify_ns }} 2>/dev/null | sed 's/\.$//' | head -n1)
+    if [ "$got" = "$exp" ]; then cname=OK; else cname=BROKEN; fi
+    crt=$(find {{ caddy_acme_cert_store }}/certificates -type f \( -name "${dom}.crt" -o -name "wildcard_.${dom}.crt" \) 2>/dev/null | head -n1)
+    if [ -n "$crt" ] && openssl x509 -checkend {{ caddy_acme_cert_min_seconds }} -noout -in "$crt" >/dev/null 2>&1; then cert=VALID; else cert=MISSING; fi
+    echo "${cname} ${cert} got=${got}"
+  args:
+    executable: /bin/bash
+  register: _acme_dns_recheck_res
+  changed_when: false
+  loop: "{{ _acme_dns_recheck | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Classify re-verification results
+  ansible.builtin.set_fact:
+    _acme_dns_reverify_block: >-
+      {{ _acme_dns_recheck_res.results | default([])
+         | selectattr('stdout', 'defined')
+         | selectattr('stdout', 'search', '^BROKEN MISSING')
+         | map(attribute='item') | list }}
+    _acme_dns_reverify_warn: >-
+      {{ _acme_dns_recheck_res.results | default([])
+         | selectattr('stdout', 'defined')
+         | selectattr('stdout', 'search', '^BROKEN VALID')
+         | map(attribute='item') | list }}
+
+- name: WARN - acme-dns CNAME broken but a valid cert still exists (renewal will fail later)
+  ansible.builtin.debug:
+    msg: >-
+      [acme-dns] WARNING: _acme-challenge.{{ item }} no longer resolves to
+      {{ _acme_dns_creds[item].fulldomain }}. The current certificate is still
+      valid, so issuance is not blocked now, but RENEWAL WILL FAIL. Restore the
+      CNAME at your registrar.
+  loop: "{{ _acme_dns_reverify_warn | default([]) }}"
+
+- name: Re-add broken-without-cert domains to pending (forces reminder + pause downstream)
+  ansible.builtin.set_fact:
+    _acme_dns_pending_domains: >-
+      {{ (_acme_dns_pending_domains | default([]) + (_acme_dns_reverify_block | default([]))) | unique | list }}
+  when: _acme_dns_reverify_block | default([]) | length > 0

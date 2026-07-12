@@ -1,0 +1,24 @@
+{% set desired = cloudflared_desired_ingress | default([]) %}
+{% set current = cloudflared_current_ingress | default([]) %}
+{% set ns = namespace(final=[], desired_keys=[], managed_route_keys=[]) %}
+{% for rule in desired %}
+{% set _ = ns.desired_keys.append((rule.hostname | default('') | string) ~ '|' ~ (rule.path | default('') | string)) %}
+{% endfor %}
+{% if cloudflared_routes_from_proxy_routes | default(true) | bool %}
+{% for route in proxy_routes | default([]) if (route.hostname is defined) and ((route.tunnel_type | default(cloudflared_default_tunnel_type)) == 'cloudflare') %}
+{% set _ = ns.managed_route_keys.append((route.hostname | string) ~ '|' ~ (route.path | default('') | string)) %}
+{% endfor %}
+{% endif %}
+{% if not (cloudflared_prune_public_hostnames | default(false) | bool) %}
+{% for rule in current %}
+{% set key = (rule.hostname | default('') | string) ~ '|' ~ (rule.path | default('') | string) %}
+{% if rule.hostname is defined and key not in ns.desired_keys and key not in ns.managed_route_keys %}
+{% set _ = ns.final.append(rule) %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% for rule in desired %}
+{% set _ = ns.final.append(rule) %}
+{% endfor %}
+{% set _ = ns.final.append({'service': cloudflared_fallback_service | default('http_status:404')}) %}
+{{ ns.final | to_nice_yaml }}

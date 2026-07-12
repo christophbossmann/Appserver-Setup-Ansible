@@ -1,0 +1,379 @@
+---
+# ==========================================================
+# Phase 0: Time Sync (must run before apt to avoid "not valid yet" errors)
+# Handles all cases: chrony already installed, timesyncd available, or neither.
+# No apt install required — works on any Ubuntu server state.
+# ==========================================================
+- name: Force initial clock sync
+  ansible.builtin.shell: |
+    # Case 1: chrony already installed and running (e.g. from a previous partial run)
+    if systemctl is-active --quiet chrony 2>/dev/null; then
+      chronyc -a makestep
+    # Case 2: chrony installed but not yet started
+    elif command -v chronyc &>/dev/null; then
+      systemctl start chrony
+      chronyc -a makestep
+    # Case 3: systemd-timesyncd available and not masked
+    elif systemctl list-unit-files systemd-timesyncd.service 2>/dev/null | grep -qv masked; then
+      systemctl enable --now systemd-timesyncd
+      timedatectl set-ntp true
+      for i in $(seq 1 12); do
+        [ "$(timedatectl show --property=NTPSynchronized --value 2>/dev/null)" = "yes" ] && break
+        sleep 5
+      done
+    # Case 4: last resort — set time from an HTTP Date header (http:// -> no TLS,
+    # so it works even with a wrong clock). Try several diverse hosts; first wins.
+    else
+      for url in http://www.google.com http://www.cloudflare.com http://www.microsoft.com http://example.com; do
+        DATE=$(curl -sI --max-time 5 "$url" 2>/dev/null | awk -F': ' 'tolower($1)=="date"{print $2; exit}' | tr -d '\r')
+        if [ -n "$DATE" ]; then date -s "$DATE" && break; fi
+      done
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+# ----------------------------------------------------------
+# Phase 0b: Verify the clock actually converged. Abort EARLY and CLEARLY if not,
+# instead of letting a later TLS download fail with the cryptic
+# "certificate is not yet valid". Reference is the online time (HTTP Date header
+# over http:// -> no TLS, so it works even with a wrong clock); if the host has
+# no internet, we fall back to the Ansible controller's clock.
+# ----------------------------------------------------------
+- name: Determine reference time (online HTTP Date header, no TLS)
+  ansible.builtin.shell: |
+    set -o pipefail
+    for url in http://www.google.com http://www.cloudflare.com http://www.microsoft.com http://example.com; do
+      d=$(curl -sI --max-time 5 "$url" 2>/dev/null | awk -F': ' 'tolower($1)=="date"{print $2; exit}' | tr -d '\r')
+      [ -n "$d" ] && { date -u -d "$d" +%s && exit 0; }
+    done
+    exit 1
+  args:
+    executable: /bin/bash
+  register: _clock_ref_online
+  changed_when: false
+  failed_when: false
+  check_mode: false   # read-only probe; without it --check sees an empty result
+
+- name: Capture managed host clock (epoch, UTC)
+  ansible.builtin.command: date -u +%s
+  register: _clock_host
+  changed_when: false
+  check_mode: false   # read-only probe; the skew assert below needs real data
+
+- name: Abort if host clock is not roughly in sync with reference time
+  vars:
+    _have_online: "{{ _clock_ref_online.rc == 0 and (_clock_ref_online.stdout | trim) != '' }}"
+    _ref: "{{ (_clock_ref_online.stdout | trim) if _have_online else lookup('pipe', 'date -u +%s') }}"
+    _src: "{{ 'online time' if _have_online else 'Ansible controller clock' }}"
+    _skew: "{{ (_clock_host.stdout | int) - (_ref | int) }}"
+  ansible.builtin.assert:
+    that:
+      - _skew | int | abs <= clock_skew_max_seconds | int
+    fail_msg: >-
+      Clock skew too large: this host is {{ _skew }} s off the {{ _src }}
+      (limit ±{{ clock_skew_max_seconds }} s). Time sync did not converge, so TLS
+      operations (tailscale / apt / caddy ACME) would fail with
+      'certificate is not yet valid'. Fix NTP on the host
+      (sudo timedatectl set-ntp true; check chrony/timesyncd) and re-run.
+    success_msg: "Clock OK: {{ _skew }} s vs {{ _src }} (limit ±{{ clock_skew_max_seconds }} s)."
+  changed_when: false
+
+# ----------------------------------------------------------
+# Phase 0c: Quiesce background apt so it can't hold the dpkg lock mid-play.
+# unattended-upgrades / apt-daily can fire (especially right after a clock fix
+# catches up a backlog) and hold /var/lib/dpkg/lock-frontend, breaking later
+# apt operations (tailscale install.sh, docker, ...) with a cryptic rc=100.
+# We stop the TIMERS (no new runs this play) and WAIT for any in-flight run to
+# finish gracefully -- we do NOT kill it mid-dpkg. Timers return on next boot.
+# ----------------------------------------------------------
+- name: Stop apt background timers for the duration of this play
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop:
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+  failed_when: false
+
+- name: Wait for any in-flight apt/dpkg lock to be released
+  ansible.builtin.shell: |
+    set -o pipefail
+    deadline=$(( $(date +%s) + {{ apt_lock_wait_seconds | default(300) }} ))
+    while :; do
+      if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+                  /var/lib/apt/lists/lock >/dev/null 2>&1; then
+        exit 0
+      fi
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "apt/dpkg lock still held after {{ apt_lock_wait_seconds | default(300) }}s by:" >&2
+        fuser -v /var/lib/dpkg/lock-frontend >&2 2>&1 || true
+        exit 1
+      fi
+      sleep 5
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+# ==========================================================
+# Phase 1: Base Packages
+# ==========================================================
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ hardening_base_packages }}"
+    state: present
+
+- name: Enable unattended-upgrades
+  ansible.builtin.dpkg_selections:
+    name: unattended-upgrades
+    selection: install
+
+- name: Ensure atd is running (needed for rollback safety)
+  ansible.builtin.systemd:
+    name: atd
+    enabled: true
+    state: started
+
+- name: Ensure chrony is running (replaces systemd-timesyncd as NTP daemon)
+  ansible.builtin.systemd:
+    name: chrony
+    enabled: true
+    state: started
+
+- name: Force time sync via chrony
+  ansible.builtin.command: chronyc -a makestep
+  changed_when: false
+
+# ==========================================================
+# Phase 2: Swap
+# ==========================================================
+- name: Configure swap
+  when: hardening_swap_enabled
+  block:
+    - name: Check if swapfile exists
+      ansible.builtin.stat:
+        path: "{{ hardening_swap_path }}"
+      register: _swap_file
+
+    - name: Create swapfile
+      ansible.builtin.command: fallocate -l {{ hardening_swap_size_mb }}M {{ hardening_swap_path }}
+      when: not _swap_file.stat.exists
+      register: _swap_created
+
+    - name: Set swapfile permissions
+      ansible.builtin.file:
+        path: "{{ hardening_swap_path }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: not _swap_file.stat.exists
+
+    - name: Format swapfile
+      ansible.builtin.command: mkswap {{ hardening_swap_path }}
+      when: not _swap_file.stat.exists
+
+    - name: Enable swapfile
+      ansible.builtin.command: swapon {{ hardening_swap_path }}
+      when: not _swap_file.stat.exists
+
+    - name: Persist swapfile in fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "{{ hardening_swap_path }} none swap sw 0 0"
+        state: present
+
+    - name: Set vm.swappiness
+      ansible.posix.sysctl:
+        name: vm.swappiness
+        value: "{{ hardening_swap_swappiness }}"
+        state: present
+        reload: true
+
+    - name: Set vm.vfs_cache_pressure
+      ansible.posix.sysctl:
+        name: vm.vfs_cache_pressure
+        value: "{{ hardening_swap_vfs_cache_pressure }}"
+        state: present
+        reload: true
+
+# ==========================================================
+# Phase 3: Fail2Ban
+# ==========================================================
+- name: Install Fail2Ban
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+
+- name: Configure Fail2Ban jail
+  ansible.builtin.template:
+    src: jail.local.j2
+    dest: /etc/fail2ban/jail.local
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart Fail2Ban
+
+- name: Enable and start Fail2Ban
+  ansible.builtin.systemd:
+    name: fail2ban
+    enabled: true
+    state: started
+
+# ==========================================================
+# Phase 4: SSH Hardening
+# ==========================================================
+- name: Backup sshd_config before changes
+  ansible.builtin.copy:
+    src: /etc/ssh/sshd_config
+    dest: /etc/ssh/sshd_config.bak
+    remote_src: true
+    force: false
+
+- name: Disable root login via SSH
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PermitRootLogin'
+    line: 'PermitRootLogin no'
+    validate: '/usr/sbin/sshd -t -f %s'
+  register: ssh_root_login
+  notify: Restart SSH
+
+- name: Disable password authentication
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PasswordAuthentication'
+    line: 'PasswordAuthentication no'
+    validate: '/usr/sbin/sshd -t -f %s'
+  register: ssh_password_auth
+  notify: Restart SSH
+
+- name: Check if critical settings changed
+  ansible.builtin.set_fact:
+    hardening_changed: "{{ ssh_root_login.changed or ssh_password_auth.changed }}"
+
+# Flush handlers so SSH restarts BEFORE UFW is enabled
+- name: Apply SSH changes before enabling firewall
+  ansible.builtin.meta: flush_handlers
+
+# ==========================================================
+# Phase 5: UFW Firewall
+# ==========================================================
+- name: Install UFW
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+- name: Set UFW default deny incoming
+  community.general.ufw:
+    direction: incoming
+    default: deny
+
+- name: Set UFW default allow outgoing
+  community.general.ufw:
+    direction: outgoing
+    default: allow
+
+- name: Allow ports through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto }}"
+    comment: "{{ item.comment }}"
+  loop: "{{ hardening_ufw_allowed_ports }}"
+
+- name: Allow full access from trusted IP ranges
+  community.general.ufw:
+    rule: allow
+    from_ip: "{{ item.from_ip | default('any') }}"
+    interface: "{{ item.interface | default(omit) }}"
+    direction: "{{ 'in' if item.interface is defined else omit }}"
+    comment: "{{ item.comment }}"
+  loop: "{{ hardening_ufw_full_access_ranges | default([], true) }}"
+
+# ==========================================================
+# Phase 5: Rollback Safety + Enable + Smoke Test
+# ==========================================================
+- name: Schedule auto-rollback in {{ hardening_rollback_delay_minutes }} minutes
+  ansible.builtin.shell: |
+    echo "ufw disable && cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config && systemctl restart ssh && echo 'ROLLBACK EXECUTED' >> /var/log/ansible-rollback.log" | at now + {{ hardening_rollback_delay_minutes }} minutes 2>&1
+  register: at_job
+  when: hardening_changed
+
+- name: Extract rollback job ID
+  ansible.builtin.set_fact:
+    rollback_job_id: "{{ at_job.stdout | regex_search('job (\\d+)', '\\1') | first }}"
+  when: hardening_changed
+
+- name: Show rollback job info
+  ansible.builtin.debug:
+    msg: "Rollback job {{ rollback_job_id }} scheduled. Will auto-restore in {{ hardening_rollback_delay_minutes }} min if smoke test fails."
+  when: hardening_changed
+
+- name: Configure Docker-UFW compatibility (DOCKER-USER chain)
+  ansible.builtin.blockinfile:
+    path: /etc/ufw/after.rules
+    marker: "# {mark} DOCKER UFW COMPAT"
+    block: |
+      *filter
+      :DOCKER-USER - [0:0]
+      -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+      {% for item in hardening_ufw_full_access_ranges | default([]) %}
+      {% if item.interface is defined %}
+      -A DOCKER-USER -i {{ item.interface }} -j RETURN
+      {% endif %}
+      -A DOCKER-USER -s {{ item.from_ip | default('any') }} -j RETURN
+      {% endfor %}
+      -A DOCKER-USER -s 172.16.0.0/12 -j RETURN
+      -A DOCKER-USER -j DROP
+      COMMIT
+  when: hardening_docker_ufw_compat | default(true) | bool
+  notify: Reload UFW
+
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled
+
+- name: Smoke test - verify SSH connectivity
+  ansible.builtin.wait_for_connection:
+    delay: 3
+    timeout: 30
+
+- name: Cancel auto-rollback
+  ansible.builtin.command: atrm {{ rollback_job_id }}
+  register: atrm_result
+  failed_when: false
+  when: hardening_changed
+
+- name: Verify rollback job is gone
+  ansible.builtin.shell: atq | grep -q "^{{ rollback_job_id }}\s"
+  register: atq_check
+  failed_when: false
+  when: hardening_changed
+
+- name: Warn if rollback job still exists
+  ansible.builtin.debug:
+    msg: >
+      WARNING: Rollback job {{ rollback_job_id }} could not be cancelled!
+      The server will auto-rollback in {{ hardening_rollback_delay_minutes }} minutes.
+      Manually run: sudo atrm {{ rollback_job_id }}
+  when: hardening_changed and atq_check.rc == 0
+
+- name: Hardening complete (with changes)
+  ansible.builtin.debug:
+    msg: >
+      Server hardening complete. SSH connectivity verified.
+      Rollback job cancelled.
+      Root login: disabled | Password auth: disabled |
+      UFW: enabled | Fail2Ban: enabled
+  when: hardening_changed and (atq_check.rc | default(1)) != 0
+
+- name: Hardening complete (no changes)
+  ansible.builtin.debug:
+    msg: "Server already hardened. No changes applied."
+  when: not hardening_changed

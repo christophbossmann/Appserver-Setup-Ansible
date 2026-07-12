@@ -1,0 +1,32 @@
+{% for route in cloudflared_public_hostnames | default([]) %}
+- hostname: "{{ route.hostname }}"
+  service: "{{ route.service }}"
+{% if route.path is defined and route.path %}
+  path: "{{ route.path }}"
+{% endif %}
+{% if route.origin_request is defined and route.origin_request %}
+  originRequest:
+{% for key, value in route.origin_request.items() %}
+    {{ key }}: {{ value | to_json }}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% if cloudflared_routes_from_proxy_routes | default(true) | bool %}
+{% for route in proxy_routes | default([]) if (route.tunnel_enabled | default(false) | bool) and ((route.tunnel_type | default(cloudflared_default_tunnel_type)) == 'cloudflare') %}
+- hostname: "{{ route.hostname }}"
+  service: "{{ route.tunnel_service | default(cloudflared_default_tunnel_service) }}"
+{% if route.path is defined and route.path %}
+  path: "{{ route.path }}"
+{% endif %}
+{% set origin_req = route.tunnel_origin_request | default({}) %}
+{% if origin_req or (route.tunnel_origin_server_name is defined and route.tunnel_origin_server_name) %}
+  originRequest:
+{% for key, value in origin_req.items() %}
+    {{ key }}: {{ value | to_json }}
+{% endfor %}
+{% if route.tunnel_origin_server_name is defined and route.tunnel_origin_server_name %}
+    originServerName: {{ route.tunnel_origin_server_name | to_json }}
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}

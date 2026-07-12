@@ -1,0 +1,22 @@
+---
+# Extra Cockpit plugins to install alongside the base package.
+# Useful options:
+#   - cockpit-storaged       # Disk / storage management
+#   - cockpit-networkmanager # Network configuration
+#   - cockpit-packagekit     # OS package updates from UI
+#   - cockpit-machines       # libvirt VM management
+cockpit_extra_packages: []
+
+# External hostname used by the reverse proxy (e.g. Caddy).
+# Required so Cockpit allows WebSocket connections from the proxied URL.
+cockpit_hostname: "cockpit.example.com"
+
+# Port Cockpit listens on. Default 9090 conflicts with Prometheus; change if needed.
+cockpit_port: 9091
+
+# Listen address. Loopback only — access goes through the Caddy route
+# (tailscale) or an SSH tunnel. Set to 0.0.0.0 to expose directly.
+cockpit_listen_address: "127.0.0.1"
+
+# Caddy route(s) for this role live in defaults/caddy_route.yml (loaded
+# explicitly by the caddy role, not auto-loaded). Selected per host via caddy_services.

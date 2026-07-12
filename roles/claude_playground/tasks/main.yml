@@ -1,0 +1,43 @@
+# =============================================================================
+# claude_playground role
+#
+# Two responsibilities, in order:
+#   1. PROVISIONING (task.md): the locked-down `playground` user + its own
+#      rootless Docker daemon + the `playgroundctl` broker. Done entirely in
+#      Ansible; the Python broker never provisions anything.
+#   2. STACK: the claude-ctl AI runtime container. It has NO host Docker access
+#      (no helper, no /var/run/docker.sock); it manages playground workloads only
+#      through `playgroundctl` -> the rootless playground daemon.
+#
+# Assumes Docker (+ compose plugin) is already installed by the `docker` role
+# earlier in the play (it also adds the Docker CE apt repo that provides
+# docker-ce-rootless-extras).
+# =============================================================================
+- name: Fresh start - tear down claude-ctl stack and image (when requested)
+  when: playground_fresh_start | default(false) | bool
+  ansible.builtin.import_tasks: fresh_start.yml
+
+# --- 1. Provisioning + broker -----------------------------------------------
+- name: Provision rootless Docker + playgroundctl broker
+  when: playground_ctl_provision | bool
+  block:
+    - name: Install rootless Docker prerequisites
+      ansible.builtin.import_tasks: provision_packages.yml
+
+    - name: Create playground user, group, subuid/subgid, linger, workspace
+      ansible.builtin.import_tasks: provision_user.yml
+
+    - name: Install rootless Docker for the playground user
+      ansible.builtin.import_tasks: provision_rootless.yml
+
+    - name: Deploy the playgroundctl broker + systemd service
+      ansible.builtin.import_tasks: broker.yml
+
+    - name: Seed and start the default playground app
+      ansible.builtin.import_tasks: default_app.yml
+      when: playground_default_app_enabled | bool
+
+# --- 2. Container stack (claude-ctl AI runtime) -----------------------------
+- name: Deploy the claude-ctl stack
+  ansible.builtin.import_tasks: stack.yml
+  when: playground_stack_enabled | bool

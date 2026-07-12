@@ -1,0 +1,27 @@
+[Unit]
+Description=playgroundctl runtime broker (rootless Docker for the playground user)
+Documentation=file://{{ playground_ctl_install_dir }}
+After=network.target docker.service
+Wants=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={{ playground_ctl_install_dir }}
+ExecStart=/usr/bin/python3 -m playground_ctl.app
+Restart=always
+RestartSec=2
+# Target port for the playground_http_get action (deploy verification).
+Environment=PLAYGROUND_PUBLIC_PORT={{ playground_public_port }}
+
+# The broker runs as root on purpose:
+#   - host Docker is reached read-only (`docker ps`, `image ls`, `compose ls`)
+#   - write actions go to the rootless playground daemon via `sudo -u {{ playground_ctl_user }}`
+#   - the broker itself creates {{ playground_ctl_socket }} as
+#     root:{{ playground_ctl_socket_group }} with mode 0660 (see socket_server.py)
+# remote-ctl / the AI only ever receive {{ playground_ctl_socket }}, never
+# /var/run/docker.sock.
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

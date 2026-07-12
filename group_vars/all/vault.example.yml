@@ -1,0 +1,58 @@
+---
+# =============================================================================
+# group_vars/all/vault.example.yml — TEMPLATE for vault.yml (safe to commit).
+#
+# Setup:
+#   1. cp group_vars/all/vault.example.yml group_vars/all/vault.yml
+#   2. Fill in real values (generate strong secrets, see hints per section).
+#   3. Encrypt in place:  ansible-vault encrypt group_vars/all/vault.yml
+#   4. Configure `vault_password_file` in ansible.cfg [defaults]
+#      (or run playbooks with --ask-vault-pass).
+#
+# Convention: every secret is a vault_* variable; non-secret config references
+# them via {{ vault_* }}. Find all consumers with:
+#     grep -rn "vault_" group_vars host_vars roles stacks --include=*.yml
+# =============================================================================
+
+# --- Admin user (group_vars/all/users.yml sets the name; host_vars consume) ---
+# Salt must be a FIXED random string (e.g. `openssl rand -hex 8`): a random
+# salt per run would produce a new hash every time and make the users role
+# permanently "changed".
+vault_admin_user_password: "CHANGEME-strong-login-password"
+vault_admin_user_salt: "CHANGEME-fixed-random-salt"
+
+# --- Cloudflare (tunnel ingress model; see host_vars/myserver.yml) ------------
+# API token: Cloudflare -> My Profile -> API Tokens -> Create custom token
+#   permissions: Zone/DNS/Edit, Zone/Zone/Read, Account/Cloudflare Tunnel/Edit
+# Connector token: Zero Trust -> Networks -> Tunnels -> Install connector
+vault_cloudflare_api_token: "CHANGEME-cloudflare-api-token"
+vault_cloudflared_tunnel_connector_token_myserver: "CHANGEME-tunnel-connector-token"
+
+# --- Postgres / pgAdmin -------------------------------------------------------
+vault_postgres_password: "CHANGEME"
+vault_pgadmin_password: "CHANGEME"          # applied on FIRST START only
+
+# --- Komodo -------------------------------------------------------------------
+vault_komodo_passkey: "CHANGEME"            # Core<->Periphery trust secret: openssl rand -hex 32
+vault_komodo_database_password: "CHANGEME"
+vault_komodo_init_admin_password: "CHANGEME"  # applied on first start only
+
+# --- Grafana ------------------------------------------------------------------
+# Applied on FIRST START only; change later via:
+#   docker exec grafana grafana-cli admin reset-admin-password NEW_PASSWORD
+vault_grafana_admin_password: "CHANGEME"
+
+# --- n8n ----------------------------------------------------------------------
+vault_n8n_webdav_password: "CHANGEME"
+# Strongly recommended for production (n8n credential encryption at rest);
+# uncomment here AND n8n_encryption_key in group_vars/all/n8n.yml:
+# vault_n8n_encryption_key: "CHANGEME-long-random-string"
+
+# --- Claude Playground --------------------------------------------------------
+vault_playground_webdav_password: "CHANGEME"
+
+# --- Caddy basic_auth bcrypt hashes -------------------------------------------
+# Generate one DISTINCT hash per route:  caddy hash-password
+vault_basicauth_hash_playground: "CHANGEME-bcrypt-hash"
+vault_basicauth_hash_webdav_playground: "CHANGEME-bcrypt-hash"
+vault_basicauth_hash_playwright: "CHANGEME-bcrypt-hash"

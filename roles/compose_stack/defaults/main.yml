@@ -1,0 +1,74 @@
+---
+# =============================================================================
+# compose_stack — generic docker-compose service deployment.
+#
+# Invoke once per service from a playbook, gated with a tag:
+#   roles:
+#     - { role: compose_stack, vars: { stack: immich }, tags: [immich] }
+#
+# The service definition lives in stacks/<stack>/ on the controller:
+#   stacks/<stack>/
+#   ├── docker-compose.yml.j2   # REQUIRED — compose template (full var access)
+#   ├── stack.yml               # optional — per-stack settings (see below)
+#   ├── caddy_route.yml         # optional — caddy_route_<stack> (picked up by
+#   │                           #   the caddy role's resolver, like role routes)
+#   └── configs/, files/        # optional — sources for `configs:` entries
+#
+# Tunables/secrets for the stack (image tags, ports, passwords) belong in
+# group_vars/all/<stack>.yml (override per host in host_vars, per play in
+# vars_files) — same precedence behavior as the old per-service role defaults.
+#
+# stack.yml keys (all optional):
+#   dir:            target dir on the host        (default: /opt/<stack>)
+#   owner/group/mode: ownership of the stack dir  (default: root/root/0755)
+#   compose_mode:   mode of docker-compose.yml    (default: "0644"; use "0600"
+#                                                  when it contains secrets)
+#   dirs:           extra dirs; string (relative to dir, or absolute) or dict
+#                   {path, owner, group, mode}
+#   networks:       external Docker networks to create if missing (e.g. the
+#                   shared `backend` net that cross-stack compose files join)
+#   configs:        files to deploy next to the compose file; dict
+#                   {src, dest, owner, group, mode} — src is relative to
+#                   stacks/<stack>/; *.j2 sources are templated, others copied
+#   pull:           run `docker compose pull` before up (default: true; set
+#                   false for stateful services that must not auto-update)
+#   health_url:     URL polled after `up` until reachable (default: none)
+#   health_status:  accepted status codes          (default: [200])
+#   health_cmd:     alternative health probe: a command retried until rc=0
+#                   (e.g. "docker exec postgres pg_isready -U n8n"); unlike
+#                   health_url this FAILS the play when it never succeeds
+#   status_msg:     extra lines appended to the final status output
+# =============================================================================
+
+# Name of the stack == directory under stacks/. REQUIRED (set per invocation).
+stack: ""
+
+# Controller-side location of the stack definitions.
+compose_stack_src_root: "{{ inventory_dir }}/stacks"
+compose_stack_src_dir: "{{ compose_stack_src_root }}/{{ stack }}"
+
+# Host-side base directory; the stack lives in <base>/<stack> unless
+# stack.yml overrides `dir`.
+compose_stack_base_dir: /opt
+
+# Default modes/ownership (per-entry overrides in stack.yml win).
+compose_stack_compose_mode: "0644"
+compose_stack_dir_owner: root
+compose_stack_dir_group: root
+compose_stack_dir_mode: "0755"
+compose_stack_config_owner: root
+compose_stack_config_group: root
+compose_stack_config_mode: "0644"
+
+# Run `docker compose pull` before `up`.
+compose_stack_pull: true
+
+# Health check defaults (used when stack.yml sets health_url).
+compose_stack_health_retries: 15
+compose_stack_health_delay: 5
+
+# DANGER: stop the stack, remove its volumes and wipe its directory before
+# deploying. Applies to EVERY compose_stack invocation in the play — combine
+# with --tags <stack> to target a single service:
+#   ansible-playbook ... --tags immich -e compose_stack_fresh=true
+compose_stack_fresh: false

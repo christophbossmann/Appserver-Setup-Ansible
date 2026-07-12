@@ -1,0 +1,47 @@
+---
+- name: Install Cockpit
+  ansible.builtin.apt:
+    name: "{{ ['cockpit'] + (cockpit_extra_packages | default([])) }}"
+    state: present
+    update_cache: true
+
+- name: Create cockpit systemd socket override directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/cockpit.socket.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write cockpit socket port override
+  ansible.builtin.template:
+    src: cockpit-listen.conf.j2
+    dest: /etc/systemd/system/cockpit.socket.d/listen.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart cockpit
+
+- name: Enable and start Cockpit socket
+  ansible.builtin.systemd:
+    name: cockpit.socket
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Create /etc/cockpit directory
+  ansible.builtin.file:
+    path: /etc/cockpit
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write cockpit.conf (reverse proxy Origins)
+  ansible.builtin.template:
+    src: cockpit.conf.j2
+    dest: /etc/cockpit/cockpit.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart cockpit

@@ -1,0 +1,136 @@
+---
+# ==========================================================
+# Fresh install: wipe everything
+# ==========================================================
+- name: Fresh install - stop and remove n8n container
+  ansible.builtin.shell: |
+    cd /opt/n8n && docker compose down --volumes 2>/dev/null
+    echo "cleaned"
+  register: n8n_cleanup
+  changed_when: "'cleaned' in n8n_cleanup.stdout"
+  failed_when: false
+  when: n8n_fresh_install
+
+- name: Fresh install - wipe all data
+  ansible.builtin.file:
+    path: /opt/n8n
+    state: absent
+  when: n8n_fresh_install
+
+- name: Fresh install - drop and recreate n8n database
+  ansible.builtin.shell: |
+    docker exec postgres psql -U {{ n8n_db_user }} -d postgres \
+      -c "DROP DATABASE IF EXISTS {{ n8n_db_name }};" \
+      -c "CREATE DATABASE {{ n8n_db_name }} OWNER {{ n8n_db_user }};"
+  when: n8n_fresh_install
+  changed_when: true
+
+# ==========================================================
+# Setup — core directories
+# ==========================================================
+- name: Create n8n directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: "0755"
+  loop:
+    - /opt/n8n
+    - "{{ n8n_data_dir }}"
+    - "{{ n8n_brain_dir }}"
+
+# ==========================================================
+# Brain — agent context directories + starter files
+# ==========================================================
+- name: Create brain directories for each agent
+  ansible.builtin.file:
+    path: "{{ n8n_brain_dir }}/{{ item.0 }}/{{ item.1 }}"
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: "0755"
+  loop: "{{ n8n_brain_agents | product(n8n_brain_subdirs) | list }}"
+  loop_control:
+    label: "{{ item.0 }}/{{ item.1 }}"
+
+# Seeded only when the role ships a starter file for this agent — real agent
+# content is maintained OUTSIDE this repo (n8n workflow repo / WebDAV), so
+# agents without a files/brain/<agent>/ directory are skipped, not an error.
+- name: Deploy brain starter files (only on first setup)
+  ansible.builtin.copy:
+    src: "brain/{{ item.0 }}/{{ item.1 }}"
+    dest: "{{ n8n_brain_dir }}/{{ item.0 }}/{{ item.1 }}"
+    owner: "1000"
+    group: "1000"
+    mode: "0644"
+    force: false
+  loop: "{{ n8n_brain_agents | product(n8n_brain_files) | list }}"
+  loop_control:
+    label: "{{ item.0 }}/{{ item.1 }}"
+  when: (role_path ~ '/files/brain/' ~ item.0 ~ '/' ~ item.1) is file
+
+# ==========================================================
+# Docker Compose — n8n + WebDAV
+# ==========================================================
+- name: Deploy n8n docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: /opt/n8n/docker-compose.yml
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart n8n
+
+# ==========================================================
+# Start and verify
+# ==========================================================
+# Guarded against --check: command tasks validate chdir even in check mode,
+# and on a fresh host /opt/n8n does not exist there yet.
+- name: Pull images
+  ansible.builtin.command: docker compose pull
+  args:
+    chdir: /opt/n8n
+  register: n8n_pull
+  changed_when: "'Pull complete' in n8n_pull.stderr or 'Downloaded' in n8n_pull.stderr"
+  when: not ansible_check_mode
+
+- name: Start n8n stack
+  ansible.builtin.command: docker compose up -d
+  args:
+    chdir: /opt/n8n
+  register: n8n_up
+  changed_when: "n8n_up.stderr is search('Started|Creating|Created|Recreating|Recreated')"
+  when: not ansible_check_mode
+
+# No failed_when: false — an n8n that never becomes healthy must fail the
+# play, not just print a hint.
+- name: Wait for n8n to be ready
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ n8n_port }}/healthz"
+    status_code: [200]
+  register: n8n_health
+  retries: 15
+  delay: 5
+  until: n8n_health is not failed
+
+- name: Show n8n status
+  ansible.builtin.debug:
+    msg: >
+      {% if n8n_health.status is defined and n8n_health.status == 200 %}
+      n8n is running and healthy.
+      {% else %}
+      Health check skipped (check mode).
+      {% endif %}
+      {% if n8n_public_hostname | length > 0 %}
+      Public dashboard: {{ n8n_public_protocol }}://{{ n8n_public_hostname }}
+      {% endif %}
+      Local dashboard: http://{{ ansible_host }}:{{ n8n_port }}
+      First login: complete the setup wizard in the browser.
+      {% if n8n_webdav_enabled %}
+      WebDAV (Brain): https://webdav-n8n.{{ internal_host | default('<internal_host>') }} (port {{ n8n_webdav_port }} is loopback-only)
+      WebDAV User: {{ n8n_webdav_user }}
+      Mount as network drive for direct file editing.
+      {% endif %}
+      Brain directory: {{ n8n_brain_dir }}
+      Agents: {{ n8n_brain_agents | join(', ') }}

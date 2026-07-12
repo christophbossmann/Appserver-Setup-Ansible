@@ -1,0 +1,5 @@
+# Caddy route for this role — loaded explicitly by the caddy role.
+caddy_route_pgadmin:
+  name: pgadmin
+  hostname_label: pgadmin
+  caddy_upstream: "127.0.0.1:5050"

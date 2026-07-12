@@ -1,0 +1,27 @@
+---
+# =============================================================================
+# Proxy Server Setup: install cloudflared package + Caddy, but do not attach tunnel
+# unless cloudflared_service_install=true is explicitly provided.
+#
+# Usage, install only:
+#   ansible-playbook -i inventory.ini playbooks/server-proxy.yml \
+#     --limit myserver
+#
+# Usage, install and attach to an existing remotely managed tunnel:
+#   ansible-playbook -i inventory.ini playbooks/server-proxy.yml \
+#     -e "cloudflared_service_install=true" \
+#     -e "cloudflared_tunnel_connector_token=YOUR_TOKEN" \
+#     --limit myserver
+# =============================================================================
+
+- name: Proxy Server
+  hosts: all
+  become: true
+  vars:
+    cloudflared_install: true
+    cloudflared_service_install: false
+  roles:
+    - { role: cloudflare_dns, tags: [caddy, cloudflare_dns] }
+    - { role: cloudflared, tags: [caddy, cloudflared] }
+    - { role: caddy, tags: [caddy] }
+    - { role: caddy_post_check, tags: [caddy, caddy_post_check] }

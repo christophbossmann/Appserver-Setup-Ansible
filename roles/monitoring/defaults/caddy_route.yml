@@ -1,0 +1,5 @@
+# Caddy route for grafana (lives in the monitoring role) — loaded explicitly by caddy.
+caddy_route_grafana:
+  name: grafana
+  hostname_label: grafana
+  caddy_upstream: "127.0.0.1:3000"

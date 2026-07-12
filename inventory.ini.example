@@ -1,0 +1,9 @@
+# Copy to inventory.ini (git-ignored) and adjust.
+# Host names here must match host_vars/<name>.yml.
+[servers]
+myserver ansible_host=192.168.0.10
+# myvps  ansible_host=203.0.113.10
+
+[servers:vars]
+# The passwordless service account created by ansible-bootstrap.sh
+ansible_user=ansible

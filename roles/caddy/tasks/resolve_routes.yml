@@ -1,0 +1,51 @@
+---
+# Build proxy_routes from per-role/per-stack route files selected per host via
+# caddy_services.
+#
+# Routes live in roles/<role>/defaults/caddy_route.yml (NOT main.yml, so Ansible
+# does not auto-load them) or in stacks/<stack>/caddy_route.yml for services
+# deployed via the generic compose_stack role. The caddy role loads ALL of them
+# explicitly below, on the controller, so every route is available regardless of
+# which roles the running play happens to list (a caddy-only or n8n-only play
+# still sees them). caddy_services (host_vars) then decides which ones are
+# rendered + their profile.
+
+- name: Discover per-role and per-stack Caddy route files (on the controller)
+  ansible.builtin.find:
+    paths:
+      - "{{ role_path }}/.."           # roles/<role>/defaults/caddy_route.yml
+      - "{{ inventory_dir }}/stacks"   # stacks/<stack>/caddy_route.yml (compose_stack)
+    patterns: "caddy_route.yml"
+    recurse: true
+  delegate_to: localhost
+  run_once: true
+  become: false          # just reads repo files on the controller; no sudo needed
+  register: _caddy_route_files
+
+- name: Load per-role and per-stack Caddy route definitions
+  ansible.builtin.include_vars: "{{ item.path }}"
+  loop: "{{ _caddy_route_files.files }}"
+  loop_control:
+    label: "{{ item.path | regex_replace('.*/(roles|stacks)/', '\\1/') }}"
+
+- name: Validate caddy_services entries (profile valid + route definition exists)
+  ansible.builtin.assert:
+    that:
+      - item.value in ['internal', 'external']
+      - lookup('vars', 'caddy_route_' ~ item.key, default='__MISSING__') != '__MISSING__'
+    fail_msg: >-
+      caddy_services['{{ item.key }}'] = '{{ item.value }}' is invalid:
+      profile must be internal|external, and a caddy_route_{{ item.key }} must be
+      defined in some roles/<role>/defaults/caddy_route.yml or
+      stacks/<stack>/caddy_route.yml (check for a typo, or a missing route file).
+    quiet: true
+  loop: "{{ caddy_services | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} -> {{ item.value }}"
+
+- name: Resolve active services into proxy_routes (+ keep base wildcards)
+  ansible.builtin.set_fact:
+    proxy_routes: >-
+      {{ (proxy_routes | default([]))
+         + (proxy_routes_base | default([]))
+         + (lookup('template', 'proxy_routes_resolved.yml.j2') | from_yaml | default([], true)) }}

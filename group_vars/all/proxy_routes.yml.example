@@ -1,0 +1,46 @@
+# =============================================================================
+# group_vars/all/proxy_routes.yml — base wildcard-cert routes + profile docs
+#
+# Per-service routes live NEXT TO their service:
+#   roles/<role>/defaults/caddy_route.yml   (dedicated roles)
+#   stacks/<stack>/caddy_route.yml          (compose_stack services)
+# They are discovered by roles/caddy/tasks/resolve_routes.yml and selected per
+# host via `caddy_services` in host_vars/<host>.yml.
+#
+# HOST-specific behaviour (TLS issuance + public ingress) lives in the two
+# profile dicts `route_int` / `route_ext` in host_vars/<host>.yml. The keys use
+# the native caddy_*/tunnel_* names, so routes reference them 1:1.
+#
+# Two ingress models this supports:
+#   - HOME (tunnel):  external -> caddy_tls_mode "off", Cloudflare Tunnel does TLS.
+#   - VPS  (direct):  external -> Let's Encrypt via acme-dns wildcard *.<global>,
+#                     no tunnel, real A/AAAA DNS.
+# =============================================================================
+
+# --- DEFAULT publish profiles (override per host in host_vars) --------------
+# host_vars/<host>.yml wins over these group_vars defaults.
+#route_int:
+#  caddy_tls_mode: inherit             # inherit the *.int.<host> wildcard
+#  caddy_bind_interfaces: [tailscale0] # only reachable over Tailscale
+#  tunnel_enabled: false
+#  tunnel_manage_dns: false
+#
+#route_ext:
+#  caddy_tls_mode: "off"               # safe default: assume a tunnel does TLS
+#  caddy_bind_interfaces: []           # listen on all interfaces
+#  tunnel_enabled: true
+#  tunnel_manage_dns: true
+#  wildcard_cert_enabled: false        # does Caddy issue a *.<global_host> cert?
+
+# --- base: wildcard certs (used directly by resolve_routes.yml) --------------
+proxy_routes_base:
+  - name: wildcard_cert_internal
+    hostname: "*.{{ internal_host }}"
+    caddy_tls_mode: "acme_dns"
+
+  # Public wildcard: only issued when external routes use a Caddy-issued cert
+  # (caddy_tls_mode inherit/acme_dns). On tunnel hosts (tls off) it is disabled.
+  - name: wildcard_cert_public
+    hostname: "*.{{ global_host }}"
+    caddy_enabled: "{{ route_ext.wildcard_cert_enabled }}"
+    caddy_tls_mode: "acme_dns"

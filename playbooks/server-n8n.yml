@@ -1,0 +1,37 @@
+---
+# =============================================================================
+# n8n Server: Hardening + Users + Docker + Tailscale + Postgres + n8n + Caddy
+#
+# Usage:
+#   ansible-playbook -i inventory.ini playbooks/server-n8n.yml --limit myserver
+# =============================================================================
+
+- name: n8n Server
+  hosts: all
+  become: true
+  # No vars_files: app config lives in group_vars/all/<service>.yml (auto-
+  # loaded), secrets in group_vars/all/vault.yml (vault_* convention).
+  # Routes live centrally in group_vars/all/proxy_routes.yml (auto-loaded).
+  # Every role is tag-gated with its own name, so single services can be
+  # deployed fast (role defaults still load play-wide for skipped roles):
+  #   ansible-playbook ... --tags n8n,caddy
+  # The edge roles share the extra tag 'caddy' so one tag reruns the whole
+  # route pipeline (render + DNS + tunnel + post-check).
+  roles:
+    - { role: hardening, tags: [hardening] }
+    - { role: tailscale, tags: [tailscale] }
+    - { role: users, tags: [users] }
+    - { role: docker, tags: [docker] }
+    - { role: compose_stack, vars: { stack: postgres }, tags: [postgres] }
+    # Generic compose stacks (definitions in stacks/<name>/).
+    - { role: compose_stack, vars: { stack: pgadmin }, tags: [pgadmin] }
+    - { role: n8n, tags: [n8n] }
+    - { role: monitoring, tags: [monitoring] }
+    - { role: compose_stack, vars: { stack: komodo }, tags: [komodo] }
+    - { role: cockpit, tags: [cockpit] }
+    - { role: compose_stack, vars: { stack: playwright_mcp }, tags: [playwright_mcp] }
+    - { role: caddy, tags: [caddy] }
+    - { role: cloudflare_dns, tags: [caddy, cloudflare_dns] }
+    - { role: cloudflared, tags: [caddy, cloudflared] }
+    - { role: caddy_post_check, tags: [caddy, caddy_post_check] }
+    

@@ -1,0 +1,54 @@
+---
+hardening_rollback_delay_minutes: 5
+
+hardening_base_packages:
+  - vim
+  - htop
+  - curl
+  - wget
+  - git
+  - unattended-upgrades
+  - apt-listchanges
+  - net-tools
+  - tmux
+  - at
+  - chrony
+  - nano
+
+hardening_ufw_allowed_ports:
+  - { port: "22", proto: "tcp", comment: "SSH" }
+  - { port: "80", proto: "tcp", comment: "HTTP" }
+  - { port: "80", proto: "udp", comment: "HTTP" }
+  - { port: "443", proto: "tcp", comment: "HTTPS" }
+  - { port: "443", proto: "udp", comment: "HTTPS/HTTP3 QUIC" }
+
+# IP ranges that get full port access via UFW (no port restriction).
+# Useful for VPN networks, local testing, or trusted subnets.
+# Comment out ranges you don't want to allow.
+hardening_ufw_full_access_ranges: []
+  #- { from_ip: "100.64.0.0/10", interface: "tailscale0", comment: "Tailscale VPN" }
+  #- { from_ip: "192.168.0.0/16", comment: "Local LAN" }  # no interface = all interfaces
+
+# Swap
+hardening_swap_enabled: true
+hardening_swap_path: /swapfile
+hardening_swap_size_mb: 2048
+hardening_swap_swappiness: 10          # low = prefer RAM, good for servers
+hardening_swap_vfs_cache_pressure: 50  # default 100, lower = keep inode cache longer
+  #- { from_ip: "100.64.0.0/10", interface: "tailscale0", comment: "Tailscale VPN" }
+  #- { from_ip: "192.168.0.0/16", comment: "Local LAN" }  # no interface = all interfaces
+
+# Make Docker respect UFW rules by populating the DOCKER-USER iptables chain.
+# Derives allowed ranges from hardening_ufw_full_access_ranges automatically.
+# Traffic from trusted ranges reaches containers directly; external internet is blocked.
+hardening_docker_ufw_compat: true
+
+hardening_fail2ban_maxretry: 10
+hardening_fail2ban_findtime: "10m"
+hardening_fail2ban_bantime: "1h"
+
+# Max tolerated clock skew (seconds) vs online/controller time before hardening hard-fails.
+clock_skew_max_seconds: 120
+
+# Max seconds to wait for a background apt/dpkg lock to clear before aborting.
+apt_lock_wait_seconds: 300

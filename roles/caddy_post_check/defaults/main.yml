@@ -1,0 +1,30 @@
+---
+# Final end-to-end checks for public routes after application, Caddy and optional
+# Cloudflare Tunnel roles have all run.
+caddy_post_check_enabled: true
+caddy_post_check_retries: 20
+caddy_post_check_delay: 3
+caddy_post_check_timeout: 10
+caddy_post_check_validate_certs: true
+caddy_post_check_follow_redirects: safe
+caddy_post_check_status_codes:
+  - 200
+  - 301
+  - 302
+  - 401
+  - 403
+
+# Shared route model. All routes with caddy_enabled=true are checked when
+# caddy_post_check_enabled=true. Per-route optional overrides:
+#   healthcheck_url: "https://example.com/health"
+#   healthcheck_status_codes: [200]
+#   healthcheck_validate_certs: true/false
+#   healthcheck_timeout: 10
+proxy_routes: []
+
+# Optional preferred resolver to WAIT for DNS propagation before checking
+# (e.g. "1.1.1.1" or "ns1.desec.io"). Empty = no wait; the check uses the
+# system resolver directly. Requires `dig` (dnsutils) on the host.
+check_public_routes_dns_server: ""
+caddy_post_check_dns_retries: 30
+caddy_post_check_dns_delay: 2

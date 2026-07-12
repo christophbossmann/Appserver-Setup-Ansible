@@ -1,0 +1,7 @@
+---
+# up -d --force-recreate (not `restart`): a plain restart does NOT apply
+# docker-compose.yml changes (image/env/ports) — same pattern as compose_stack.
+- name: Restart monitoring stack
+  ansible.builtin.command: docker compose up -d --force-recreate
+  args:
+    chdir: /opt/monitoring

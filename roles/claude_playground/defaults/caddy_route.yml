@@ -1,0 +1,24 @@
+# Caddy route for this role — loaded explicitly by the caddy role.
+# basic_auth hashes live in group_vars/all/vault.yml (generate a new one with
+# `caddy hash-password`).
+caddy_route_playground:
+  name: playground
+  hostname_label: playground
+  caddy_upstream: "127.0.0.1:8090"
+  caddy_extra: |
+    basic_auth {
+      kunde {{ vault_basicauth_hash_playground }}
+    }
+
+# WebDAV access to the playground workspace (opt-in via playground_webdav_enabled).
+# Add 'webdav_playground' to the host's caddy_services to expose it.
+# Port must match playground_webdav_port (default 8091).
+caddy_route_webdav_playground:
+  name: webdav-playground
+  hostname_label: webdav-playground
+  caddy_upstream: "127.0.0.1:8091"
+  caddy_extra: |
+    # matches playground_webdav_user / vault_playground_webdav_password
+    basic_auth {
+      {{ admin_user }} {{ vault_basicauth_hash_webdav_playground }}
+    }

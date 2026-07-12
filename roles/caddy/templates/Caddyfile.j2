@@ -1,0 +1,70 @@
+{% if caddy_email or caddy_pki_cas | default([]) | length > 0 %}
+{
+{% if caddy_email %}
+    email {{ caddy_email }}
+{% endif %}
+{% if caddy_pki_cas | default([]) | length > 0 %}
+    pki {
+{% for ca in caddy_pki_cas %}
+        ca {{ ca.name }} {
+            root {
+                cert {{ ca.cert }}
+                key  {{ ca.key }}
+            }
+        }
+{% endfor %}
+    }
+{% endif %}
+}
+{% endif %}
+
+{% for site in caddy_effective_sites | default(caddy_sites | default([])) %}
+{% set site_tls_mode = site.caddy_tls_mode | default(caddy_tls_mode) %}
+{% set allowed_ranges = site.caddy_allowed_ranges | default([]) %}
+{% set effective_ca = site.caddy_pki_ca | default(caddy_pki_default_ca) | default('') %}
+{% set effective_cert = site.caddy_cert_file | default(caddy_tls_cert_file) | default('') %}
+{% set effective_key  = site.caddy_key_file  | default(caddy_tls_key_file)  | default('') %}
+{% if site_tls_mode == "off" %}http://{{ site.hostname }}{% else %}{{ site.hostname }}{% endif %} {
+{% if site.caddy_bind_interfaces | default([]) | length > 0 %}
+{% set _bind_addrs = site.caddy_bind_interfaces | map('extract', caddy_bind_interface_ipv4_map) | join(' ') %}
+    bind {{ _bind_addrs }}
+{% endif %}
+{% if site_tls_mode == "internal" %}
+{% if effective_ca %}
+    tls {
+        ca {{ effective_ca }}
+    }
+{% else %}
+    tls internal
+{% endif %}
+{% elif site_tls_mode == "cloudflare_dns" %}
+    tls {
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+    }
+{% elif site_tls_mode == "tailscale" %}
+    tls {{ caddy_tailscale_cert_dir }}/{{ site.hostname }}.crt {{ caddy_tailscale_cert_dir }}/{{ site.hostname }}.key
+{% elif site_tls_mode == "acme_dns" %}
+    tls {
+        dns acmedns {{ caddy_acme_dns_credentials_file }}
+        propagation_timeout {{ caddy_acme_dns_propagation_timeout | default('-1') }}
+    }
+{% elif site_tls_mode == "manual_cert" %}
+    tls {{ effective_cert }} {{ effective_key }}
+{% endif %}
+{% if site.caddy_upstream | default('') %}
+{% if allowed_ranges | length > 0 %}
+    @allowed remote_ip {{ allowed_ranges | join(' ') }}
+    reverse_proxy @allowed {{ site.caddy_upstream }}
+    respond "Forbidden" 403
+{% else %}
+    reverse_proxy {{ site.caddy_upstream }}
+{% endif %}
+{% else %}
+    respond "Not Found" 404
+{% endif %}
+{% if site.caddy_extra | default('') %}
+{{ site.caddy_extra | indent(4, first=true) }}
+{% endif %}
+}
+
+{% endfor %}

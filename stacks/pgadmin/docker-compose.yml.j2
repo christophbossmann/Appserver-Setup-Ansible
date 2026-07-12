@@ -1,0 +1,21 @@
+services:
+  pgadmin:
+    image: {{ pgadmin_image }}
+    container_name: pgadmin
+    restart: unless-stopped
+    ports:
+      # Loopback only — reachable via the Caddy route (tailscale) or an SSH
+      # tunnel: ssh -L 5050:127.0.0.1:5050 <host>
+      - "127.0.0.1:{{ pgadmin_port }}:80"
+    volumes:
+      - /opt/pgadmin/data:/var/lib/pgadmin
+      - /opt/pgadmin/servers.json:/pgadmin4/servers.json:ro
+    environment:
+      PGADMIN_DEFAULT_EMAIL: {{ pgadmin_email }}
+      PGADMIN_DEFAULT_PASSWORD: {{ pgadmin_password }}
+      PGADMIN_CONFIG_SERVER_MODE: "True"
+
+networks:
+  default:
+    name: backend
+    external: true

@@ -1,0 +1,24 @@
+---
+# Playwright MCP stack defaults (was roles/playwright_mcp/defaults/main.yml).
+# Digest pin: no <service>_version var here on purpose — @sha256 pins don't fit
+# the repo:tag scheme. Bump by replacing the digest in the full _image var.
+playwright_mcp_image: "ghcr.io/xtr-dev/mcp-playwright-novnc@sha256:e42bfafecd753042a2e67b6c6c034bc8de0426589bd36b2ab0ec69618e2a661e"
+
+# Host ports
+playwright_mcp_port: 3100
+playwright_mcp_novnc_port: 6080
+
+# Virtual display
+playwright_mcp_screen_width: 1920
+playwright_mcp_screen_height: 1080
+playwright_mcp_screen_depth: 24
+
+# Browser engine: chromium, firefox, webkit
+playwright_mcp_browser: chromium
+
+# Shared memory for Chromium
+playwright_mcp_shm_size: "2gb"
+
+# Extra environment variables — merged on top of the defaults above.
+# Keys = exact env var names. User values win over defaults.
+playwright_mcp_extra_env: {}

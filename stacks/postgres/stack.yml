@@ -1,0 +1,15 @@
+# Per-stack settings for compose_stack (see roles/compose_stack/defaults/main.yml).
+owner: "999"   # postgres container user
+group: "999"
+mode: "0700"
+networks:
+  - backend    # shared net; pgadmin/playwright/n8n compose files join it as external
+dirs:
+  - { path: "{{ postgres_data_dir }}", owner: "999", group: "999", mode: "0700" }
+# Stateful service: never auto-pull — a new 16.x image would recreate the DB
+# container on a routine run. Update deliberately via postgres_version.
+pull: false
+health_cmd: "docker exec postgres pg_isready -U {{ postgres_user }}"
+health_retries: 10
+health_delay: 3
+status_msg: "Postgres {{ postgres_version }} is running on port {{ postgres_port }}."
