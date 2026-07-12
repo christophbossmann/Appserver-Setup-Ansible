@@ -1,0 +1,5 @@
+---
+- name: Restart n8n
+  ansible.builtin.command: docker compose up -d --force-recreate
+  args:
+    chdir: /opt/n8n

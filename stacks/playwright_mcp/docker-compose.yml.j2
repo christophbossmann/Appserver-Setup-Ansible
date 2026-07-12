@@ -1,0 +1,42 @@
+{# ============================================================
+   Build the final environment dict via combine.
+   - pw_env_base:       role defaults, always present
+   - extra_env:         user vars from host/group vars (wins)
+   ============================================================ #}
+
+{% set pw_env_base = {
+  'SCREEN_WIDTH':  playwright_mcp_screen_width  | string,
+  'SCREEN_HEIGHT': playwright_mcp_screen_height | string,
+  'SCREEN_DEPTH':  playwright_mcp_screen_depth  | string,
+  'MCP_PORT':      '3000',
+  'MCP_BROWSER':   playwright_mcp_browser
+} %}
+
+{% set pw_env_final = pw_env_base | combine(playwright_mcp_extra_env) %}
+
+services:
+  playwright-mcp:
+    image: {{ playwright_mcp_image }}
+    container_name: playwright-mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:{{ playwright_mcp_port }}:3000"
+      - "127.0.0.1:{{ playwright_mcp_novnc_port }}:6080"
+    volumes:
+      - /opt/playwright-mcp/index.html:/usr/share/novnc/index.html:ro
+    environment:
+{% for key, value in pw_env_final.items() %}
+      - {{ key }}={{ value }}
+{% endfor %}
+    shm_size: {{ playwright_mcp_shm_size }}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:6080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  default:
+    name: backend
+    external: true

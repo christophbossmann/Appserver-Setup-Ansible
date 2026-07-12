@@ -1,0 +1,8 @@
+# Example playground recipe. Replace this with whatever you want to test.
+# It must listen on port {{ playground_internal_port }}; Caddy reaches it by
+# container name over the shared network.
+FROM python:3.12-slim
+WORKDIR /app
+RUN printf '<h1>Playground OK</h1>' > index.html
+EXPOSE {{ playground_internal_port }}
+CMD ["python", "-m", "http.server", "{{ playground_internal_port }}"]

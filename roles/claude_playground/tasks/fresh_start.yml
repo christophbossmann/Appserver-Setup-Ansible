@@ -1,0 +1,38 @@
+# --- Optional fresh start ----------------------------------------------------
+
+- name: Fresh start - compose down with volumes
+  ansible.builtin.command:
+    cmd: docker compose down -v --remove-orphans
+    chdir: "{{ base_dir }}"
+  register: _fresh_down
+  changed_when: "'Removing' in (_fresh_down.stderr | default('')) or 'Removed' in (_fresh_down.stderr | default(''))"
+  failed_when: false
+
+- name: Fresh start - remove the claude-ctl container
+  ansible.builtin.command:
+    cmd: docker rm -f claude-ctl
+  register: _fresh_ctl
+  changed_when: _fresh_ctl.rc == 0
+  failed_when: false
+  
+- name: Fresh start - tear down the rootless playground stack
+  ansible.builtin.command:
+    cmd: "{{ playground_ctl_bin }} playground compose destroy"   # down + volumes
+  changed_when: true
+  failed_when: false
+
+- name: Fresh start - find everything in the workspace
+  ansible.builtin.find:
+    paths: "{{ playground_ctl_workspace }}"
+    file_type: any
+    hidden: true            # auch versteckte Dateien (.env etc.)
+  register: _ws_entries
+
+- name: Fresh start - wipe all workspace contents (keep the dir itself)
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _ws_entries.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+

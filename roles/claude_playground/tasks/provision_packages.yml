@@ -1,0 +1,30 @@
+---
+# === Step 1 (task.md): system packages for rootless Docker ===========================
+# Ansible-equivalent of:  apt install -y uidmap dbus-user-session docker-ce-rootless-extras
+# The `docker` role must run earlier in the play: it adds the Docker CE apt repo
+# that provides `docker-ce-rootless-extras`. `acl` is added so that becoming the
+# unprivileged `playground` user (and host-side ACLs on its runtime dir) works
+# cleanly.
+
+- name: Install rootless Docker prerequisites
+  ansible.builtin.apt:
+    name:
+      - uidmap
+      - dbus-user-session
+      - docker-ce-rootless-extras
+      - acl
+    state: present
+    update_cache: true
+
+# Optional verification (task.md, "Optional prüfen"): make sure the rootless
+# tooling is actually on PATH before we try to use it as the playground user.
+# NOTE: `command -v` is a shell builtin, so this MUST use the shell module (the
+# command module has no shell and would look for a binary named "command").
+- name: Verify rootless Docker tooling is present
+  ansible.builtin.shell: "command -v {{ item }}"
+  loop:
+    - dockerd-rootless-setuptool.sh
+    - dockerd-rootless.sh
+    - newuidmap
+    - newgidmap
+  changed_when: false

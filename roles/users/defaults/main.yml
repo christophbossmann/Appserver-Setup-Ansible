@@ -1,0 +1,18 @@
+---
+# Define users in your vars file, e.g.:
+#
+#   users:
+#     - name: christoph
+#       sudo: true
+#       password: "{{ 'mypass' | password_hash('sha512', 'mysalt') }}"
+#       ssh_keys:
+#         - "{{ lookup('file', '~/.ssh/christoph_key.pub') }}"
+#
+#     - name: deploy
+#       sudo: true
+#       sudo_nopasswd: true    # passwordless sudo for service accounts
+#
+#     - name: olduser
+#       state: absent          # removes the user
+
+users: []

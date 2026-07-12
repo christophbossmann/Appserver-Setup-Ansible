@@ -1,0 +1,89 @@
+---
+# === Steps 2-4 + 6 (task.md): user, group, subuid/subgid, linger, workspace ==========
+# Ansible-equivalent of the user/group/subid/linger/workspace parts of
+# setup-playground-rootless-docker.sh. Python never does any of this.
+
+# --- Group for the broker socket --------------------------------------------
+- name: Ensure broker socket group exists
+  ansible.builtin.group:
+    name: "{{ playground_ctl_socket_group }}"
+    state: present
+
+# --- The playground service account -----------------------------------------
+# Home dir + locked password login. Created here (not via the global `users`
+# role) so the role stays self-contained.
+- name: Ensure playground user exists (home, locked password)
+  ansible.builtin.user:
+    name: "{{ playground_ctl_user }}"
+    shell: /bin/bash
+    create_home: true
+    password_lock: true
+    state: present
+
+# task.md: "playground ist nicht in der Gruppe docker."
+- name: Read playground group membership
+  ansible.builtin.command: "id -nG {{ playground_ctl_user }}"
+  register: _pgctl_groups
+  changed_when: false
+
+- name: Ensure playground is NOT a member of the docker group
+  ansible.builtin.command: "gpasswd -d {{ playground_ctl_user }} docker"
+  when: "'docker' in _pgctl_groups.stdout.split()"
+  changed_when: true
+
+# --- subuid / subgid (task.md step 3) ---------------------------------------
+- name: Ensure subuid mapping for playground
+  ansible.builtin.lineinfile:
+    path: /etc/subuid
+    regexp: "^{{ playground_ctl_user }}:"
+    line: "{{ playground_ctl_user }}:{{ playground_ctl_subid_start }}:{{ playground_ctl_subid_count }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Ensure subgid mapping for playground
+  ansible.builtin.lineinfile:
+    path: /etc/subgid
+    regexp: "^{{ playground_ctl_user }}:"
+    line: "{{ playground_ctl_user }}:{{ playground_ctl_subid_start }}:{{ playground_ctl_subid_count }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+
+# --- Linger (task.md step 4) ------------------------------------------------
+# Lets the rootless docker user manager (and thus the daemon) run without an
+# active login session, and survive reboots.
+- name: Enable linger for the playground user
+  ansible.builtin.command: "loginctl enable-linger {{ playground_ctl_user }}"
+  args:
+    creates: "/var/lib/systemd/linger/{{ playground_ctl_user }}"
+
+# --- Workspace (task.md step 6) ---------------------------------------------
+# Owner playground:playground, and explicitly NOT a symlink.
+- name: Stat the playground workspace path
+  ansible.builtin.stat:
+    path: "{{ playground_ctl_workspace }}"
+  register: _pgctl_ws
+
+- name: Fail if the workspace path is a symlink
+  ansible.builtin.assert:
+    that:
+      - not (_pgctl_ws.stat.islnk | default(false))
+    fail_msg: >-
+      {{ playground_ctl_workspace }} is a symlink. The workspace must be a real
+      directory owned by {{ playground_ctl_user }}. Remove the symlink and re-run.
+
+- name: Ensure playground workspace exists (owner playground, real directory)
+  ansible.builtin.file:
+    path: "{{ playground_ctl_workspace }}"
+    state: directory
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    # setgid (2xxx) so files created in the workspace inherit the playground
+    # group. In rootless stack mode the claude-ctl container (uid 10001) is
+    # added to the playground group via group_add and can then write here, while
+    # the rootless playground daemon (running as the playground user) builds
+    # from the very same files. No container uid change needed.
+    mode: "02775"

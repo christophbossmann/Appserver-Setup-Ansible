@@ -1,0 +1,29 @@
+1. RUN ansible bootstrap: ./ansible-bootstrap.sh
+2. RUN ansible playbook: ansible-playbook -i inventory.ini playbooks/server-n8n.yml --limit myserver
+
+
+
+
+
+-------------------------------------
+-------------------------------------
+
+LEGACY
+------------------
+
+api token: REDACTED_ROTATE_ME
+
+tunnel connector: REDACTED_TUNNEL_CONNECTOR_TOKEN
+
+tunnel id: 058482f6-f3d7-42c2-8602-306c464c1a20
+
+acocount id: f00ba75fc86393e41f6e158263772965
+
+curl -sS \
+  -H "Authorization: Bearer cfut_REDACTED_ROTATE_ME" \
+  "https://api.cloudflare.com/client/v4/accounts/f00ba75fc86393e41f6e158263772965/cfd_tunnel/058482f6-f3d7-42c2-8602-306c464c1a20/configurations"
+
+
+curl -sS \
+  -H "Authorization: Bearer cfut_REDACTED_ROTATE_ME" \
+  "https://api.cloudflare.com/client/v4/zones?name=playnconnect.net"

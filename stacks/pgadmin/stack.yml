@@ -1,0 +1,13 @@
+# Per-stack settings for compose_stack (see roles/compose_stack/defaults/main.yml).
+owner: "5050"   # pgAdmin container user
+group: "5050"
+compose_mode: "0600"   # compose file contains PGADMIN_DEFAULT_PASSWORD
+dirs:
+  - { path: data, owner: "5050", group: "5050" }
+configs:
+  - { src: configs/servers.json.j2, dest: servers.json }
+health_url: "http://127.0.0.1:{{ pgadmin_port }}/misc/ping"
+status_msg: >-
+  Dashboard: http://{{ ansible_host }}:{{ pgadmin_port }} —
+  Login: {{ pgadmin_email }} / <see vars>.
+  Postgres server is auto-registered; enter the Postgres password on first connect.

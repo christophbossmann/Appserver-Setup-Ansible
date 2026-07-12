@@ -1,0 +1,41 @@
+---
+# Komodo stack defaults (was roles/komodo/defaults/main.yml).
+# Override per host in host_vars or per play via vars_files (vars/monitoring.yml).
+
+# === Images ===
+# Pin to a specific version — Komodo updates can be breaking.
+# Check releases: https://github.com/moghtech/komodo/releases
+# Core and periphery MUST run the same version -> shared komodo_version.
+komodo_version: "2"
+komodo_core_image: "ghcr.io/moghtech/komodo-core:{{ komodo_version }}"
+komodo_periphery_image: "ghcr.io/moghtech/komodo-periphery:{{ komodo_version }}"
+# FerretDB v2 (MongoDB-compatible adapter backed by Postgres); the two tags are
+# coupled to each other, so they stay full-image vars.
+komodo_postgres_image: "ghcr.io/ferretdb/postgres-documentdb:17-0.107.0-ferretdb-2.7.0"
+komodo_ferretdb_image: "ghcr.io/ferretdb/ferretdb:2.7.0"
+
+# === Ports ===
+komodo_port: 9120
+
+# === Data ===
+komodo_data_dir: /opt/komodo
+# All repos / configs managed by Periphery must live under this path.
+# Must be identical inside and outside the container.
+komodo_periphery_root_dir: /etc/komodo
+
+# === Credentials ===
+# CHANGE THESE — especially passkey (used for Core<->Periphery auth).
+# Use a long random string for passkey (e.g. openssl rand -hex 32).
+komodo_passkey: "changeme-replace-with-long-random-string"
+komodo_database_username: "komodo"
+komodo_database_password: "changeme"
+
+# === Core Config ===
+komodo_host: "https://komodo.{{ internal_host }}"
+komodo_local_auth: true
+komodo_init_admin_username: "admin"
+komodo_init_admin_password: "changeme"
+# Auto-register the local Periphery on first Core startup.
+# first_server_address must be reachable from the Core container.
+komodo_first_server_name: "{{ inventory_hostname }}"
+komodo_first_server_address: "https://periphery:8120"

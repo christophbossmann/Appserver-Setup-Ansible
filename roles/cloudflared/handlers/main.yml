@@ -1,0 +1,7 @@
+---
+# No failed_when: false — a tunnel that fails to restart after a config change
+# must fail the play, not silently stay down.
+- name: Restart cloudflared
+  ansible.builtin.systemd:
+    name: cloudflared
+    state: restarted

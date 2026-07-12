@@ -1,0 +1,80 @@
+---
+# === Step 5 (task.md): rootless Docker for the playground user =======================
+# Ansible-equivalent of the `dockerd-rootless-setuptool.sh install` block.
+#
+# Approach: every command runs as root (the play is `become: true`) and reaches
+# the playground user via `sudo -iu` — a LOGIN shell — exactly like the proven
+# setup-playground-rootless-docker.sh. This sets up XDG_RUNTIME_DIR / the user
+# D-Bus session reliably and avoids the classic Ansible `become_user` tmpfile
+# pitfalls with unprivileged accounts.
+
+- name: Resolve the playground uid
+  ansible.builtin.command: "id -u {{ playground_ctl_user }}"
+  register: _pgctl_uid
+  changed_when: false
+
+- name: Set rootless runtime facts
+  ansible.builtin.set_fact:
+    playground_ctl_uid: "{{ _pgctl_uid.stdout | trim }}"
+    playground_ctl_xdg: "/run/user/{{ _pgctl_uid.stdout | trim }}"
+
+# Linger creates the per-user runtime dir asynchronously; wait for it before
+# touching `systemctl --user`.
+- name: Wait for the playground user runtime dir (linger)
+  ansible.builtin.stat:
+    path: "{{ playground_ctl_xdg }}"
+  register: _pgctl_runtime
+  until: _pgctl_runtime.stat.exists
+  retries: 15
+  delay: 2
+
+- name: Install rootless Docker for the playground user (idempotent)
+  ansible.builtin.command:
+    cmd: >-
+      sudo -iu {{ playground_ctl_user }}
+      env XDG_RUNTIME_DIR={{ playground_ctl_xdg }}
+      DOCKER_HOST=unix://{{ playground_ctl_xdg }}/docker.sock
+      dockerd-rootless-setuptool.sh install --force
+    creates: "{{ playground_ctl_home }}/.config/systemd/user/docker.service"
+
+- name: Enable the rootless Docker user service
+  ansible.builtin.command:
+    cmd: >-
+      sudo -iu {{ playground_ctl_user }}
+      env XDG_RUNTIME_DIR={{ playground_ctl_xdg }}
+      systemctl --user enable docker
+  register: _pgctl_enable
+  changed_when: "'Created symlink' in (_pgctl_enable.stdout + _pgctl_enable.stderr)"
+
+- name: Check whether the rootless Docker user service is active
+  ansible.builtin.command:
+    cmd: >-
+      sudo -iu {{ playground_ctl_user }}
+      env XDG_RUNTIME_DIR={{ playground_ctl_xdg }}
+      systemctl --user is-active docker
+  register: _pgctl_active
+  changed_when: false
+  failed_when: false
+
+- name: Start the rootless Docker user service if not active
+  ansible.builtin.command:
+    cmd: >-
+      sudo -iu {{ playground_ctl_user }}
+      env XDG_RUNTIME_DIR={{ playground_ctl_xdg }}
+      systemctl --user start docker
+  when: _pgctl_active.stdout | trim != 'active'
+  changed_when: true
+
+# Sanity: the rootless socket should now exist and the daemon should answer.
+- name: Verify the rootless Docker daemon is reachable
+  ansible.builtin.command:
+    cmd: >-
+      sudo -u {{ playground_ctl_user }}
+      env XDG_RUNTIME_DIR={{ playground_ctl_xdg }}
+      DOCKER_HOST=unix://{{ playground_ctl_xdg }}/docker.sock
+      docker info
+  register: _pgctl_info
+  changed_when: false
+  retries: 5
+  delay: 3
+  until: _pgctl_info.rc == 0

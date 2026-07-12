@@ -1,0 +1,118 @@
+---
+- name: Normalize desired Cloudflare DNS record
+  ansible.builtin.set_fact:
+    cloudflare_dns_record_normalized:
+      type: "{{ cloudflare_dns_record.type | default(cloudflare_dns_default_type) | upper }}"
+      name: "{{ cloudflare_dns_record.name }}"
+      content: "{{ cloudflare_dns_record.content }}"
+      proxied: "{{ cloudflare_dns_record.proxied | default(cloudflare_dns_default_proxied) }}"
+      ttl: "{{ cloudflare_dns_record.ttl | default(cloudflare_dns_default_ttl) }}"
+      comment: "{{ cloudflare_dns_record.comment | default(omit) }}"
+
+# Query by hostname only, not by type.
+# This intentionally allows a dev hostname to be moved from an old A/AAAA/CNAME target
+# to the desired tunnel CNAME target without manual cleanup first.
+- name: Find existing Cloudflare DNS records for hostname
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ cloudflare_effective_zone_id }}/dns_records?name={{ cloudflare_dns_record_normalized.name | urlencode }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token | trim }}"
+      Content-Type: "application/json"
+    return_content: true
+    status_code: 200
+  register: cloudflare_dns_existing_response
+  no_log: true
+
+- name: Extract existing Cloudflare DNS records for hostname
+  ansible.builtin.set_fact:
+    cloudflare_dns_existing_records: "{{ cloudflare_dns_existing_response.json.result | default([]) }}"
+
+- name: Find exact desired Cloudflare DNS record
+  ansible.builtin.set_fact:
+    cloudflare_dns_exact_records: >-
+      {{
+        cloudflare_dns_existing_records
+        | selectattr('type', 'equalto', cloudflare_dns_record_normalized.type)
+        | selectattr('name', 'equalto', cloudflare_dns_record_normalized.name)
+        | selectattr('content', 'equalto', cloudflare_dns_record_normalized.content)
+        | list
+      }}
+
+- name: Pick Cloudflare DNS record to update if hostname already exists
+  ansible.builtin.set_fact:
+    cloudflare_dns_exact_record: "{{ (cloudflare_dns_exact_records | first) | default({}, true) }}"
+    cloudflare_dns_record_to_update: "{{ (cloudflare_dns_existing_records | first) | default({}, true) }}"
+
+- name: Build Cloudflare DNS record payload
+  ansible.builtin.set_fact:
+    cloudflare_dns_record_payload: >-
+      {{
+        {
+          'type': cloudflare_dns_record_normalized.type,
+          'name': cloudflare_dns_record_normalized.name,
+          'content': cloudflare_dns_record_normalized.content,
+          'proxied': cloudflare_dns_record_normalized.proxied | bool,
+          'ttl': cloudflare_dns_record_normalized.ttl | int
+        }
+        | combine({'comment': cloudflare_dns_record.comment}
+                  if (cloudflare_dns_record.comment is defined and (cloudflare_dns_record.comment | string | length > 0)) else {})
+      }}
+
+- name: Create Cloudflare DNS record when hostname does not exist
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ cloudflare_effective_zone_id }}/dns_records"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token | trim }}"
+      Content-Type: "application/json"
+    body_format: json
+    body: "{{ cloudflare_dns_record_payload }}"
+    return_content: true
+    status_code: 200
+  no_log: true   # request headers carry the bearer token
+  when: cloudflare_dns_existing_records | length == 0
+
+# If the hostname exists but does not already point to the desired tunnel target,
+# update the first existing record in-place. This is intentionally an overwrite for
+# dev domains, e.g. A/AAAA/CNAME old-target -> CNAME <tunnel-id>.cfargotunnel.com.
+- name: Update existing Cloudflare DNS record when hostname points elsewhere
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ cloudflare_effective_zone_id }}/dns_records/{{ cloudflare_dns_record_to_update.id }}"
+    method: PUT
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token | trim }}"
+      Content-Type: "application/json"
+    body_format: json
+    body: "{{ cloudflare_dns_record_payload }}"
+    return_content: true
+    status_code: 200
+  no_log: true
+  when:
+    - cloudflare_dns_existing_records | length > 0
+    - cloudflare_dns_exact_record | length == 0
+
+# A CNAME cannot coexist with other records of the same hostname. If the dev hostname
+# had multiple stale records, keep the desired/updated one and remove only same-hostname
+# duplicates. This does not prune unrelated hostnames.
+- name: Remove duplicate Cloudflare DNS records for same hostname
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ cloudflare_effective_zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token | trim }}"
+      Content-Type: "application/json"
+    return_content: true
+    status_code: 200
+  loop: >-
+    {{
+      cloudflare_dns_existing_records
+      | rejectattr('id', 'equalto', (cloudflare_dns_exact_record.id | default(cloudflare_dns_record_to_update.id | default(''))))
+      | list
+    }}
+  loop_control:
+    label: "{{ item.type }} {{ item.name }} -> {{ item.content }}"
+  no_log: true
+  when:
+    - cloudflare_dns_existing_records | length > 1
+    - cloudflare_dns_exact_record | length > 0 or cloudflare_dns_record_to_update | length > 0

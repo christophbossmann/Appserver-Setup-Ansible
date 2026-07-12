@@ -1,0 +1,18 @@
+---
+# =============================================================================
+# Base Server Setup: Hardening + Users + Docker + Tailscale
+#
+# Usage:
+#   ansible-playbook -i inventory.ini playbooks/server-base.yml \
+#     --limit myserver
+# =============================================================================
+
+- name: Base Server Setup
+  hosts: all
+  become: true
+  roles:
+    - { role: hardening, tags: [hardening] }
+    - { role: users, tags: [users] }
+    - { role: docker, tags: [docker] }
+    - { role: tailscale, tags: [tailscale] }
+    - { role: caddy, tags: [caddy] }

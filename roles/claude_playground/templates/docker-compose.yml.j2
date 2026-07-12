@@ -1,0 +1,68 @@
+services:
+  # The AI runtime (Claude Code / Remote Control). In the rootless/migrated
+  # model it has NO Docker access of its own:
+  #   - NO /var/run/docker.sock
+  #   - NO helper container
+  # It manages playground workloads ONLY through `playgroundctl`, which talks to
+  # this host's playground-ctl broker over {{ playground_ctl_socket }} and from
+  # there to the rootless playground Docker daemon.
+  claude-ctl:
+    build:
+      context: {{ ctl_build_dir }}
+      args:
+        CLAUDE_CODE_VERSION: "{{ claude_code_version }}"
+    image: claude-ctl:local
+    container_name: claude-ctl
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    environment:
+      REMOTE_CONTROL: "{{ playground_remote_control_autoactivate | lower }}"
+      PLAYGROUND_CTL_SOCKET: "{{ playground_ctl_socket }}"
+    # uid stays 10001 (Claude login persistence is untouched). Access to the
+    # shared workspace and the broker socket is granted purely via group
+    # membership:
+    group_add:
+      - "{{ playground_ctl_workspace_gid }}"   # write into {{ playground_ctl_workspace }}
+      - "{{ playground_ctl_socket_gid }}"       # talk to the broker socket
+    volumes:
+      # Shared workspace, owned by the playground user (setgid playground group).
+      - "{{ playground_ctl_workspace }}:/workspace"
+      # Persisted Claude config + credentials (login survives rebuilds).
+      - "claude_home:/home/claude"
+      # The ONLY path to Docker: the broker socket. Never the host docker.sock.
+      - "{{ playground_ctl_socket }}:{{ playground_ctl_socket }}"
+
+{% if playground_webdav_enabled %}
+  # WebDAV access to workspace + claude-home (rclone serve webdav), mirroring
+  # the n8n webdav sidecar. Runs as the claude uid (10001, baked into the
+  # claude-ctl image) + playground group — the same identity mix as claude-ctl
+  # itself, so it can fully access the claude_home volume (memory files) AND
+  # the group-writable setgid workspace.
+  # The Claude login token (.credentials.json) is excluded from serving.
+  # Bound to 127.0.0.1 only; exposed via the webdav-playground.<host> Caddy route.
+  playground-webdav:
+    image: {{ playground_webdav_image }}
+    container_name: playground-webdav
+    restart: unless-stopped
+    user: "10001:{{ playground_ctl_workspace_gid }}"
+    command: >
+      serve webdav /data
+      --addr :8888
+      --user {{ playground_webdav_user }}
+      --pass {{ playground_webdav_password }}
+      --dir-cache-time {{ playground_webdav_cachetime }}
+      --exclude "/claude-home/.claude/.credentials.json"
+{% if playground_webdav_readonly %}      --read-only
+{% endif %}
+    volumes:
+      - "{{ playground_ctl_workspace }}:/data/workspace"
+{% if playground_webdav_include_claude_home %}
+      - "claude_home:/data/claude-home"
+{% endif %}
+    ports:
+      - "127.0.0.1:{{ playground_webdav_port }}:8888"
+{% endif %}
+
+volumes:
+  claude_home:

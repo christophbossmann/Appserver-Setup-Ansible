@@ -1,0 +1,12 @@
+# Caddy routes for this role — loaded explicitly by the caddy role.
+# One role may define several routes. Var name uses underscores;
+# hostname_label keeps the hyphen for the actual domain.
+caddy_route_n8n:
+  name: n8n
+  hostname_label: n8n
+  caddy_upstream: "127.0.0.1:5678"
+
+caddy_route_webdav_n8n:
+  name: webdav-n8n
+  hostname_label: webdav-n8n
+  caddy_upstream: "127.0.0.1:8888"

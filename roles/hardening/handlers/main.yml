@@ -1,0 +1,14 @@
+---
+- name: Restart Fail2Ban
+  ansible.builtin.systemd:
+    name: fail2ban
+    state: restarted
+
+- name: Restart SSH
+  ansible.builtin.systemd:
+    name: ssh
+    state: restarted
+
+- name: Reload UFW
+  ansible.builtin.command: ufw reload
+  changed_when: true

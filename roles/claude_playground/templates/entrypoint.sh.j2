@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CRED="${HOME}/.claude/.credentials.json"
+RC="${REMOTE_CONTROL:-false}"
+
+# Remote Control disabled: install/login only, never auto-start it.
+if [ "$RC" != "true" ]; then
+  cat <<'EOF'
+========================================================================
+ [claude-ctl] Remote Control is DISABLED
+ (playground_remote_control_autoactivate=false).
+
+ The Claude CLI is installed. You can log in / use it interactively:
+   docker exec -it claude-ctl claude
+
+ Remote Control will NOT be started. Set the variable to true and re-run
+ the playbook to activate it.
+========================================================================
+EOF
+  exec sleep infinity
+fi
+
+# Remote Control enabled but not logged in yet.
+if [ ! -f "$CRED" ]; then
+  cat <<'EOF'
+========================================================================
+ [claude-ctl] Remote Control enabled, but not logged in yet.
+
+ One-time login (run on the host):
+   docker exec -it claude-ctl claude
+     -> choose the claude.ai /login option (API keys do NOT work)
+     -> on a headless server, use the URL + paste-the-code flow
+     -> accept the workspace-trust dialog for /workspace
+
+ Then restart so Remote Control starts automatically:
+   docker restart claude-ctl
+========================================================================
+EOF
+  exec sleep infinity
+fi
+
+echo "[claude-ctl] Credentials found -> starting Remote Control (server mode)."
+echo "[claude-ctl] Connection URL appears below; or open the session from the"
+echo "[claude-ctl] Claude app session list. Watch it with: docker logs -f claude-ctl"
+
+# Best-effort: persist the documented auto-enable preference (honored by newer
+# versions, so the y/n prompt is skipped entirely).
+if [ -f "${HOME}/.claude.json" ]; then
+  tmp="$(mktemp)"
+  jq '.remoteControlAtStartup = true' "${HOME}/.claude.json" > "$tmp" 2>/dev/null \
+    && mv "$tmp" "${HOME}/.claude.json" || rm -f "$tmp"
+fi
+
+# Also answer the one-time "Enable Remote Control? (y/n)" prompt non-interactively,
+# in case this version still asks. `exec` keeps the pipeline as the main process.
+exec sh -c '
+while true; do
+  printf "y\n" | claude remote-control
+  echo "[claude-ctl] Remote Control exited - restarting in 5s (new session will register)..."
+  sleep 5
+done'

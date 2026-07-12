@@ -1,0 +1,83 @@
+---
+- name: Require Cloudflare DNS management variables
+  ansible.builtin.assert:
+    that:
+      - cloudflare_api_token | default('') | trim | length > 0
+      - (cloudflare_zone_id | default('') | trim | length > 0) or (cloudflare_zone_name | default('') | trim | length > 0)
+    fail_msg: "cloudflare_api_token and either cloudflare_zone_id or cloudflare_zone_name are required when cloudflare_manage_dns_records=true"
+  no_log: true
+  when: cloudflare_manage_dns_records | bool
+
+- name: Build desired Cloudflare DNS records
+  ansible.builtin.set_fact:
+    cloudflare_desired_dns_records: "{{ lookup('template', 'desired_dns_records.yml.j2') | from_yaml | default([], true) }}"
+  when: cloudflare_manage_dns_records | bool
+
+- name: Skip Cloudflare DNS update when no desired DNS records exist
+  ansible.builtin.debug:
+    msg: "cloudflare_manage_dns_records=true but no desired DNS records were defined. Nothing to update."
+  when:
+    - cloudflare_manage_dns_records | bool
+    - cloudflare_desired_dns_records | default([]) | length == 0
+
+# The full token must never reach the log (no_log on the API calls below), but
+# the last 4 chars identify WHICH token is in use when debugging auth errors.
+- name: Show Cloudflare API token fingerprint
+  ansible.builtin.debug:
+    msg: "Using Cloudflare API token ending in …{{ (cloudflare_api_token | trim)[-4:] }}"
+  when: cloudflare_api_token | default('') | trim | length > 0
+
+- name: Look up Cloudflare zone id
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones?name={{ cloudflare_zone_name | urlencode }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token | trim }}"
+      Content-Type: "application/json"
+    return_content: true
+    status_code: 200
+  register: cloudflare_zone_lookup
+  no_log: true   # request headers carry the bearer token
+  check_mode: false   # read-only GET; must run in --check so the zone id resolves
+  when:
+    - cloudflare_manage_dns_records | bool
+    - cloudflare_desired_dns_records | default([]) | length > 0
+    - cloudflare_zone_id | default('') | trim | length == 0
+
+- name: Set effective Cloudflare zone id
+  ansible.builtin.set_fact:
+    cloudflare_effective_zone_id: >-
+      {{
+        (cloudflare_zone_id | default('') | trim)
+        if (cloudflare_zone_id | default('') | trim | length > 0)
+        else (cloudflare_zone_lookup.json.result[0].id | default(''))
+      }}
+  when:
+    - cloudflare_manage_dns_records | bool
+    - cloudflare_desired_dns_records | default([]) | length > 0
+
+- name: Require resolved Cloudflare zone id
+  ansible.builtin.assert:
+    that:
+      - cloudflare_effective_zone_id | default('') | trim | length > 0
+    fail_msg: "Could not resolve Cloudflare zone id. Check cloudflare_zone_name/cloudflare_zone_id and token permissions."
+  when:
+    - cloudflare_manage_dns_records | bool
+    - cloudflare_desired_dns_records | default([]) | length > 0
+
+- name: Upsert Cloudflare DNS records
+  ansible.builtin.include_tasks: upsert_record.yml
+  loop: "{{ cloudflare_desired_dns_records }}"
+  loop_control:
+    loop_var: cloudflare_dns_record
+    label: "{{ cloudflare_dns_record.type | default('CNAME') }} {{ cloudflare_dns_record.name }} -> {{ cloudflare_dns_record.content }}"
+  when:
+    - cloudflare_manage_dns_records | bool
+    - cloudflare_desired_dns_records | default([]) | length > 0
+
+- name: Note that Cloudflare DNS pruning is disabled
+  ansible.builtin.debug:
+    msg: "cloudflare_prune_dns_records=true was requested, but automatic DNS deletion is intentionally not implemented in this role. Remove stale DNS records manually."
+  when:
+    - cloudflare_manage_dns_records | bool
+    - cloudflare_prune_dns_records | bool

@@ -1,0 +1,66 @@
+---
+- name: Require Cloudflare tunnel management variables
+  ansible.builtin.assert:
+    that:
+      - cloudflared_account_id | default('') | trim | length > 0
+      - cloudflared_tunnel_id | default('') | trim | length > 0
+      - cloudflare_api_token | default('') | trim | length > 0
+    fail_msg: "cloudflared_account_id, cloudflared_tunnel_id, and cloudflare_api_token are required when cloudflared_manage_public_hostnames=true"
+  no_log: true
+
+- name: Build desired Cloudflare Tunnel ingress rules
+  ansible.builtin.set_fact:
+    cloudflared_desired_ingress: "{{ lookup('template', 'tunnel_desired_ingress.yml.j2') | from_yaml | default([], true) }}"
+
+- name: Get current Cloudflare Tunnel configuration
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/accounts/{{ cloudflared_account_id }}/cfd_tunnel/{{ cloudflared_tunnel_id }}/configurations"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token | trim }}"
+      Content-Type: "application/json"
+    return_content: true
+    status_code: 200
+  register: cloudflared_config_response
+  no_log: true
+
+- name: Extract current Cloudflare Tunnel ingress rules
+  ansible.builtin.set_fact:
+    cloudflared_current_ingress: "{{ cloudflared_config_response.json.result.config.ingress | default([]) }}"
+    cloudflared_current_origin_request: "{{ cloudflared_config_response.json.result.config.originRequest | default({}) }}"
+
+- name: Build final Cloudflare Tunnel ingress rules
+  ansible.builtin.set_fact:
+    cloudflared_final_ingress: "{{ lookup('template', 'tunnel_final_ingress.yml.j2') | from_yaml }}"
+
+- name: Build effective Cloudflare Tunnel global originRequest
+  ansible.builtin.set_fact:
+    cloudflared_effective_origin_request: "{{ cloudflared_origin_request if ((cloudflared_origin_request | default({})) | length > 0) else (cloudflared_current_origin_request | default({})) }}"
+
+- name: Build Cloudflare Tunnel configuration payload
+  ansible.builtin.set_fact:
+    cloudflared_config_payload: >-
+      {{
+        {
+          'config':
+            ({'ingress': cloudflared_final_ingress}
+             | combine({'originRequest': cloudflared_effective_origin_request}
+                       if (cloudflared_effective_origin_request | length > 0) else {}))
+        }
+      }}
+
+- name: Update Cloudflare Tunnel public hostnames
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/accounts/{{ cloudflared_account_id }}/cfd_tunnel/{{ cloudflared_tunnel_id }}/configurations"
+    method: PUT
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token | trim }}"
+      Content-Type: "application/json"
+    body_format: json
+    body: "{{ cloudflared_config_payload }}"
+    return_content: true
+    status_code: 200
+  register: cloudflared_update_response
+  changed_when: cloudflared_final_ingress != cloudflared_current_ingress
+  no_log: true
+  when: cloudflared_final_ingress != cloudflared_current_ingress

@@ -1,0 +1,8 @@
+---
+# Copy these into your secrets var file (plaintext for now; ansible-vault later).
+
+# --- Optional overrides (defaults shown) ---
+# claude_code_version: "latest"        # pin e.g. "2.1.79" for reproducibility
+# edge_network_name: "edge"            # must match the network your Caddy uses
+# playground_ctl_provision: true       # provision user + rootless Docker + broker
+# playground_stack_enabled: true       # build/run the claude-ctl AI container

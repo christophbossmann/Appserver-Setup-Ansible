@@ -1,0 +1,43 @@
+---
+# =============================================================================
+# tailscale role — defaults
+# =============================================================================
+
+# Master switch. When false, Tailscale is INSTALLED but nothing else happens
+# (no start, no auth, no export). When true (default) the full flow runs.
+tailscale_enabled: true
+
+# Force re-authentication even if valid Tailscale state already exists.
+# false (default): existing state is reused automatically, no prompts.
+# true:            the interactive auth flow runs and `tailscale up
+#                  --force-reauth` is issued.
+tailscale_reauth_force: false
+
+# Auth key. Leave empty to be prompted interactively during the run, or set it
+# here / via -e "tailscale_auth_key=tskey-auth-..." to skip the prompt.
+# Generate at: https://login.tailscale.com/admin/settings/keys
+tailscale_auth_key: ""
+
+# Extra args for `tailscale up` (e.g. "--advertise-exit-node" or "--accept-routes").
+tailscale_extra_args: ""
+
+# --- State import (auto) ----------------------------------------------------
+# Path on the CONTROLLER to a tailscaled.state backup. If a file exists here it
+# is imported onto the server automatically (so the node keeps its identity
+# without a new auth key) — UNLESS the server is already logged in (a live login
+# always wins, no relogin) or tailscale_reauth_force is true. Defaults to the
+# same path the export step writes to, so the role round-trips its own backup.
+# Set to "" to disable auto-import.
+tailscale_state_file: "~/.ansible/tailscale-state/{{ inventory_hostname }}.state"
+
+# --- State export (default ON) ----------------------------------------------
+# After the run, fetch the live tailscaled.state back to the controller so you
+# always have a current backup. Set to false to disable.
+tailscale_export_state: true
+
+# Destination on the controller for the exported state (flat file, per host).
+tailscale_state_export_path: "~/.ansible/tailscale-state/{{ inventory_hostname }}.state"
+
+# Backward-compat override: if set, used as the export destination instead of
+# tailscale_state_export_path.
+tailscale_state_backup_path: ""

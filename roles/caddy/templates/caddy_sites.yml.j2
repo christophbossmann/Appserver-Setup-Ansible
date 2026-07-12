@@ -1,0 +1,27 @@
+{% for route in proxy_routes | default([]) if route.caddy_enabled | default(true) | bool %}
+- hostname: "{{ route.hostname }}"
+{% if route.caddy_upstream | default('') %}
+  caddy_upstream: "{{ route.caddy_upstream }}"
+{% endif %}
+{% if route.caddy_tls_mode is defined %}
+  caddy_tls_mode: "{{ route.caddy_tls_mode }}"
+{% endif %}
+{% if route.caddy_pki_ca is defined %}
+  caddy_pki_ca: "{{ route.caddy_pki_ca }}"
+{% endif %}
+{% if route.caddy_cert_file is defined %}
+  caddy_cert_file: "{{ route.caddy_cert_file }}"
+{% endif %}
+{% if route.caddy_key_file is defined %}
+  caddy_key_file: "{{ route.caddy_key_file }}"
+{% endif %}
+{% if route.caddy_bind_interfaces | default([]) | length > 0 %}
+  caddy_bind_interfaces: {{ route.caddy_bind_interfaces | to_yaml | trim }}
+{% endif %}
+{% if route.caddy_allowed_ranges | default([]) | length > 0 %}
+  caddy_allowed_ranges: {{ route.caddy_allowed_ranges | to_yaml | trim }}
+{% endif %}
+{% if route.caddy_extra is defined %}
+  caddy_extra: {{ route.caddy_extra | to_yaml | trim }}
+{% endif %}
+{% endfor %}

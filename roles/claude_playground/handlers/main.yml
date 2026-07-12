@@ -1,0 +1,15 @@
+---
+# The compose stack is (re)built and reconciled by the compose task on every
+# run, so it needs no handler. The broker, however, is a systemd service.
+
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+# Skipped in --check: on a fresh host the unit file was never actually
+# written there, so systemd cannot know the service yet.
+- name: Restart playground-ctl
+  ansible.builtin.systemd_service:
+    name: playground-ctl
+    state: restarted
+  when: not ansible_check_mode

@@ -1,0 +1,85 @@
+---
+# Image convention (repo-wide): templates reference ONLY <name>_image;
+# <service>_version is the bump knob the _image default is composed from.
+n8n_version: "2.26.4"
+n8n_image: "n8nio/n8n:{{ n8n_version }}"
+
+# WebDAV sidecar (rclone). Latest official tag not definitively confirmed (~1.74);
+# verify on hub.docker.com/r/rclone/rclone/tags and set a fixed version
+# (then convert to rclone_version + composed image like above).
+rclone_image: "rclone/rclone:latest"
+n8n_port: 5678
+n8n_data_dir: /opt/n8n/data
+
+# Bind published Docker port on the host.
+# Empty = Docker default (0.0.0.0). Use 127.0.0.1 when n8n is only reached via Caddy.
+n8n_bind_address: ""
+
+# Database — must match postgres role vars
+n8n_db_host: postgres
+n8n_db_port: 5432
+n8n_db_user: "n8n"
+n8n_db_password: "changeme"
+n8n_db_name: "n8n"
+
+# Timezone
+n8n_timezone: "Europe/Berlin"
+
+# Public/reverse-proxy settings.
+# Set n8n_public_hostname when n8n is accessed through Caddy/Cloudflare/VServer.
+# Example: n8n.cfdev.playnconnect.net
+n8n_public_hostname: ""
+n8n_public_protocol: "https"
+# Optional full override. If empty, computed as: <protocol>://<hostname>/
+n8n_public_url: ""
+# n8n docs recommend this behind a reverse proxy.
+n8n_proxy_hops: 1
+# For browser access via HTTPS, this should normally be true.
+n8n_secure_cookie: true
+# Stable encryption key is strongly recommended for production.
+n8n_encryption_key: ""
+# Extra environment variables for the n8n container.
+n8n_extra_env: {}
+
+# Fresh install — wipes all data
+n8n_fresh_install: false
+
+# ==========================================================
+# WebDAV — brain file access from desktop/network
+# Provides read/write access to agent context files.
+# Mount as network drive: http://<server>:8888
+# ==========================================================
+n8n_webdav_enabled: true
+n8n_webdav_port: 8888
+n8n_webdav_user: "christoph"
+n8n_webdav_password: "changeme"
+n8n_webdav_cachetime: "5s"
+
+# ==========================================================
+# Brain — agent context directories
+# Each agent gets its own subdirectory under /opt/n8n/files/
+# with starter files deployed on first setup.
+# ==========================================================
+n8n_brain_dir: /opt/n8n/files
+# Agent names — one brain directory per entry. Override in group_vars with your
+# real agents; starter files are seeded ONLY when a matching
+# files/brain/<agent>/ directory exists in this role (and never overwritten —
+# journal etc. are agent state).
+n8n_brain_agents:
+  - agent_example
+
+# Subdirectories created under every agent dir (override for workflows that
+# need a specific output layout).
+n8n_brain_subdirs:
+  - templates
+  - output
+
+# Starter files seeded from files/brain/<agent>/ on first setup.
+n8n_brain_files:
+  - AGENT.md
+  - USER.md
+  - journal.md
+  - targets.md
+
+# Caddy route(s) for this role live in defaults/caddy_route.yml (loaded
+# explicitly by the caddy role, not auto-loaded). Selected per host via caddy_services.

@@ -1,0 +1,55 @@
+---
+# End-to-end reachability checks for ALL enabled proxy_routes — purely via DNS.
+#
+# Every route is requested at https://<hostname> using the host's normal
+# resolver, so the check also proves DNS is set up correctly:
+#   - public routes (Cloudflare Tunnel) resolve to Cloudflare; TLS terminates there
+#   - internal routes resolve to the host's Tailscale IP; Caddy serves the cert
+# No --resolve, no injected IPs: real name resolution end to end.
+#
+# Optional: if check_public_routes_dns_server is set (e.g. "1.1.1.1"), we first
+# WAIT until each record is visible on that fast resolver, to avoid checking
+# before DNS has propagated. The actual HTTP check still uses the system resolver.
+
+- name: Wait for proxy route DNS to appear (preferred resolver)
+  ansible.builtin.command: "dig +short {{ item.hostname }} @{{ check_public_routes_dns_server }}"
+  register: _caddy_pc_dns
+  changed_when: false
+  check_mode: false   # read-only probe; must also resolve in --check runs
+  until: (_caddy_pc_dns.stdout | trim) | length > 0
+  retries: "{{ caddy_post_check_dns_retries }}"
+  delay: "{{ caddy_post_check_dns_delay }}"
+  loop: "{{ proxy_routes | default([]) }}"
+  loop_control:
+    # default('-') is required: the label is templated even for skipped items,
+    # and hosts without check_public_routes_dns_server would fail on it.
+    label: "{{ item.name | default(item.hostname) }} @ {{ check_public_routes_dns_server | default('-') }}"
+  when:
+    - caddy_post_check_enabled | bool
+    - (check_public_routes_dns_server | default('')) | length > 0
+    - item.caddy_enabled | default(false) | bool
+    - not (item.healthcheck_skip | default(false) | bool)
+    - not (item.hostname.startswith('*'))
+
+- name: Check proxy routes (via DNS)
+  ansible.builtin.uri:
+    url: "https://{{ item.hostname }}"
+    method: GET
+    status_code: "{{ item.healthcheck_status_codes | default(caddy_post_check_status_codes) }}"
+    validate_certs: "{{ item.healthcheck_validate_certs | default(caddy_post_check_validate_certs) }}"
+    timeout: "{{ item.healthcheck_timeout | default(caddy_post_check_timeout) }}"
+    follow_redirects: "{{ item.healthcheck_follow_redirects | default(caddy_post_check_follow_redirects) }}"
+    return_content: false
+  register: _caddy_pc
+  until: _caddy_pc is succeeded
+  retries: "{{ item.healthcheck_retries | default(caddy_post_check_retries) }}"
+  delay: "{{ item.healthcheck_delay | default(caddy_post_check_delay) }}"
+  loop: "{{ proxy_routes | default([]) }}"
+  loop_control:
+    label: "{{ item.name | default(item.hostname) }} @ {{ check_public_routes_dns_server | default('-') }}"
+  when:
+    - caddy_post_check_enabled | bool
+    - item.caddy_enabled | default(false) | bool
+    - not (item.healthcheck_skip | default(false) | bool)
+    # Skip wildcard cert directives (e.g. *.int...) — they are not services.
+    - not (item.hostname.startswith('*'))

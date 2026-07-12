@@ -1,0 +1,222 @@
+---
+# Generic docker-compose stack deployment. See defaults/main.yml for the
+# stacks/<stack>/ layout and stack.yml keys.
+#
+# No handlers: this role runs multiple times per play (once per stack), and
+# handlers dedupe by name — the restart would only fire for the LAST stack.
+# Recreate is decided inline instead (compose or config file changed).
+
+- name: Require a stack name ({{ stack | default('?') }})
+  ansible.builtin.assert:
+    that:
+      - stack | default('') | trim | length > 0
+    fail_msg: "compose_stack requires 'stack' (directory name under stacks/)."
+
+- name: Check stack definition exists on the controller
+  ansible.builtin.stat:
+    path: "{{ compose_stack_src_dir }}/docker-compose.yml.j2"
+  delegate_to: localhost
+  become: false
+  register: _cs_compose_src
+
+- name: Fail when the compose template is missing
+  ansible.builtin.assert:
+    that:
+      - _cs_compose_src.stat.exists
+    fail_msg: >-
+      No compose template found at {{ compose_stack_src_dir }}/docker-compose.yml.j2
+      — create the stack definition first (see roles/compose_stack/defaults/main.yml).
+
+- name: Check for per-stack settings file
+  ansible.builtin.stat:
+    path: "{{ compose_stack_src_dir }}/stack.yml"
+  delegate_to: localhost
+  become: false
+  register: _cs_meta_stat
+
+# stack.yml is loaded into _cs_meta_file, NOT directly into _cs_meta: a
+# set_fact (precedence 19) would permanently shadow include_vars (18), and
+# include_vars values persist play-wide, so a stack WITHOUT stack.yml would
+# otherwise see the previous stack's settings. The set_fact below re-resolves
+# _cs_meta for every invocation from the freshly loaded file (or {}).
+- name: Load per-stack settings (stack.yml)
+  ansible.builtin.include_vars:
+    file: "{{ compose_stack_src_dir }}/stack.yml"
+    name: _cs_meta_file
+  when: _cs_meta_stat.stat.exists
+
+- name: Resolve effective stack settings
+  ansible.builtin.set_fact:
+    _cs_meta: "{{ _meta }}"
+    _cs_dir: "{{ _meta.dir | default(compose_stack_base_dir ~ '/' ~ stack) }}"
+    _cs_dirs: "{{ _meta.dirs | default([]) }}"
+    _cs_configs: "{{ _meta.configs | default([]) }}"
+    _cs_health_url: "{{ _meta.health_url | default('') }}"
+    _cs_health_status: "{{ _meta.health_status | default([200]) }}"
+    _cs_health_cmd: "{{ _meta.health_cmd | default('') }}"
+  vars:
+    _meta: "{{ _cs_meta_file | default({}) if _cs_meta_stat.stat.exists else {} }}"
+
+# ==========================================================
+# Fresh install (opt-in): wipe stack + volumes
+# ==========================================================
+- name: Fresh install — stop stack and remove volumes ({{ stack }})
+  ansible.builtin.shell: |
+    cd {{ _cs_dir | quote }} && docker compose down --volumes 2>/dev/null
+    echo "cleaned"
+  register: _cs_cleanup
+  changed_when: "'cleaned' in _cs_cleanup.stdout"
+  failed_when: false
+  when: compose_stack_fresh | bool
+
+- name: Fresh install — wipe stack directory ({{ stack }})
+  ansible.builtin.file:
+    path: "{{ _cs_dir }}"
+    state: absent
+  when: compose_stack_fresh | bool
+
+# ==========================================================
+# Directories
+# ==========================================================
+- name: Create stack directory ({{ stack }})
+  ansible.builtin.file:
+    path: "{{ _cs_dir }}"
+    state: directory
+    owner: "{{ _cs_meta.owner | default(compose_stack_dir_owner) }}"
+    group: "{{ _cs_meta.group | default(compose_stack_dir_group) }}"
+    mode: "{{ _cs_meta.mode | default(compose_stack_dir_mode) }}"
+
+- name: Create additional stack directories ({{ stack }})
+  ansible.builtin.file:
+    path: "{{ _cs_path if _cs_path is match('/') else _cs_dir ~ '/' ~ _cs_path }}"
+    state: directory
+    owner: "{{ item.owner | default(compose_stack_dir_owner) if item is mapping else compose_stack_dir_owner }}"
+    group: "{{ item.group | default(compose_stack_dir_group) if item is mapping else compose_stack_dir_group }}"
+    mode: "{{ item.mode | default(compose_stack_dir_mode) if item is mapping else compose_stack_dir_mode }}"
+  vars:
+    _cs_path: "{{ item.path if item is mapping else item }}"
+  loop: "{{ _cs_dirs }}"
+  loop_control:
+    label: "{{ _cs_path }}"
+
+# ==========================================================
+# Shared external Docker networks (created once, never removed)
+# ==========================================================
+- name: Ensure external Docker networks exist ({{ stack }})
+  ansible.builtin.command: "docker network create {{ item }}"
+  register: _cs_net_create
+  changed_when: _cs_net_create.rc == 0
+  failed_when: false   # rc != 0 = network already exists
+  loop: "{{ _cs_meta.networks | default([]) }}"
+
+# ==========================================================
+# Config files (templates *.j2 / plain files)
+# ==========================================================
+- name: Deploy stack config templates ({{ stack }})
+  ansible.builtin.template:
+    src: "{{ compose_stack_src_dir }}/{{ item.src }}"
+    dest: "{{ _cs_dir }}/{{ item.dest | default(item.src | basename | regex_replace('\\.j2$', '')) }}"
+    owner: "{{ item.owner | default(compose_stack_config_owner) }}"
+    group: "{{ item.group | default(compose_stack_config_group) }}"
+    mode: "{{ item.mode | default(compose_stack_config_mode) }}"
+  loop: "{{ _cs_configs | selectattr('src', 'search', '\\.j2$') | list }}"
+  loop_control:
+    label: "{{ item.src }}"
+  register: _cs_config_templates
+
+- name: Deploy stack config files ({{ stack }})
+  ansible.builtin.copy:
+    src: "{{ compose_stack_src_dir }}/{{ item.src }}"
+    dest: "{{ _cs_dir }}/{{ item.dest | default(item.src | basename) }}"
+    owner: "{{ item.owner | default(compose_stack_config_owner) }}"
+    group: "{{ item.group | default(compose_stack_config_group) }}"
+    mode: "{{ item.mode | default(compose_stack_config_mode) }}"
+  loop: "{{ _cs_configs | rejectattr('src', 'search', '\\.j2$') | list }}"
+  loop_control:
+    label: "{{ item.src }}"
+  register: _cs_config_files
+
+# ==========================================================
+# Compose file + pull + up
+# ==========================================================
+- name: Deploy docker-compose.yml ({{ stack }})
+  ansible.builtin.template:
+    src: "{{ compose_stack_src_dir }}/docker-compose.yml.j2"
+    dest: "{{ _cs_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "{{ _cs_meta.compose_mode | default(compose_stack_compose_mode) }}"
+  register: _cs_compose
+
+# not ansible_check_mode: command tasks validate chdir even in check mode,
+# and on a fresh host the stack dir does not exist there yet.
+- name: Pull images ({{ stack }})
+  ansible.builtin.command: docker compose pull
+  args:
+    chdir: "{{ _cs_dir }}"
+  register: _cs_pull
+  changed_when: "'Pull complete' in _cs_pull.stderr or 'Downloaded' in _cs_pull.stderr"
+  when:
+    - _cs_meta.pull | default(compose_stack_pull) | bool
+    - not ansible_check_mode
+
+# Mounted config files (e.g. servers.json) are only read at container start,
+# so any changed config forces a recreate — same semantics as the old
+# per-service restart handlers.
+- name: Start stack ({{ stack }})
+  ansible.builtin.command: >-
+    docker compose up -d
+    {{ '--force-recreate' if (_cs_compose.changed or _cs_config_templates.changed or _cs_config_files.changed) else '' }}
+  args:
+    chdir: "{{ _cs_dir }}"
+  register: _cs_up
+  changed_when: "_cs_up.stderr is search('Started|Creating|Created|Recreating|Recreated')"
+  when: not ansible_check_mode
+
+# ==========================================================
+# Health check + status
+# ==========================================================
+- name: Wait for {{ stack }} to be ready
+  ansible.builtin.uri:
+    url: "{{ _cs_health_url }}"
+    status_code: "{{ _cs_health_status }}"
+  register: _cs_health
+  retries: "{{ _cs_meta.health_retries | default(compose_stack_health_retries) }}"
+  delay: "{{ _cs_meta.health_delay | default(compose_stack_health_delay) }}"
+  until: _cs_health is not failed
+  failed_when: false
+  when: _cs_health_url | length > 0
+
+# Unlike the URL probe above this has no failed_when: false — a service that
+# declares health_cmd (e.g. a database) must actually come up or the play
+# aborts before dependent services deploy against it.
+- name: Wait for {{ stack }} to be ready (command probe)
+  ansible.builtin.command: "{{ _cs_health_cmd }}"
+  register: _cs_health_cmd_res
+  changed_when: false
+  retries: "{{ _cs_meta.health_retries | default(compose_stack_health_retries) }}"
+  delay: "{{ _cs_meta.health_delay | default(compose_stack_health_delay) }}"
+  until: _cs_health_cmd_res.rc == 0
+  when: _cs_health_cmd | length > 0
+
+- name: Show {{ stack }} status
+  ansible.builtin.debug:
+    msg: >
+      {% if _cs_health_url | length > 0 %}
+      {% if _cs_health.status is defined and _cs_health.status in _cs_health_status %}
+      {{ stack }} is running and healthy.
+      {% elif _cs_health is skipped %}
+      {{ stack }} deployed (health check skipped in check mode).
+      {% else %}
+      {{ stack }} may still be starting. Check: cd {{ _cs_dir }} && docker compose logs -f
+      {% endif %}
+      {% elif _cs_health_cmd | length > 0 %}
+      {% if _cs_health_cmd_res is skipped %}
+      {{ stack }} deployed (health check skipped in check mode).
+      {% else %}
+      {{ stack }} is running and healthy.
+      {% endif %}
+      {% else %}
+      {{ stack }} deployed (no health check configured).
+      {% endif %}
+      {{ _cs_meta.status_msg | default('') }}

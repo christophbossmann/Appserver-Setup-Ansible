@@ -1,0 +1,113 @@
+---
+# Skipped in --check: the .deb is never downloaded there, so the install
+# cannot be predicted (and would fail on the missing /tmp file).
+- name: Download cloudflared .deb package
+  ansible.builtin.get_url:
+    url: "{{ cloudflared_package_url }}"
+    dest: "{{ cloudflared_package_dest }}"
+    mode: "0644"
+  when:
+    - cloudflared_install | bool
+    - not ansible_check_mode
+
+- name: Install cloudflared
+  ansible.builtin.apt:
+    deb: "{{ cloudflared_package_dest }}"
+  when:
+    - cloudflared_install | bool
+    - not ansible_check_mode
+
+- name: Create cloudflared configuration directory
+  ansible.builtin.file:
+    path: "{{ cloudflared_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ cloudflared_config_dir_mode }}"
+  when: cloudflared_install | bool
+
+- name: Copy cloudflared config.yml
+  ansible.builtin.copy:
+    src: "{{ cloudflared_config_src }}"
+    dest: "{{ cloudflared_config_dest }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - cloudflared_install | bool
+    - cloudflared_config_src | length > 0
+  notify: Restart cloudflared
+
+- name: Copy cloudflared credentials file
+  ansible.builtin.copy:
+    src: "{{ cloudflared_credentials_src }}"
+    dest: "{{ cloudflared_credentials_dest }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - cloudflared_install | bool
+    - cloudflared_credentials_src | length > 0
+  notify: Restart cloudflared
+
+- name: Install cloudflared service using tunnel token
+  ansible.builtin.command: "cloudflared service install {{ cloudflared_tunnel_connector_token }}"
+  args:
+    creates: /etc/systemd/system/cloudflared.service
+  when:
+    - cloudflared_service_install | bool
+    - cloudflared_tunnel_connector_token | length > 0
+  no_log: true
+  notify: Restart cloudflared
+
+- name: Install cloudflared service using local config
+  ansible.builtin.command: cloudflared service install
+  args:
+    creates: /etc/systemd/system/cloudflared.service
+  when:
+    - cloudflared_service_install | bool
+    - cloudflared_tunnel_connector_token | length == 0
+  notify: Restart cloudflared
+
+- name: Enable and start cloudflared
+  ansible.builtin.systemd:
+    name: cloudflared
+    enabled: "{{ cloudflared_service_enabled }}"
+    state: "{{ cloudflared_service_state }}"
+  when:
+    - cloudflared_install | bool
+    - cloudflared_service_install | bool
+
+- name: Wait until cloudflared service is active
+  ansible.builtin.command: systemctl is-active cloudflared
+  register: cloudflared_service_active
+  changed_when: false
+  check_mode: false   # read-only probe; in --check it reports the CURRENT state
+  until: cloudflared_service_active.stdout == "active"
+  retries: 20
+  delay: 3
+  when:
+    - cloudflared_install | bool
+    - cloudflared_service_install | bool
+
+- name: Wait until cloudflared registered a tunnel connection
+  ansible.builtin.command: journalctl -u cloudflared -n 500 --no-pager
+  register: cloudflared_connection_logs
+  changed_when: false
+  check_mode: false   # read-only probe; in --check it reports the CURRENT state
+  until: "'Registered tunnel connection' in cloudflared_connection_logs.stdout"
+  retries: 20
+  delay: 3
+  when:
+    - cloudflared_install | bool
+    - cloudflared_service_install | bool
+
+- name: Manage Cloudflare Tunnel public hostnames
+  ansible.builtin.include_tasks: public_hostnames.yml
+  when: cloudflared_manage_public_hostnames | bool
+
+- name: Remove downloaded cloudflared package
+  ansible.builtin.file:
+    path: "{{ cloudflared_package_dest }}"
+    state: absent
+  when: cloudflared_install | bool

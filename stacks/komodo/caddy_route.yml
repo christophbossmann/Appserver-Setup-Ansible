@@ -1,0 +1,8 @@
+# Caddy route(s) for this role. NOT auto-loaded (only defaults/main.yml is).
+# The caddy role explicitly include_vars this file for every host, so the route
+# is available even when this role's tasks are not part of the running play.
+# Whether it is actually rendered is decided per host via caddy_services.
+caddy_route_komodo:
+  name: komodo
+  hostname_label: komodo
+  caddy_upstream: "127.0.0.1:9120"

@@ -1,0 +1,195 @@
+---
+# === Container stack: claude-ctl AI runtime ==========================================
+# The claude-ctl AI runtime keeps uid 10001 but has NO host Docker access:
+#   - no /var/run/docker.sock mount
+#   - no helper container
+# It reaches Docker ONLY through `playgroundctl` over {{ playground_ctl_socket }},
+# which drives the rootless playground daemon. The shared workspace lives at
+# {{ playground_ctl_workspace }} and is reached via group membership.
+#
+# This runs `docker compose` on the HOST Docker daemon (as root) on purpose:
+# claude-ctl is just a process container with zero docker privileges, so running
+# it rootful is fine and lets it use the broker socket cleanly via group_add (no
+# userns gid remapping headaches).
+
+# check_mode: false on the three probes — read-only lookups whose stdout is
+# consumed by the set_fact below; without it a --check run crashes on the
+# empty registered result. On a FRESH host in --check the user/group don't
+# exist yet (provisioning was skipped), so absence is tolerated there and
+# placeholder ids are used — real runs still fail hard on a missing user.
+- name: Resolve the playground group gid (workspace access)
+  ansible.builtin.command: "getent group {{ playground_ctl_user }}"
+  register: _pgctl_grp_ws
+  changed_when: false
+  check_mode: false
+  failed_when: _pgctl_grp_ws.rc != 0 and not ansible_check_mode
+
+- name: Resolve the playgroundctl group gid (broker socket access)
+  ansible.builtin.command: "getent group {{ playground_ctl_socket_group }}"
+  register: _pgctl_grp_sock
+  changed_when: false
+  check_mode: false
+  failed_when: _pgctl_grp_sock.rc != 0 and not ansible_check_mode
+
+- name: Resolve the playground uid (webdav sidecar file ownership)
+  ansible.builtin.command: "id -u {{ playground_ctl_user }}"
+  register: _pgctl_uid
+  changed_when: false
+  check_mode: false
+  failed_when: _pgctl_uid.rc != 0 and not ansible_check_mode
+
+- name: Set claude-ctl group facts
+  ansible.builtin.set_fact:
+    # getent group output: name:passwd:GID:members  -> field index 2 is the gid
+    playground_ctl_workspace_gid: "{{ _pgctl_grp_ws.stdout.split(':')[2] if _pgctl_grp_ws.rc == 0 else '0' }}"
+    playground_ctl_socket_gid: "{{ _pgctl_grp_sock.stdout.split(':')[2] if _pgctl_grp_sock.rc == 0 else '0' }}"
+    playground_ctl_uid: "{{ _pgctl_uid.stdout | trim if _pgctl_uid.rc == 0 else '0' }}"
+
+# --- Build context + workspace content --------------------------------------
+- name: Create build-context directory
+  ansible.builtin.file:
+    path: "{{ ctl_build_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render claude-ctl build context (rootless variant with playgroundctl CLI)
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: "claude-ctl.Dockerfile.j2", dest: "{{ ctl_build_dir }}/Dockerfile", mode: "0644" }
+    - { src: "entrypoint.sh.j2", dest: "{{ ctl_build_dir }}/entrypoint.sh", mode: "0755" }
+
+- name: Copy the playgroundctl client into the claude-ctl build context
+  ansible.builtin.copy:
+    src: playground-ctl/playgroundctl.py
+    dest: "{{ ctl_build_dir }}/playgroundctl"
+    mode: "0755"
+
+# Always overwritten: CLAUDE.md is role-owned documentation (source of truth
+# is this template), NOT agent state — a stale copy would hide new
+# playgroundctl capabilities from the agent. Put host-specific additions into
+# the template/vars, not into the workspace copy.
+- name: Render agent guide (CLAUDE.md) into the shared workspace
+  ansible.builtin.template:
+    src: CLAUDE.md.j2
+    dest: "{{ playground_ctl_workspace }}/CLAUDE.md"
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "0664"
+
+# --- Compose stack -----------------------------------------------------------
+- name: Render docker-compose (rootless / no helper, no host docker.sock)
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ base_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+# Skipped in --check: command tasks validate chdir even in check mode, and on
+# a fresh host {{ base_dir }} does not exist there yet.
+- name: Build and start the claude-ctl stack
+  ansible.builtin.command:
+    cmd: docker compose up -d --build --remove-orphans
+    chdir: "{{ base_dir }}"
+  register: _compose_up
+  changed_when: "_compose_up.stderr is search('Started|Creating|Created|Recreating|Recreated|Built')"
+  when: not ansible_check_mode
+
+# --- Optional: force a fresh login (drops stored credentials) ----------------
+# The confirmation pause runs FIRST and doubles as the interactivity guard:
+# in a non-interactive run it fails here, BEFORE anything is deleted, so you can
+# never get locked out with no way to log back in.
+- name: Force relogin - confirm (interactive only)
+  ansible.builtin.pause:
+    prompt: |
+      playground_force_relogin=true
+
+      This will DELETE the stored Claude credentials inside claude-ctl and
+      require a fresh login on this run. Config, history and sessions are kept.
+
+      Press ENTER to proceed, or Ctrl-C then A to abort.
+  when: playground_force_relogin | default(false) | bool
+
+- name: Force relogin - drop stored credentials
+  ansible.builtin.command:
+    cmd: docker exec claude-ctl rm -f /home/claude/.claude/.credentials.json
+  when: playground_force_relogin | default(false) | bool
+  changed_when: true
+  failed_when: false   # container/file may not exist yet -> not a hard error
+
+# --- Login + optional Remote Control activation -----------------------------
+- name: Check whether Claude is already logged in
+  ansible.builtin.command:
+    cmd: docker exec claude-ctl test -f /home/claude/.claude/.credentials.json
+  register: claude_login_check
+  failed_when: false
+  changed_when: false
+
+- name: One-time login (pause until you have logged in)
+  ansible.builtin.pause:
+    prompt: |
+      Claude is not logged in yet. In ANOTHER terminal on this host, run:
+
+        docker exec -it claude-ctl claude
+          -> choose the claude.ai /login option (API keys do NOT work)
+          -> on a headless server, use the URL + paste-the-code flow
+          -> accept the workspace-trust dialog for /workspace
+
+      When finished, press ENTER here to continue.
+  when: claude_login_check.rc != 0
+
+# --- Optional: mint a fresh Remote Control session (keeps login) -------------
+# Restarting claude-ctl makes the entrypoint start a new remote-control session,
+# which registers a NEW connection URL. The login is untouched.
+- name: New session - restart Remote Control (keeps login)
+  ansible.builtin.command:
+    cmd: docker restart claude-ctl
+  when: playground_new_session | default(false) | bool
+  changed_when: true
+
+- name: Check whether Remote Control is already running
+  ansible.builtin.command:
+    cmd: docker top claude-ctl
+  register: _rc_top
+  failed_when: false
+  changed_when: false
+
+- name: Activate Remote Control (restart so the entrypoint starts it)
+  ansible.builtin.command:
+    cmd: docker restart claude-ctl
+  when:
+    - playground_remote_control_autoactivate | bool
+    - "'remote-control' not in (_rc_top.stdout | default(''))"
+    - not (playground_new_session | default(false) | bool)   # already restarted above
+  changed_when: true
+
+- name: Capture the Remote Control connection URL from the logs
+  ansible.builtin.shell: |
+    set -o pipefail
+    for i in $(seq 1 15); do
+      url=$(docker logs claude-ctl 2>&1 \
+            | grep -Eo 'https://claude\.ai/code\?environment=[A-Za-z0-9_]+' \
+            | tail -1)
+      if [ -n "$url" ]; then echo "$url"; exit 0; fi
+      sleep 2
+    done
+    exit 0
+  args:
+    executable: /bin/bash
+  register: _rc_url
+  changed_when: false
+  when: playground_remote_control_autoactivate | bool
+
+- name: Remote Control URL
+  ansible.builtin.debug:
+    msg: >-
+      {{ ('Remote Control is live. Open on a device logged into the SAME account: '
+          ~ _rc_url.stdout)
+         if (_rc_url.stdout | default('') | length > 0)
+         else 'No URL captured yet. Check: docker logs claude-ctl  (or: docker attach claude-ctl).' }}
+  when: playground_remote_control_autoactivate | bool

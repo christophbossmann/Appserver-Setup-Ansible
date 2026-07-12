@@ -1,0 +1,23 @@
+#Claude
+.claude/*
+
+# Real hosts/IPs — keep inventory.ini.example tracked instead.
+inventory.ini
+
+# Operational notes containing live tokens — never commit.
+RUN.txt
+
+# Secrets live ONLY in group_vars/all/vault.yml (vault_* convention).
+# It is currently PLAINTEXT. After `ansible-vault encrypt group_vars/all/vault.yml`
+# you can (and should) relax the broad ignores below to just:
+#     group_vars/all/vault.yml   <- drop too, once encrypted (commit the vault)
+# so the non-secret config in group_vars/ and host_vars/ gets versioned.
+group_vars/**/*.yml
+!group_vars/**/*.example.yml
+
+host_vars/**/*.yml
+!host_vars/**/*.example.yml
+
+*:Zone.Identifier
+
+private/*

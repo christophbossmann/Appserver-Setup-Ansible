@@ -1,0 +1,9 @@
+# Per-stack settings for compose_stack (see roles/compose_stack/defaults/main.yml).
+dir: /opt/playwright-mcp   # hyphen (container/volume paths reference it)
+configs:
+  - { src: files/index.html, dest: index.html }   # noVNC redirect page
+health_url: "http://127.0.0.1:{{ playwright_mcp_novnc_port }}/"
+health_retries: 10
+status_msg: >-
+  MCP SSE endpoint (from n8n container): http://playwright-mcp:3000/sse —
+  noVNC web UI: http://{{ ansible_host }}:{{ playwright_mcp_novnc_port }}

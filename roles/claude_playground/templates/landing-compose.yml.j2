@@ -1,0 +1,18 @@
+# Default playground app.
+#
+# This is the stack that `playgroundctl playground compose up` operates on. It
+# serves a small "Welcome to Playground" landing page (nginx + index.html) on
+# the fixed public port, so the playground.<host> Caddy route has a backend.
+#
+# Replace this file (or swap in a different docker-compose.yml) with your own
+# stack at any time. The ONLY contract: keep at least one service published on
+# 127.0.0.1:{{ playground_public_port }} if you want the public route to work.
+services:
+  landing:
+    image: {{ nginx_image }}
+    restart: unless-stopped
+    volumes:
+      # The landing page. Edit index.html (or replace this whole stack) freely.
+      - ./index.html:/usr/share/nginx/html/index.html:ro
+    ports:
+      - "127.0.0.1:{{ playground_public_port }}:80"

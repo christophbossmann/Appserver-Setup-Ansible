@@ -1,0 +1,99 @@
+---
+# =============================================================================
+# claude_playground role defaults
+# =============================================================================
+
+# === Claude Code (claude-ctl container) ===
+# Pin to a specific version for reproducible builds, e.g. "2.1.79".
+claude_code_version: "latest"
+
+# Remote Control activation. When true the play waits for login and then starts
+# `claude remote-control` as the container's main process. When false the CLI is
+# installed and you can log in, but Remote Control is NOT started.
+playground_remote_control_autoactivate: false
+
+# Set true (usually via -e playground_fresh_start=true) to tear down the
+# claude-ctl stack incl. volumes and image, then rebuild clean. Files in the
+# shared workspace are NOT removed.
+playground_fresh_start: false
+
+# Run-only switches (pass with -e ...=true when you need them; keep false otherwise):
+#   playground_new_session   -> restart claude-ctl to mint a FRESH Remote Control
+#                               session (new connection URL). Login is KEPT.
+#   playground_force_relogin -> delete the stored credentials and force a fresh
+#                               login this run. Guarded by an interactive confirm
+#                               pause, so it can't lock you out in a non-tty run.
+#                               Config/history/sessions are kept.
+playground_new_session: false
+playground_force_relogin: false
+
+# === Host-side build/compose paths (root-owned; NOT the AI workspace) ===
+base_dir: "/opt/claude-playground"
+ctl_build_dir: "{{ base_dir }}/claude-ctl"
+
+# Build/run the claude-ctl AI runtime container. Set false to provision the
+# broker only (no AI runtime container).
+playground_stack_enabled: true
+
+# =============================================================================
+# === playgroundctl: rootless Docker broker (task.md) =========================
+# =============================================================================
+# Provisions a locked-down `playground` user with its OWN rootless Docker daemon
+# plus the `playgroundctl` broker that fronts it. The Python broker does NO
+# provisioning; everything below is done by Ansible. The broker runs a hard
+# preflight at startup and refuses to start on a misconfigured host.
+
+# Run the provisioning + broker tasks (packages, user/group, subuid/subgid,
+# linger, rootless Docker, /opt deploy, systemd service). Set false to skip.
+playground_ctl_provision: true
+
+# --- Identity (policy: keep in sync with playground_ctl/policy.py) -----------
+playground_ctl_user: "playground"                 # (policy) PLAYGROUND_USER
+playground_ctl_socket_group: "playgroundctl"      # (policy) SOCKET_GROUP
+playground_ctl_home: "/home/{{ playground_ctl_user }}"
+playground_ctl_workspace: "{{ playground_ctl_home }}/workspace"   # (policy) PLAYGROUND_WORKSPACE
+playground_ctl_socket: "/run/playground-ctl.sock"                # (policy) SOCKET_PATH
+
+# --- subuid / subgid range (task.md example) ---------------------------------
+playground_ctl_subid_start: 231072
+playground_ctl_subid_count: 65536
+
+# --- Broker install paths ----------------------------------------------------
+playground_ctl_install_dir: "/opt/playground-ctl"
+playground_ctl_bin: "/usr/local/bin/playgroundctl"
+
+# === Default playground app (backs the playground.<host> route) ===
+# The playground.<host> Caddy route proxies to 127.0.0.1:<playground_public_port>.
+# A tiny default app publishes there so the route works out of the box; the AI
+# (or you) can replace the workspace docker-compose.yml with any stack, as long
+# as it keeps publishing on this port.
+# Landing page container image (default app).
+nginx_image: "nginx:1.30-alpine"
+
+playground_public_port: 8090
+playground_default_app_enabled: true
+
+# Caddy route(s) for this role live in defaults/caddy_route.yml (loaded
+# explicitly by the caddy role, not auto-loaded). Selected per host via caddy_services.
+
+# --- WebDAV access to the playground (sidecar, like n8n's rclone) -------------
+# Opt-in. Runs an rclone "serve webdav" sidecar in the SAME root-docker compose
+# as claude-ctl. Reached via the webdav-playground.<host> Caddy route (add
+# 'webdav_playground' to the host's caddy_services to expose it). Bind stays on
+# 127.0.0.1 -> Caddy is the only front.
+#
+# WebDAV root layout:
+#   /workspace    -> the shared playground workspace
+#   /claude-home  -> the claude_home volume (Claude config, ~/.claude incl.
+#                    memory files); .credentials.json is EXCLUDED from serving.
+playground_webdav_enabled: false
+playground_webdav_port: 8091          # host: 127.0.0.1:<port> -> container :8888
+playground_webdav_user: "christoph"
+playground_webdav_password: "changeme"
+playground_webdav_cachetime: "5s"
+playground_webdav_readonly: false     # true -> serve everything read-only
+# Also expose the claude_home volume (memory files etc.) as /claude-home.
+playground_webdav_include_claude_home: true
+# rclone image (own var; do NOT depend on the n8n role being in the play).
+# Verify the current tag on hub.docker.com/r/rclone/rclone/tags and pin it.
+playground_webdav_image: "rclone/rclone:latest"

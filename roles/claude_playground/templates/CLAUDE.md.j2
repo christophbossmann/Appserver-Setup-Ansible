@@ -1,0 +1,78 @@
+# Playground workspace (rootless / playgroundctl model)
+
+You are running inside the **claude-ctl** container. You have **no direct Docker
+access** here — no `docker` CLI, no docker socket. Everything you do with
+containers goes through the **`playgroundctl`** command, which talks to this
+host's broker over a Unix socket and from there to a **rootless Docker daemon**
+owned by the `playground` user.
+
+## Where you work
+
+- This directory (`/workspace`) is the shared playground workspace
+  (`{{ playground_ctl_workspace }}` on the host).
+- Put your `docker-compose.yml` and any build context here. The rootless
+  playground daemon builds and runs from exactly these files.
+- Bind-publish ports to `127.0.0.1` only.
+
+## The public route (fixed port)
+
+The host serves **`playground.<domain>` → `127.0.0.1:{{ playground_public_port }}`**.
+Whatever you run, if you want it reachable on that public URL, publish a service
+on `127.0.0.1:{{ playground_public_port }}`. The default `docker-compose.yml`
+here already does this (a tiny "Welcome to Playground" text page). You may
+replace the whole file with your own stack — just keep one service on
+`127.0.0.1:{{ playground_public_port }}` if the public page should keep working.
+You can use any other `127.0.0.1` ports freely for additional services.
+
+## What you can do
+
+Read-only against the host Docker daemon (never write):
+
+```bash
+playgroundctl host ps
+playgroundctl host image ls
+playgroundctl host compose ls
+```
+
+Full control of the rootless **playground** daemon:
+
+```bash
+playgroundctl playground ps
+playgroundctl playground image ls
+playgroundctl playground image rm playground/<image>:<tag>
+
+playgroundctl playground compose up
+playgroundctl playground compose ps
+playgroundctl playground compose logs [tail]
+playgroundctl playground compose stop
+playgroundctl playground compose restart
+playgroundctl playground compose down
+playgroundctl playground compose destroy   # down + volumes
+playgroundctl playground compose build
+playgroundctl playground compose reset      # destroy + up
+playgroundctl playground compose kill
+
+playgroundctl playground http get [/path]   # fetch the served app via the broker
+```
+
+`http get` is how you VERIFY a deploy: your container has no network path to
+the app (it publishes on the host loopback, 127.0.0.1:{{ playground_public_port }}),
+but the broker does. It returns the HTTP status line and the first 8 KB of the
+body — check that your change is actually visible in the response.
+
+## Rules
+
+- You **cannot** run write/compose actions on `host` — they are rejected.
+- `playgroundctl playground image rm` only accepts images whose name starts with
+  `playground/` (e.g. `playground/app:latest`). Tag images you build under that
+  prefix if you want to be able to remove them.
+- Never expect access to `/var/run/docker.sock`. It does not exist in this
+  container by design.
+
+## Typical loop
+
+1. Write/edit `docker-compose.yml` (and Dockerfiles) here in `/workspace`.
+2. `playgroundctl playground compose up`
+3. `playgroundctl playground compose logs 100` to inspect.
+4. `playgroundctl playground http get /` to verify the served result end-to-end.
+5. Iterate. `playgroundctl playground compose down` (or `destroy`) when done.

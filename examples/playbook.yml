@@ -1,0 +1,9 @@
+---
+- name: Deploy the Claude playground
+  hosts: playground
+  become: true
+  # For a standalone test you can pass secrets with --extra-vars or a vars file:
+  #   ansible-playbook -i examples/inventory.ini examples/playbook.yml \
+  #     -e @examples/vars.example.yml
+  roles:
+    - claude_playground

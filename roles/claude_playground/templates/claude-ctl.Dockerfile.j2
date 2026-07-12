@@ -1,0 +1,34 @@
+FROM node:22-bookworm-slim
+
+ARG CLAUDE_CODE_VERSION=latest
+
+# python3 is needed for the playgroundctl client (stdlib-only Unix-socket CLI).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates tmux jq python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code. Pin CLAUDE_CODE_VERSION for reproducible builds.
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+ENV DISABLE_AUTOUPDATER=1
+
+# Non-root user. The named volume for /home/claude persists both ~/.claude.json
+# (Claude's main config) and ~/.claude/ (credentials), so login survives rebuilds.
+RUN useradd -m -u 10001 claude \
+    && mkdir -p /home/claude/.claude /workspace \
+    && chown -R claude:claude /home/claude /workspace
+
+# The playgroundctl client. The AI calls e.g. `playgroundctl playground compose up`;
+# the request travels over PLAYGROUND_CTL_SOCKET to the host broker, which drives
+# the rootless playground Docker daemon. This container has NO docker CLI and NO
+# docker socket of its own.
+COPY playgroundctl /usr/local/bin/playgroundctl
+RUN chmod +x /usr/local/bin/playgroundctl
+ENV PLAYGROUND_CTL_SOCKET={{ playground_ctl_socket }}
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+USER claude
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,0 +1,5 @@
+# Caddy route for this role — loaded explicitly by the caddy role (see komodo file).
+caddy_route_cockpit:
+  name: cockpit
+  hostname_label: cockpit
+  caddy_upstream: "127.0.0.1:9091"

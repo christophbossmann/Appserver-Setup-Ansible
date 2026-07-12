@@ -1,0 +1,29 @@
+{# =========================================================================
+   Resolve each ACTIVE service on this host into a concrete proxy_route.
+   Inputs:
+     - caddy_services : { <service_key>: internal|external }   (host_vars)
+     - caddy_route_<service_key> : { name, hostname_label,      (role defaults)
+                                     caddy_upstream, [caddy_extra], [caddy_enabled] }
+     - route_int / route_ext : per-host profile bodies          (host_vars)
+     - global_host / internal_host : per-host domain bases       (host_vars)
+   internal -> route_int + internal_host ;  external -> route_ext + global_host
+   Iteration follows caddy_services insertion order (keep it aligned with the
+   old proxy_routes order to minimise the generated-Caddyfile diff).
+   ========================================================================= #}
+{% for svc, profile in (caddy_services | default({})).items() %}
+{%   set route = lookup('vars', 'caddy_route_' ~ svc) %}
+{%   set prof  = route_ext if profile == 'external' else route_int %}
+{%   set basis = global_host if profile == 'external' else internal_host %}
+- name: "{{ route.name | default(svc) }}"
+  hostname: "{{ route.hostname_label }}.{{ basis }}"
+  caddy_enabled: {{ route.caddy_enabled | default(true) | bool | lower }}
+  caddy_upstream: "{{ route.caddy_upstream }}"
+  caddy_tls_mode: "{{ prof.caddy_tls_mode }}"
+  caddy_bind_interfaces: {{ prof.caddy_bind_interfaces | default([]) | to_json }}
+{%   if route.caddy_extra is defined and route.caddy_extra | trim | length > 0 %}
+  caddy_extra: |
+{{ route.caddy_extra | indent(4, first=True) }}
+{%   endif %}
+  tunnel_enabled: {{ prof.tunnel_enabled | default(false) | bool | lower }}
+  tunnel_manage_dns: {{ prof.tunnel_manage_dns | default(false) | bool | lower }}
+{% endfor %}

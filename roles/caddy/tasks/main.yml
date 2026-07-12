@@ -1,0 +1,861 @@
+---
+- name: Validate Caddy TLS mode
+  ansible.builtin.assert:
+    that:
+      - caddy_tls_mode in ['auto', 'inherit', 'off', 'internal', 'cloudflare_dns', 'acme_dns', 'tailscale', 'manual_cert']
+    fail_msg: "caddy_tls_mode must be one of: auto, inherit, off, internal, cloudflare_dns, acme_dns, tailscale, manual_cert"
+
+- name: Require name, cert and key for each custom PKI CA
+  ansible.builtin.assert:
+    that:
+      - item.name | default('') | trim | length > 0
+      - item.cert | default('') | trim | length > 0
+      - item.key | default('') | trim | length > 0
+    fail_msg: "Each caddy_pki_cas entry requires name, cert, and key (failed on: {{ item.name | default('unnamed') }})"
+  loop: "{{ caddy_pki_cas | default([]) }}"
+  loop_control:
+    label: "{{ item.name | default('unnamed') }}"
+
+- name: Require Cloudflare API token for Cloudflare DNS mode
+  ansible.builtin.assert:
+    that:
+      - (caddy_cloudflare_api_token | default('') | trim | length) > 0
+    fail_msg: "caddy_cloudflare_api_token is required when caddy_tls_mode=cloudflare_dns"
+  when: caddy_tls_mode == 'cloudflare_dns'
+  no_log: true
+
+- name: Install Caddy repository prerequisites
+  ansible.builtin.apt:
+    name:
+      - debian-keyring
+      - debian-archive-keyring
+      - apt-transport-https
+      - curl
+      - gnupg
+    state: present
+    update_cache: true
+  when: caddy_package_repo_enabled | bool
+
+- name: Add Caddy apt key
+  ansible.builtin.shell: |
+    set -o pipefail
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+      | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  args:
+    executable: /bin/bash
+    creates: /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  when: caddy_package_repo_enabled | bool
+
+- name: Add Caddy apt repository
+  ansible.builtin.get_url:
+    url: https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt
+    dest: /etc/apt/sources.list.d/caddy-stable.list
+    owner: root
+    group: root
+    mode: "0644"
+  when: caddy_package_repo_enabled | bool
+
+- name: Install Caddy
+  ansible.builtin.apt:
+    name: caddy
+    state: present
+    update_cache: true
+
+# ==========================================================
+# xcaddy: build Caddy with required DNS provider plugins
+# ==========================================================
+- name: Collect required xcaddy DNS plugins
+  ansible.builtin.set_fact:
+    _caddy_required_plugins: >-
+      {{
+        (['github.com/caddy-dns/cloudflare'] if caddy_build_cloudflare_dns_plugin | bool else [])
+        + (['github.com/caddy-dns/acmedns']   if caddy_build_acme_dns_plugin | bool else [])
+      }}
+
+# check_mode: false — read-only probe; must also run in --check so the rebuild
+# decision and the bind-IP map below are based on real data.
+- name: Check installed Caddy modules
+  ansible.builtin.command: caddy list-modules
+  register: caddy_modules
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: _caddy_required_plugins | length > 0
+
+# In --check mode the list-modules command is skipped and registers an EMPTY
+# stdout — which would false-positive every plugin as missing and send the run
+# into the /tmp/caddy copy. Only a real, non-empty module list may trigger a
+# rebuild ("no info" must mean "no rebuild").
+- name: Determine whether xcaddy rebuild is needed
+  ansible.builtin.set_fact:
+    _caddy_needs_rebuild: >-
+      {{
+        _caddy_required_plugins | length > 0
+        and (caddy_modules.stdout | default('')) | length > 0
+        and (
+          (caddy_build_cloudflare_dns_plugin | bool and caddy_modules.stdout is not search(caddy_cloudflare_module_name))
+          or
+          (caddy_build_acme_dns_plugin | bool and caddy_modules.stdout is not search(caddy_acme_dns_module_name))
+        )
+      }}
+  when: _caddy_required_plugins | length > 0
+
+- name: Install xcaddy build prerequisites
+  ansible.builtin.apt:
+    name:
+      - golang-go
+      - git
+    state: present
+    update_cache: true
+  when: _caddy_needs_rebuild | default(false) | bool
+
+- name: Install xcaddy
+  ansible.builtin.command: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+  environment:
+    GOPATH: /root/go
+  args:
+    creates: "{{ caddy_xcaddy_path }}"
+  when: _caddy_needs_rebuild | default(false) | bool
+
+- name: Build Caddy with required DNS plugins
+  ansible.builtin.command: >-
+    {{ caddy_xcaddy_path }} build
+    {{ _caddy_required_plugins | map('regex_replace', '^', '--with ') | join(' ') }}
+  args:
+    chdir: /tmp
+  when: _caddy_needs_rebuild | default(false) | bool
+
+- name: Stop Caddy before replacing binary
+  ansible.builtin.systemd:
+    name: caddy
+    state: stopped
+  when: _caddy_needs_rebuild | default(false) | bool
+
+- name: Install custom Caddy binary
+  ansible.builtin.copy:
+    src: "{{ caddy_custom_binary_tmp }}"
+    dest: /usr/bin/caddy
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  when: _caddy_needs_rebuild | default(false) | bool
+  notify: Restart caddy
+
+- name: Create Caddy systemd override directory
+  ansible.builtin.file:
+    path: "{{ caddy_systemd_override_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: caddy_tls_mode == 'cloudflare_dns'
+
+- name: Write Cloudflare API token environment file
+  ansible.builtin.copy:
+    dest: "{{ caddy_cloudflare_env_file }}"
+    owner: root
+    group: caddy
+    mode: "0640"
+    content: |
+      CLOUDFLARE_API_TOKEN={{ caddy_cloudflare_api_token | trim }}
+  when: caddy_tls_mode == 'cloudflare_dns'
+  no_log: true
+  notify: Restart caddy
+
+- name: Configure Caddy service to load Cloudflare token
+  ansible.builtin.copy:
+    dest: "{{ caddy_systemd_override_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Service]
+      EnvironmentFile={{ caddy_cloudflare_env_file }}
+  when: caddy_tls_mode == 'cloudflare_dns'
+  notify:
+    - Reload systemd
+    - Restart caddy
+
+- name: Remove Cloudflare API token environment file when not needed
+  ansible.builtin.file:
+    path: "{{ caddy_cloudflare_env_file }}"
+    state: absent
+  when: caddy_tls_mode != 'cloudflare_dns'
+  notify: Restart caddy
+
+- name: Remove Caddy Cloudflare DNS systemd override when not needed
+  ansible.builtin.file:
+    path: "{{ caddy_systemd_override_file }}"
+    state: absent
+  when: caddy_tls_mode != 'cloudflare_dns'
+  notify:
+    - Reload systemd
+    - Restart caddy
+
+
+# Resolve proxy_routes from per-role caddy_route_<svc> defaults selected per host
+# via caddy_services (+ profiled through route_int/route_ext). Replaces the old
+# central proxy_routes_<group> sub-lists. See roles/caddy/tasks/resolve_routes.yml.
+- name: Resolve proxy_routes for this host
+  ansible.builtin.import_tasks: resolve_routes.yml
+
+- name: Build Caddy sites from neutral proxy_routes
+  ansible.builtin.set_fact:
+    _caddy_sites_from_proxy_routes: "{{ lookup('template', 'caddy_sites.yml.j2') | from_yaml | default([], true) }}"
+
+- name: Build effective Caddy sites
+  ansible.builtin.set_fact:
+    caddy_effective_sites: "{{ (_caddy_sites_from_proxy_routes | default([])) + (caddy_sites | default([])) }}"
+
+- name: Require cert and key for each manual_cert site
+  ansible.builtin.assert:
+    that:
+      - (item.caddy_cert_file | default(caddy_tls_cert_file) | default('') | trim | length) > 0
+      - (item.caddy_key_file  | default(caddy_tls_key_file)  | default('') | trim | length) > 0
+    fail_msg: >-
+      manual_cert mode requires a cert and key for site {{ item.hostname }}.
+      Set caddy_tls_cert_file/caddy_tls_key_file globally or caddy_cert_file/caddy_key_file per site.
+  loop: "{{ caddy_effective_sites }}"
+  loop_control:
+    label: "{{ item.hostname }}"
+  when: item.caddy_tls_mode | default(caddy_tls_mode) == 'manual_cert'
+
+- name: Verify wildcard cert entry exists for each inherit site
+  ansible.builtin.assert:
+    that:
+      - caddy_effective_sites
+        | map(attribute='hostname')
+        | select('match', '^\\*\\.' + (item.hostname | regex_replace('^[^.]+\\.', '')))
+        | list | length > 0
+    fail_msg: >-
+      Site {{ item.hostname }} uses caddy_tls_mode=inherit but no matching wildcard entry
+      (*.{{ item.hostname | regex_replace('^[^.]+\\.', '') }}) found in caddy_effective_sites.
+  loop: "{{ caddy_effective_sites }}"
+  loop_control:
+    label: "{{ item.hostname }}"
+  when: item.caddy_tls_mode | default(caddy_tls_mode) == 'inherit'
+
+# ==========================================================
+# acme_dns: register domains with acme-dns relay server
+# One-time per domain: Ansible prompts for a CNAME at your
+# registrar, then Caddy renews fully automatically forever.
+# ==========================================================
+- name: Check if acme-dns credentials file already exists
+  ansible.builtin.stat:
+    path: "{{ caddy_acme_dns_credentials_file }}"
+  register: _acme_dns_creds_file_stat
+  when: caddy_tls_mode == 'acme_dns'
+
+- name: Seed acme-dns credentials on fresh server (skip re-registration)
+  ansible.builtin.copy:
+    dest: "{{ caddy_acme_dns_credentials_file }}"
+    content: "{{ caddy_acme_dns_seed_credentials | to_nice_json }}"
+    owner: root
+    group: caddy
+    mode: "0640"
+  no_log: true
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - caddy_acme_dns_seed_credentials | length > 0
+    - not _acme_dns_creds_file_stat.stat.exists
+
+# Seeded credentials imply the CNAME is already in place from the previous install.
+# Write confirmation markers so the pending-CNAME check and interactive pause are skipped.
+- name: Create acme-dns markers directory for seeded credentials
+  ansible.builtin.file:
+    path: "{{ caddy_acme_dns_markers_dir }}"
+    state: directory
+    owner: root
+    group: caddy
+    mode: "0750"
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - caddy_acme_dns_seed_credentials | length > 0
+
+- name: Write acme-dns confirmation markers for seeded domains
+  ansible.builtin.copy:
+    dest: "{{ caddy_acme_dns_markers_dir }}/{{ item }}"
+    content: ""
+    force: false
+    owner: root
+    group: caddy
+    mode: "0640"
+  loop: "{{ caddy_acme_dns_seed_credentials.keys() | list }}"
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - caddy_acme_dns_seed_credentials | length > 0
+
+- name: Load existing acme-dns credentials
+  ansible.builtin.slurp:
+    src: "{{ caddy_acme_dns_credentials_file }}"
+  register: _acme_dns_creds_raw
+  failed_when: false
+  when: caddy_tls_mode == 'acme_dns'
+
+- name: Parse existing acme-dns credentials
+  ansible.builtin.set_fact:
+    _acme_dns_creds: "{{ _acme_dns_creds_raw.content | b64decode | from_json }}"
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - _acme_dns_creds_raw.content is defined
+
+# goacmedns reads server_url from each entry in the JSON.
+# If it is absent (credentials registered without this field) the
+# plugin constructs an empty URL → 'unsupported protocol scheme'.
+- name: Detect acme-dns credentials missing server_url
+  ansible.builtin.set_fact:
+    _acme_dns_creds_needs_server_url: >-
+      {{ (_acme_dns_creds | default({})).values()
+         | rejectattr('server_url', 'defined')
+         | list | length > 0 }}
+  when: caddy_tls_mode == 'acme_dns'
+
+- name: Enrich acme-dns credentials with server_url
+  ansible.builtin.set_fact:
+    _acme_dns_creds: >-
+      {{
+        dict(
+          (_acme_dns_creds | default({})).keys() | zip(
+            (_acme_dns_creds | default({})).values()
+            | map('combine', {'server_url': caddy_acme_dns_api_url})
+          )
+        )
+      }}
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - _acme_dns_creds_needs_server_url | default(false)
+
+- name: Find existing acme-dns confirmation markers
+  ansible.builtin.find:
+    paths: "{{ caddy_acme_dns_markers_dir }}"
+    file_type: file
+  register: _acme_dns_markers_found
+  failed_when: false
+  when: caddy_tls_mode == 'acme_dns'
+
+- name: Build list of confirmed acme-dns domains
+  ansible.builtin.set_fact:
+    _acme_dns_confirmed_domains: >-
+      {{
+        _acme_dns_markers_found.files | default([])
+        | map(attribute='path')
+        | map('basename')
+        | list
+      }}
+  when: caddy_tls_mode == 'acme_dns'
+
+- name: Collect sites using acme_dns TLS mode
+  ansible.builtin.set_fact:
+    _acme_dns_sites: >-
+      {{
+        (caddy_effective_sites | selectattr('caddy_tls_mode', 'defined') | selectattr('caddy_tls_mode', 'equalto', 'acme_dns') | list)
+        + (caddy_effective_sites | rejectattr('caddy_tls_mode', 'defined') | list if caddy_tls_mode == 'acme_dns' else [])
+      }}
+  when: caddy_tls_mode == 'acme_dns'
+
+- name: Determine which domains need acme-dns registration
+  ansible.builtin.set_fact:
+    _acme_dns_new_domains: >-
+      {{
+        _acme_dns_sites | default([])
+        | map(attribute='hostname')
+        | map('regex_replace', '^\*\.', '')
+        | reject('in', (_acme_dns_creds | default({})).keys() | list)
+        | list
+      }}
+  when: caddy_tls_mode == 'acme_dns'
+
+- name: Determine which domains have pending CNAME confirmation
+  ansible.builtin.set_fact:
+    _acme_dns_pending_domains: >-
+      {{
+        _acme_dns_sites | default([])
+        | map(attribute='hostname')
+        | map('regex_replace', '^\*\.', '')
+        | select('in', (_acme_dns_creds | default({})).keys() | list)
+        | reject('in', _acme_dns_confirmed_domains | default([]))
+        | list
+      }}
+  when: caddy_tls_mode == 'acme_dns'
+
+# Re-verify already-confirmed domains: a confirmation marker is one-way and never
+# re-checked, so a CNAME removed/changed after the fact would go unnoticed. This
+# digs each confirmed CNAME and, if broken, either re-pends it (no valid cert) or
+# warns (valid cert exists). May extend _acme_dns_pending_domains above.
+- name: Re-verify CNAMEs of already-confirmed acme-dns domains
+  ansible.builtin.import_tasks: acme_dns_verify.yml
+  when: caddy_tls_mode == 'acme_dns'
+
+- name: Build list of domains auto-confirmed via seed credentials
+  ansible.builtin.set_fact:
+    _acme_dns_seed_confirmed_domains: >-
+      {{
+        _acme_dns_confirmed_domains | default([])
+        | select('in', (caddy_acme_dns_seed_credentials | default({})).keys() | list)
+        | list
+      }}
+  when: caddy_tls_mode == 'acme_dns'
+
+- name: Register new domains with acme-dns
+  ansible.builtin.uri:
+    url: "{{ caddy_acme_dns_api_url }}/register"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    body: "{}"
+    body_format: json
+    return_content: true
+    status_code: 201
+  register: _acme_dns_reg
+  loop: "{{ _acme_dns_new_domains | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - _acme_dns_new_domains | default([]) | length > 0
+
+- name: Save acme-dns credentials for each new domain
+  ansible.builtin.set_fact:
+    _acme_dns_creds: "{{ (_acme_dns_creds | default({})) | combine({item.item | regex_replace('^\\*\\.', ''): item.json | combine({'server_url': caddy_acme_dns_api_url})}) }}"
+  loop: "{{ _acme_dns_reg.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  no_log: true
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - _acme_dns_new_domains | default([]) | length > 0
+
+- name: Show required CNAME records for new acme-dns registrations
+  ansible.builtin.debug:
+    msg: >-
+      [acme-dns] ONE-TIME CNAME for {{ item.item }}:
+      _acme-challenge.{{ item.item | regex_replace('^\*\.', '') }}  IN CNAME  {{ item.json.fulldomain }}.
+      Verify (queries authoritative NS directly, bypasses TTL cache):
+      dig _acme-challenge.{{ item.item | regex_replace('^\*\.', '') }} CNAME +short @{{ caddy_acme_dns_verify_ns | default('8.8.8.8') }}
+  loop: "{{ _acme_dns_reg.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - _acme_dns_new_domains | default([]) | length > 0
+
+- name: Show domains auto-confirmed via seed credentials
+  ansible.builtin.debug:
+    msg: >-
+      [acme-dns] {{ item }}: CNAME confirmed via seed credentials — no action needed.
+  loop: "{{ _acme_dns_seed_confirmed_domains | default([]) }}"
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - _acme_dns_seed_confirmed_domains | default([]) | length > 0
+
+- name: Show CNAME reminder for pending acme-dns domains
+  ansible.builtin.debug:
+    msg: >-
+      [acme-dns] REMINDER - CNAME still needed for {{ item }}:
+      _acme-challenge.{{ item }}  IN CNAME  {{ (_acme_dns_creds | default({}))[item].fulldomain }}.
+      Verify (queries authoritative NS directly, bypasses TTL cache):
+      dig _acme-challenge.{{ item }} CNAME +short @{{ caddy_acme_dns_verify_ns | default('8.8.8.8') }}
+  loop: "{{ _acme_dns_pending_domains | default([]) }}"
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - _acme_dns_pending_domains | default([]) | length > 0
+
+- name: Wait for CNAME records to be set at DNS registrar
+  ansible.builtin.pause:
+    prompt: |
+      Set the CNAME record(s) shown above at your DNS registrar.
+      This is ONE-TIME only — records stay valid for all future renewals.
+      Press Enter once the dig command above returns the correct CNAME target.
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - (_acme_dns_new_domains | default([]) | length > 0) or (_acme_dns_pending_domains | default([]) | length > 0)
+
+- name: Write acme-dns credentials file
+  ansible.builtin.copy:
+    dest: "{{ caddy_acme_dns_credentials_file }}"
+    content: "{{ _acme_dns_creds | to_nice_json }}"
+    owner: root
+    group: caddy
+    mode: "0640"
+  no_log: true
+  notify: Restart caddy
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - (_acme_dns_new_domains | default([]) | length > 0) or (_acme_dns_creds_needs_server_url | default(false))
+
+# Trust but verify: the pause above only proves the user pressed Enter, not
+# that the CNAME is correct. Dig it and compare against the registered
+# fulldomain BEFORE writing the confirmation marker — a typo (e.g. a truncated
+# copy-paste) must abort here, not surface days later as ERR_SSL_PROTOCOL_ERROR.
+# Credentials are already persisted above, so a failed check loses nothing:
+# the next run re-pends the domain and prompts again.
+- name: Verify CNAME target matches acme-dns registration (fail fast on typos)
+  ansible.builtin.shell: |
+    set -o pipefail
+    exp="{{ _acme_dns_creds[item].fulldomain | regex_replace('\.$', '') }}"
+    got=$(dig +short CNAME "_acme-challenge.{{ item }}" @{{ caddy_acme_dns_verify_ns }} 2>/dev/null | sed 's/\.$//' | head -n1)
+    if [ "$got" = "$exp" ]; then
+      echo "OK ${got}"
+    else
+      echo "CNAME MISMATCH for _acme-challenge.{{ item }}: expected '${exp}' got '${got:-<no record>}'"
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+  register: _acme_dns_confirm_check
+  changed_when: false
+  retries: "{{ caddy_acme_dns_confirm_retries }}"
+  delay: "{{ caddy_acme_dns_confirm_delay }}"
+  until: _acme_dns_confirm_check.rc == 0
+  loop: "{{ (_acme_dns_new_domains | default([])) + (_acme_dns_pending_domains | default([])) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - (_acme_dns_new_domains | default([]) | length > 0) or (_acme_dns_pending_domains | default([]) | length > 0)
+
+- name: Create acme-dns markers directory
+  ansible.builtin.file:
+    path: "{{ caddy_acme_dns_markers_dir }}"
+    state: directory
+    owner: root
+    group: caddy
+    mode: "0750"
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - (_acme_dns_new_domains | default([]) | length > 0) or (_acme_dns_pending_domains | default([]) | length > 0)
+
+- name: Write acme-dns confirmation markers
+  ansible.builtin.copy:
+    dest: "{{ caddy_acme_dns_markers_dir }}/{{ item }}"
+    content: ""
+    force: false
+    owner: root
+    group: caddy
+    mode: "0640"
+  loop: "{{ (_acme_dns_new_domains | default([])) + (_acme_dns_pending_domains | default([])) }}"
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - (_acme_dns_new_domains | default([]) | length > 0) or (_acme_dns_pending_domains | default([]) | length > 0)
+
+# Force a full restart (not just reload) after CNAME confirmation so the
+# acme-dns plugin re-reads acmedns.json with the now-valid credentials.
+- name: Restart caddy after acme-dns CNAME confirmation
+  ansible.builtin.systemd:
+    name: caddy
+    state: restarted
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - (_acme_dns_new_domains | default([]) | length > 0) or (_acme_dns_pending_domains | default([]) | length > 0)
+
+# Fetch acmedns.json back to the controller for use as seed credentials on re-install.
+- name: Fetch acme-dns credentials to controller
+  ansible.builtin.fetch:
+    src: "{{ caddy_acme_dns_credentials_file }}"
+    dest: "{{ caddy_acme_dns_credentials_backup_path }}"
+    flat: true
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - caddy_acme_dns_credentials_backup_path | length > 0
+
+- name: Notify about acme-dns credentials backup
+  ansible.builtin.debug:
+    msg: >
+      [acme-dns] Credentials backed up to: {{ caddy_acme_dns_credentials_backup_path }}
+      Use this file as caddy_acme_dns_seed_credentials input on re-install
+      (convert JSON to YAML and paste into vars under caddy_acme_dns_seed_credentials).
+  when:
+    - caddy_tls_mode == 'acme_dns'
+    - caddy_acme_dns_credentials_backup_path | length > 0
+
+# ==========================================================
+# Tailscale TLS — fetch certs and set up renewal
+# Works with both Tailscale and Headscale (same CLI).
+# ==========================================================
+- name: Collect sites that use tailscale TLS mode
+  ansible.builtin.set_fact:
+    _tailscale_tls_sites: >-
+      {{
+        (caddy_effective_sites | default([]))
+        | selectattr('caddy_tls_mode', 'defined')
+        | selectattr('caddy_tls_mode', 'equalto', 'tailscale')
+        | list
+        + (
+            (caddy_effective_sites | default([]))
+            | rejectattr('caddy_tls_mode', 'defined')
+            | list
+            if caddy_tls_mode == 'tailscale' else []
+          )
+      }}
+
+- name: Create Caddy TLS cert directory
+  ansible.builtin.file:
+    path: "{{ caddy_tailscale_cert_dir }}"
+    state: directory
+    owner: root
+    group: caddy
+    mode: "0750"
+  when: _tailscale_tls_sites | length > 0
+
+# creates: guard — only the INITIAL fetch runs here (otherwise `tailscale cert`
+# succeeds every run -> always changed -> Caddy restarted on every play).
+# Renewal is handled by the weekly systemd timer deployed below.
+- name: Fetch Tailscale TLS cert for each site
+  ansible.builtin.command: >
+    tailscale cert
+    --cert-file {{ caddy_tailscale_cert_dir }}/{{ item.hostname }}.crt
+    --key-file  {{ caddy_tailscale_cert_dir }}/{{ item.hostname }}.key
+    {{ item.hostname }}
+  args:
+    creates: "{{ caddy_tailscale_cert_dir }}/{{ item.hostname }}.crt"
+  loop: "{{ _tailscale_tls_sites }}"
+  loop_control:
+    label: "{{ item.hostname }}"
+  register: _tailscale_cert_result
+  failed_when: _tailscale_cert_result is failed
+  when: _tailscale_tls_sites | length > 0
+  notify: Restart caddy
+
+- name: Set Tailscale cert file permissions
+  ansible.builtin.file:
+    path: "{{ caddy_tailscale_cert_dir }}/{{ item.0.hostname }}.{{ item.1 }}"
+    owner: root
+    group: caddy
+    mode: "0640"
+  loop: "{{ _tailscale_tls_sites | product(['crt', 'key']) | list }}"
+  loop_control:
+    label: "{{ item.0.hostname }}.{{ item.1 }}"
+  when: _tailscale_tls_sites | length > 0
+
+- name: Deploy Tailscale cert renewal script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/caddy-tailscale-cert-renew
+    owner: root
+    group: root
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      # Auto-generated by Ansible — caddy role
+      # Renews Tailscale TLS certs for all Caddy sites and reloads Caddy.
+      set -euo pipefail
+      CERT_DIR={{ caddy_tailscale_cert_dir }}
+      {% for site in _tailscale_tls_sites %}
+      tailscale cert \
+        --cert-file "${CERT_DIR}/{{ site.hostname }}.crt" \
+        --key-file  "${CERT_DIR}/{{ site.hostname }}.key" \
+        {{ site.hostname }}
+      {% endfor %}
+      systemctl reload caddy
+  when: _tailscale_tls_sites | length > 0
+
+- name: Deploy Tailscale cert renewal systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/caddy-tailscale-cert-renew.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Renew Tailscale TLS certs for Caddy
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/caddy-tailscale-cert-renew
+  when: _tailscale_tls_sites | length > 0
+  notify: Reload systemd
+
+- name: Deploy Tailscale cert renewal systemd timer (weekly)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/caddy-tailscale-cert-renew.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Weekly renewal of Tailscale TLS certs for Caddy
+
+      [Timer]
+      OnCalendar=weekly
+      RandomizedDelaySec=1h
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+  when: _tailscale_tls_sites | length > 0
+  notify: Reload systemd
+
+- name: Enable Tailscale cert renewal timer
+  ansible.builtin.systemd:
+    name: caddy-tailscale-cert-renew.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: _tailscale_tls_sites | length > 0
+
+- name: Remove Tailscale cert renewal timer when not needed
+  ansible.builtin.systemd:
+    name: caddy-tailscale-cert-renew.timer
+    enabled: false
+    state: stopped
+  failed_when: false
+  when: (_tailscale_tls_sites | default([]) | length) == 0
+
+
+- name: Validate Caddy sites have caddy_upstream
+  ansible.builtin.assert:
+    that:
+      - (item.caddy_upstream | default('') | trim | length) > 0
+    fail_msg: "Caddy site '{{ item.hostname | default(item.name | default('unknown')) }}' is enabled but has no caddy_upstream configured."
+  loop: "{{ caddy_effective_sites | default([]) }}"
+  loop_control:
+    label: "{{ item.hostname | default(item.name | default('unknown')) }}"
+  when: item.caddy_upstream | default('') | trim | length > 0
+
+- name: Collect Caddy bind interfaces
+  ansible.builtin.set_fact:
+    caddy_bind_interfaces: >-
+      {{
+        caddy_effective_sites | default([])
+        | map(attribute='caddy_bind_interfaces')
+        | select('defined')
+        | list
+        | flatten
+        | unique
+        | list
+      }}
+
+- name: Resolve IPv4 addresses for Caddy bind interfaces
+  ansible.builtin.command: "ip -o -4 addr show dev {{ item }}"
+  register: caddy_bind_interface_ip_results
+  changed_when: false
+  failed_when: false
+  check_mode: false   # read-only probe; needed in --check for the bind-IP map
+  loop: "{{ caddy_bind_interfaces | default([]) }}"
+  when: (caddy_bind_interfaces | default([]) | length) > 0
+
+- name: Fail if a configured Caddy bind interface has no IPv4 address
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - item.stdout is search('inet ')
+    fail_msg: "Caddy bind interface '{{ item.item }}' was configured but no IPv4 address could be resolved for it."
+  loop: "{{ caddy_bind_interface_ip_results.results | default([]) }}"
+  when: (caddy_bind_interfaces | default([]) | length) > 0
+
+- name: Build Caddy bind interface IPv4 map
+  ansible.builtin.set_fact:
+    caddy_bind_interface_ipv4_map: >-
+      {{
+        caddy_bind_interface_ipv4_map | default({})
+        | combine({
+            item.item: (item.stdout | regex_findall('[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+') | first)
+          })
+      }}
+  loop: "{{ caddy_bind_interface_ip_results.results | default([]) }}"
+  when:
+    - (caddy_bind_interfaces | default([]) | length) > 0
+    - item.rc == 0
+    - item.stdout is search('inet ')
+
+- name: Initialize empty Caddy bind interface IPv4 map
+  ansible.builtin.set_fact:
+    caddy_bind_interface_ipv4_map: {}
+  when: (caddy_bind_interfaces | default([]) | length) == 0
+
+- name: Deploy Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ caddy_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "caddy validate --adapter caddyfile --config %s"
+  environment:
+    # caddy validate provisions the DNS provider while parsing the Caddyfile.
+    # Without this, {env.CLOUDFLARE_API_TOKEN} is empty during Ansible's validate step.
+    CLOUDFLARE_API_TOKEN: "{{ caddy_cloudflare_api_token | default('') | trim }}"
+  no_log: "{{ caddy_tls_mode == 'cloudflare_dns' }}"
+  notify: Restart caddy
+
+- name: Enable and start Caddy
+  ansible.builtin.systemd:
+    name: caddy
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Allow HTTP through UFW
+  community.general.ufw:
+    rule: allow
+    port: "80"
+    proto: tcp
+  when: caddy_manage_ufw | bool
+
+- name: Allow HTTPS through UFW
+  community.general.ufw:
+    rule: allow
+    port: "443"
+    proto: tcp
+  when: caddy_manage_ufw | bool
+
+# Flush all pending handlers (Reload/Restart caddy) NOW so that Caddy is
+# fully up-to-date before caddy_post_check runs its HTTP health checks.
+# Without this, handlers only fire after ALL tasks in the play complete,
+# meaning the post_check would run against the old Caddy state.
+- name: Flush handlers to apply Caddy config before post-check
+  ansible.builtin.meta: flush_handlers
+
+# Without this gate the play ends green while Caddy silently retries a failing
+# issuance forever — every TLS handshake fails (ERR_SSL_PROTOCOL_ERROR) until
+# the cert exists. caddy_post_check cannot cover this: it skips wildcard
+# entries, and its per-route HTTP retries only show the symptom, not the cause.
+# On timeout we fail WITH the actual tls.obtain errors from the journal.
+- name: Wait for valid (unexpired) acme_dns certificates in Caddy's store
+  ansible.builtin.shell: |
+    set -o pipefail
+    f="{{ item | regex_replace('^\*', 'wildcard_') }}"
+    crt=$(find {{ caddy_acme_cert_store }}/certificates -type f -name "${f}.crt" 2>/dev/null | head -n1)
+    # Existence alone is not enough: a cert whose renewal has been failing for
+    # weeks is still on disk but expired. -checkend 0 = must not be expired NOW
+    # (Caddy renews ~30 days early, so a healthy cert never gets close to this).
+    [ -n "$crt" ] && openssl x509 -checkend 0 -noout -in "$crt" >/dev/null 2>&1
+  args:
+    executable: /bin/bash
+  register: _acme_dns_cert_wait
+  changed_when: false
+  retries: "{{ caddy_acme_cert_wait_retries }}"
+  delay: "{{ caddy_acme_cert_wait_delay }}"
+  until: _acme_dns_cert_wait.rc == 0
+  ignore_errors: true
+  loop: "{{ _acme_dns_sites | default([]) | map(attribute='hostname') | unique | list }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Collect Caddy TLS errors after failed issuance
+  ansible.builtin.shell: |
+    set -o pipefail
+    journalctl -u caddy --no-pager -n 300 \
+      | grep '"level":"error"' \
+      | grep -E '"logger":"(tls|http\.acme_client)' \
+      | tail -n 5
+  args:
+    executable: /bin/bash
+  register: _acme_dns_cert_errors
+  changed_when: false
+  failed_when: false
+  when: _acme_dns_cert_wait is failed
+
+- name: Fail with Caddy TLS diagnostics when certificates were not issued
+  ansible.builtin.fail:
+    msg: |
+      Caddy has no valid certificate (missing or expired) for:
+      {{ _acme_dns_cert_wait.results | selectattr('failed', 'defined') | selectattr('failed') | map(attribute='item') | list | to_nice_yaml }}
+      Last TLS errors from `journalctl -u caddy`:
+      {{ _acme_dns_cert_errors.stdout | default('(no errors captured)') }}
+      Typical causes: broken/typo'd _acme-challenge CNAME (compare against
+      fulldomain in {{ caddy_acme_dns_credentials_file }}), acme-dns outage,
+      Let's Encrypt rate limits, or a renewal that has been failing silently
+      until the cert expired.
+  when: _acme_dns_cert_wait is failed

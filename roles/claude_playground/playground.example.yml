@@ -1,0 +1,34 @@
+# =============================================================================
+# claude_playground – vars
+# Reference for group_vars/all/playground.yml. Defaults are sensible, so an
+# empty/minimal file works too.
+# =============================================================================
+
+# === Claude Code (claude-ctl container) ===
+claude_code_version: "latest"        # pin e.g. "2.1.79" for reproducibility
+playground_remote_control_autoactivate: true
+
+# Keep false for normal runs! true tears down the claude-ctl stack + image and
+# rebuilds clean (workspace files are kept). For a one-off clean slate:
+#   ansible-playbook ... -e playground_fresh_start=true
+playground_fresh_start: false
+
+# === playgroundctl broker / rootless provisioning ===
+playground_ctl_provision: true       # provision user + rootless Docker + broker
+playground_stack_enabled: true       # build/run the claude-ctl AI container
+
+# === Default playground app + public route ===
+playground_public_port: 8090         # 127.0.0.1:<this> backs the playground.<host> route
+playground_default_app_enabled: true # seed + start the "Welcome to Playground" page
+
+# The fixed identity values are hardcoded in the broker (playground_ctl/policy.py)
+# per task.md. Only uncomment to document; do not change without editing policy.py.
+# playground_ctl_user: "playground"
+# playground_ctl_socket_group: "playgroundctl"
+# playground_ctl_workspace: "/home/playground/workspace"
+# playground_ctl_socket: "/run/playground-ctl.sock"
+# playground_ctl_subid_start: 231072
+# playground_ctl_subid_count: 65536
+
+# Route (playground, public + basic auth) lives in group_vars/all/proxy_routes.yml
+# and targets localhost:8090. Keep its upstream in sync with playground_public_port.

@@ -1,0 +1,19 @@
+{% for record in cloudflare_dns_records | default([]) %}
+- name: "{{ record.name }}"
+  type: "{{ record.type | default(cloudflare_dns_default_type) }}"
+  content: "{{ record.content }}"
+  proxied: {{ record.proxied | default(cloudflare_dns_default_proxied) | bool | to_json }}
+  ttl: {{ record.ttl | default(cloudflare_dns_default_ttl) | int }}
+{% if record.comment is defined and record.comment %}
+  comment: {{ record.comment | to_json }}
+{% endif %}
+{% endfor %}
+{% if cloudflare_dns_records_from_proxy_routes | default(true) | bool %}
+{% for route in proxy_routes | default([]) if (route.tunnel_enabled | default(false) | bool) and (route.tunnel_manage_dns | default(cloudflare_dns_default_tunnel_manage_dns) | bool) and ((route.tunnel_type | default(cloudflare_dns_default_tunnel_type)) == 'cloudflare') %}
+- name: "{{ route.hostname }}"
+  type: "{{ cloudflare_dns_default_type }}"
+  content: "{{ cloudflare_dns_default_tunnel_target }}"
+  proxied: {{ cloudflare_dns_default_proxied | bool | to_json }}
+  ttl: {{ cloudflare_dns_default_ttl | int }}
+{% endfor %}
+{% endif %}

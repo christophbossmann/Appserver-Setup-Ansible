@@ -1,0 +1,44 @@
+---
+# Optional Cloudflare DNS record management.
+# Tunnel DNS records can be derived from proxy_routes where tunnel_enabled=true
+# and tunnel_manage_dns is true. Standalone DNS records still belong in
+# cloudflare_dns_records.
+cloudflare_manage_dns_records: false
+
+# Safety default: add/update desired records only. Do not prune unmanaged hostnames.
+# Existing records with the exact same hostname are overwritten to the desired target,
+# because this role is intended for dev-domain tunnel routes. Unrelated hostnames are not deleted.
+cloudflare_prune_dns_records: false
+
+# Normal Cloudflare API token. Needs at least:
+# - Zone/DNS/Edit
+# - Zone/Zone/Read
+cloudflare_api_token: ""
+
+# Either set cloudflare_zone_id directly, or set cloudflare_zone_name and the role will look up the zone id.
+# Example: cloudflare_zone_name: "example.com"
+cloudflare_zone_id: ""
+cloudflare_zone_name: ""
+
+# Explicit DNS records. Prefer proxy_routes for new configs.
+# Most tunnel records are generated from proxy_routes using the defaults below.
+cloudflare_dns_records: []
+
+# Derive DNS records from proxy_routes when:
+#   tunnel_enabled: true
+#   tunnel_type: cloudflare (or omitted, when cloudflare_dns_default_tunnel_type=cloudflare)
+#   tunnel_manage_dns: true (default)
+cloudflare_dns_records_from_proxy_routes: true
+cloudflare_dns_default_tunnel_type: "cloudflare"
+cloudflare_dns_default_tunnel_manage_dns: true
+
+# Defaults for records generated from tunnel-enabled proxy_routes.
+# These create:
+#   <route.hostname> CNAME <cloudflared_tunnel_id>.cfargotunnel.com, proxied, Auto TTL.
+cloudflare_dns_default_type: "CNAME"
+cloudflare_dns_default_proxied: true
+cloudflare_dns_default_ttl: 1
+cloudflare_dns_default_tunnel_target: "{{ cloudflared_tunnel_id }}.cfargotunnel.com"
+
+# Neutral route model shared with Caddy and cloudflared roles.
+proxy_routes: []

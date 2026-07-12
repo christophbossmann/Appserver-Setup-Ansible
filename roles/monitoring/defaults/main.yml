@@ -1,0 +1,33 @@
+---
+# Image convention (repo-wide): templates reference ONLY <name>_image;
+# <service>_version is the bump knob the _image default is composed from.
+
+# Prometheus
+prometheus_version: "v3.12.0"
+prometheus_image: "prom/prometheus:{{ prometheus_version }}"
+prometheus_port: 9090
+prometheus_data_dir: /opt/monitoring/prometheus-data
+
+# Node Exporter (host metrics)
+node_exporter_version: "v1.11.1"
+node_exporter_image: "prom/node-exporter:{{ node_exporter_version }}"
+
+# cAdvisor (container metrics)
+# NOTE: registry moved gcr.io/cadvisor/cadvisor -> ghcr.io/google/cadvisor for v0.53.0+.
+# Versions conflicted across sources at pin time -> left as latest; set a fixed tag
+# (then convert to cadvisor_version + composed image like above).
+cadvisor_image: "gcr.io/cadvisor/cadvisor:latest"
+
+# Grafana
+grafana_version: "12.2.9"
+grafana_image: "grafana/grafana:{{ grafana_version }}"
+grafana_port: 3000
+grafana_data_dir: /opt/monitoring/grafana-data
+grafana_admin_user: "admin"
+grafana_admin_password: "changeme"
+
+# Restricted access is enforced in Caddy per proxy_route via caddy_bind_interfaces and caddy_allowed_ranges.
+# UFW/network-level restrictions are handled separately by the hardening role.
+
+# Caddy route(s) for this role live in defaults/caddy_route.yml (loaded
+# explicitly by the caddy role, not auto-loaded). Selected per host via caddy_services.

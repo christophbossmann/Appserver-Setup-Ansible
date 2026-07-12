@@ -1,0 +1,136 @@
+# =============================================================================
+# host_vars/myserver.yml  (filename = inventory hostname)
+# Host-level config: domain + everything every caddy run needs (ACME/TLS,
+# tunnel, tailscale, users). Auto-loaded, so even a playground-only run is
+# self-sufficient. Routes live next to each service (roles/*/defaults/caddy_route.yml, stacks/*/caddy_route.yml); selected via caddy_services below.
+# =============================================================================
+
+global_host: "prod.example.com"      # public base  -> *.prod.example.com
+internal_host: "int.{{ global_host }}"     # internal base -> *.int.prod.example.com
+
+# === Users ===
+users:
+  - name: YOUR_USERNAME
+    sudo: true
+    password: "{{ 'YOUR_PLAIN_PASSWORD' | password_hash('sha512', 'YOUR_SALT') }}"
+    ssh_keys:
+      - "{{ lookup('file', '~/.ssh/YOUR_KEY.pub') }}"
+
+docker_users:
+  - ansible
+  - YOUR_USERNAME
+
+# global_host/internal_host now live in host_vars/<host>.yml
+
+# === Tailscale ===
+tailscale_auth_key: "changeme"  # CHANGE BEFORE GOLIVE!!
+
+# Tailscale identity stored outside the repo at ~/.ansible/tailscale-state/myserver.state (chmod 600).
+# The backup task writes to the same path after each run — always up to date.
+# tailscale_state_file: "~/.ansible/tailscale-state/myserver.state"
+
+# tailscale_state_backup_path: "~/.ansible/tailscale-state/myserver.state"
+
+# === Post deployment route checks ===
+# Runs at the end of the playbook via role caddy_post_check.
+# Checks all proxy_routes with caddy_enabled=true after n8n, Caddy and optional tunnel setup.
+caddy_post_check_enabled: true
+# acme_dns cert issuance takes 30-90s (DNS-01 + LE propagation).
+# 60 retries × 10s = 10 minutes — enough headroom.
+caddy_post_check_retries: 60
+caddy_post_check_delay: 10
+
+# === Cloudflare API ===
+# Normal Cloudflare API token.
+# Used for:
+# - Caddy DNS-01 TXT challenge
+# - Cloudflare Tunnel public hostname management
+# Create briefly:
+#   1) Cloudflare -> My Profile -> API Tokens -> Create custom token
+#   2) Add permissions: Zone/DNS/Edit, Zone/Zone/Read, Account/Cloudflare Tunnel/Edit
+#   3) Scope to your-domain + your account, then copy token
+# For now this is plaintext. Later you can move it to Ansible Vault.
+cloudflare_api_token: "changeme"  # CHANGE BEFORE GOLIVE!!
+
+
+# === Cloudflare DNS ===
+# Optional API-based DNS record management for proxy_routes with tunnel_manage_dns: true.
+# Creates/updates CNAME records such as n8n-cfdev.your-domain -> <tunnel-id>.cfargotunnel.com.
+# Deletes are intentionally not automatic. Remove stale DNS records manually.
+cloudflare_manage_dns_records: false
+cloudflare_prune_dns_records: false
+cloudflare_zone_name: "yourdomain.com"
+# cloudflare_zone_id: "OPTIONAL_ZONE_ID_INSTEAD_OF_ZONE_NAME"
+
+# === Caddy reverse proxy ===
+# caddy_tls_mode options:
+#   off            = HTTP-only local proxy; use with Cloudflare Tunnel route HTTP -> localhost:80
+#   auto           = normal public Caddy HTTPS; use on VServer with public DNS and open 80/443
+#   internal       = local self-signed/internal Caddy CA (cert managed by Caddy, no path needed)
+#   cloudflare_dns = DNS-01 via Cloudflare API token; supports wildcard certs (*.example.com)
+#   acme_dns       = DNS-01 via acme-dns relay; one-time CNAME at registrar, then auto-renew
+#                    works with any DNS provider incl. Manitu; register: https://auth.acme-dns.io
+#   tailscale      = certs via `tailscale cert`; path: caddy_tailscale_cert_dir (default: /etc/caddy/certs)
+#   manual_cert    = pre-obtained cert/key (e.g. via acme.sh --manual or other DNS provider);
+#                    set caddy_cert_file and caddy_key_file per route in proxy_routes
+caddy_email: "your-email@example.com"
+caddy_tls_mode: acme_dns
+caddy_acme_dns_verify_ns: "ns1.desec.io" #Optional override for faster CNAME verification with set dns nameserver
+caddy_manage_ufw: false
+# caddy_cloudflare_api_token not needed for acme_dns mode
+
+# Seed credentials so fresh servers reuse the same acme-dns registration.
+# Credentials are stored outside the repo at ~/.ansible/acmedns/<hostname>.json (chmod 600).
+# The backup task writes to the same path after each run — always up to date.
+# First run: set backup path only; credentials file is created automatically.
+# Re-install: both lines below restore the existing registration without a new CNAME.
+caddy_acme_dns_seed_credentials: "{{ lookup('file', '~/.ansible/acmedns/YOUR_HOSTNAME.json') | from_json }}"
+caddy_acme_dns_credentials_backup_path: "~/.ansible/acmedns/YOUR_HOSTNAME.json"
+
+# Optional: custom root CAs for caddy_tls_mode=internal.
+# Caddy uses these instead of auto-generating its own CA.
+# Files must already exist on the remote host before the role runs.
+# "local" is the built-in CA name that tls internal uses by default.
+# caddy_pki_cas:
+#   - name: local
+#     cert: /etc/caddy/pki/root.crt
+#     key:  /etc/caddy/pki/root.key
+
+# Optional: default CA name for all internal-mode sites.
+# Empty = Caddy auto-generates its own (renders: tls internal).
+# When set, renders: tls { ca <name> } — CA must be listed in caddy_pki_cas.
+# Override per route via caddy_pki_ca on a proxy_routes entry.
+# caddy_pki_default_ca: "local"
+
+# === Cloudflare Tunnel ===
+# Package installation is safe to keep enabled. Attaching to a tunnel is opt-in.
+cloudflared_install: true
+cloudflared_service_install: false
+
+# Special connector token. Used only when cloudflared_service_install: true.
+# Create briefly:
+#   1) Zero Trust -> Networks -> Tunnels -> select tunnel
+#   2) Install connector -> choose Linux/cloudflared
+#   3) Copy the token from the shown `cloudflared service install ...` command
+cloudflared_tunnel_connector_token: "changeme"  # CHANGE BEFORE GOLIVE!!
+
+# Optional API-based management of Tunnel public hostnames.
+# Uses cloudflare_api_token above.
+cloudflared_manage_public_hostnames: false
+cloudflared_prune_public_hostnames: false
+cloudflared_account_id: "changeme"  # CHANGE BEFORE GOLIVE!!
+cloudflared_tunnel_id: "changeme"  # CHANGE BEFORE GOLIVE!!
+
+# === ACTIVATE CLOUDFLARE TUNNEL TEST (playground) ==========================
+# Prereqs on Cloudflare (Zero Trust -> Networks -> Tunnels):
+#   1) Create a tunnel -> copy the connector token
+#   2) API token scopes: Account/Cloudflare Tunnel/Edit + Zone/DNS/Edit + Zone/Zone/Read
+#   3) Note your account_id and tunnel_id
+# Then set the REAL values above (connector token, account_id, tunnel_id,
+# cloudflare_api_token, cloudflare_zone_name) and flip these to true:
+#   cloudflared_service_install: true
+#   cloudflared_manage_public_hostnames: true
+#   cloudflare_manage_dns_records: true
+# The playground route already has tunnel_enabled/tunnel_manage_dns set, so it
+# gets a public hostname on the tunnel + a proxied CNAME automatically.
+# ==========================================================================
