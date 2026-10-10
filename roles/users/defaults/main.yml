@@ -2,11 +2,11 @@
 # Define users in your vars file, e.g.:
 #
 #   users:
-#     - name: christoph
+#     - name: alice
 #       sudo: true
 #       password: "{{ 'mypass' | password_hash('sha512', 'mysalt') }}"
 #       ssh_keys:
-#         - "{{ lookup('file', '~/.ssh/christoph_key.pub') }}"
+#         - "{{ lookup('file', ssh_pubkey_dir ~ '/alice_key.pub') }}"
 #
 #     - name: deploy
 #       sudo: true

@@ -1,0 +1,115 @@
+---
+# Self-enrol the co-located node into its OWN headscale via the loopback control URL,
+# using the reusable pre-auth key that headscale_bootstrap cached on the controller.
+# No-op when the node is already logged in (steady state) or when disabled.
+- name: Co-located tailscale self-enrol
+  when: tailscale_self_enrol | bool
+  block:
+    - name: Check current Tailscale login status
+      ansible.builtin.command: tailscale status
+      register: _ts_enrol_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Determine whether the node is already logged in
+      ansible.builtin.set_fact:
+        _ts_enrol_logged_in: "{{ _ts_enrol_status.rc == 0 and 'Logged out' not in _ts_enrol_status.stdout }}"
+
+    - name: Node already logged in — leave it as-is (no self-enrol)
+      ansible.builtin.debug:
+        msg: "Tailscale already logged in on {{ inventory_hostname }} — keeping it (no self-enrol)."
+      when: _ts_enrol_logged_in | bool
+
+    - name: Self-enrol the node (not logged in)
+      when: not (_ts_enrol_logged_in | bool)
+      block:
+        - name: Locate the cached reusable pre-auth key on the controller
+          ansible.builtin.stat:
+            path: "{{ (headscale_keys_dir ~ '/' ~ inventory_hostname ~ '/' ~ tailscale_enrol_user ~ '.preauthkey') | expanduser }}"
+          delegate_to: localhost
+          become: false
+          register: _ts_enrol_keyfile
+
+        - name: Fail clearly if the pre-auth key is missing
+          ansible.builtin.assert:
+            that: _ts_enrol_keyfile.stat.exists
+            fail_msg: >-
+              tailscale_self_enrol=true but no pre-auth key at
+              {{ headscale_keys_dir }}/{{ inventory_hostname }}/{{ tailscale_enrol_user }}.preauthkey
+              on the controller. It is created by headscale_bootstrap — run that role
+              (tag headscale) first, or check headscale_server_enrol_user.
+            quiet: true
+
+        - name: Read the pre-auth key from the controller
+          ansible.builtin.set_fact:
+            _ts_enrol_key: "{{ lookup('file', (headscale_keys_dir ~ '/' ~ inventory_hostname ~ '/' ~ tailscale_enrol_user ~ '.preauthkey') | expanduser) | trim }}"
+          no_log: true
+
+        - name: Ensure tailscaled is running
+          ansible.builtin.systemd:
+            name: tailscaled
+            enabled: true
+            state: started
+
+        # Loopback control URL -> needs neither Caddy nor DNS; this is what lets the
+        # step run BEFORE Caddy and still give tailscale0 an IP for the .int binds.
+        - name: tailscale up (co-located headscale via loopback)
+          ansible.builtin.command: >
+            tailscale up
+            --login-server={{ tailscale_enrol_control_url }}
+            --authkey={{ _ts_enrol_key }}
+            {{ tailscale_enrol_extra_args }}
+          register: _ts_enrol_up
+          changed_when: true
+          no_log: true
+
+        - name: Wait for tailscale0 to get an IPv4
+          ansible.builtin.command: tailscale ip -4
+          register: _ts_enrol_ip
+          changed_when: false
+          check_mode: false   # read-only query
+          retries: 6
+          delay: 3
+          until: _ts_enrol_ip.rc == 0 and (_ts_enrol_ip.stdout | trim) | length > 0
+
+        - name: Show the enrolled Tailscale IP
+          ansible.builtin.debug:
+            msg: "Self-enrolled {{ inventory_hostname }} into its co-located headscale — tailscale0 = {{ _ts_enrol_ip.stdout | trim }}."
+
+    # BOTH paths converge here. Do NOT let this role return until tailscale0 actually
+    # holds an IP inside THIS host's headscale prefix. Two reasons this is not optional:
+    #   1. FRESH enrol: `tailscale up` returns as soon as the node is authorised, but the
+    #      first netmap (which carries the assigned IP) can lag; the 6x3s wait above only
+    #      checks for ANY non-empty IP.
+    #   2. REBUILD: headscale's DB was wiped but tailscaled's local state persisted, so
+    #      the node reports "already logged in" (stale session) and skips the enrol block
+    #      entirely — yet it must still RE-REGISTER against the new headscale before it
+    #      regains an in-prefix IP, observed to take ~60-90s.
+    # The one-pass internal-DNS convergence (headscale_int_dns, next role) derives the
+    # .int extra_records from exactly this IP. Guaranteeing it here removes the race that
+    # left extra_records EMPTY -> .int names broken until a manual re-run.
+    - name: Wait until tailscale0 holds an IP inside this host's headscale prefix
+      ansible.builtin.command: tailscale ip -4
+      register: _ts_enrol_prefix_ip
+      changed_when: false
+      check_mode: false   # read-only query
+      failed_when: false
+      retries: "{{ tailscale_enrol_ip_retries | default(40) }}"
+      delay: "{{ tailscale_enrol_ip_delay | default(3) }}"
+      until: >-
+        ((_ts_enrol_prefix_ip.stdout_lines | default([]) | first | default(''))
+         | ansible.utils.ipaddr(headscale_ipv4_prefix)) | default('', true) | length > 0
+
+    - name: Fail clearly if the node never joined its headscale prefix
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((_ts_enrol_prefix_ip.stdout_lines | default([]) | first | default(''))
+             | ansible.utils.ipaddr(headscale_ipv4_prefix)) | default('', true) | length > 0
+        fail_msg: >-
+          Node did not obtain an IP inside {{ headscale_ipv4_prefix }} after
+          ~{{ (tailscale_enrol_ip_retries | default(40)) * (tailscale_enrol_ip_delay | default(3)) }}s
+          (tailscale ip -4 = '{{ _ts_enrol_prefix_ip.stdout | default('') | trim }}'). Headscale may be
+          down or the pre-auth key invalid — the .int convergence would derive empty records.
+        quiet: true

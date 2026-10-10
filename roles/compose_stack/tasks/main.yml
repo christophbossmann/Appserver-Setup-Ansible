@@ -12,6 +12,16 @@
       - stack | default('') | trim | length > 0
     fail_msg: "compose_stack requires 'stack' (directory name under stacks/)."
 
+# Record that this service was deployed in THIS run, so caddy_post_check can check a
+# route only when its backing service actually ran (intent, not runtime probing). This
+# reflects Ansible's own tag/enable-var decision to execute this role — no tag logic is
+# re-derived. A crashed backend still registers (the role ran) -> its route is checked
+# and fails; a service not in this run never registers -> its route is skipped. Routes
+# map to this name via depends_service (default: the route name). See caddy_post_check.
+- name: Register this stack as deployed (intent-aware post-check)
+  ansible.builtin.set_fact:
+    deployed_services: "{{ (deployed_services | default([])) + [stack] }}"
+
 - name: Check stack definition exists on the controller
   ansible.builtin.stat:
     path: "{{ compose_stack_src_dir }}/docker-compose.yml.j2"
@@ -110,6 +120,41 @@
   loop: "{{ _cs_meta.networks | default([]) }}"
 
 # ==========================================================
+# Optional: source checkout from git (private app repos).
+# The stack dir entry for the checkout should use a restrictive mode
+# (e.g. { path: src, mode: "0750" }) — the remote URL in .git/config may
+# embed an auth token.
+# ==========================================================
+- name: Ensure git is installed ({{ stack }})
+  ansible.builtin.package:
+    name: git
+    state: present
+  when: _cs_meta.git_repo | default('') | length > 0
+
+# no_log: the repo URL may embed an auth token.
+- name: Clone/update source repository ({{ stack }})
+  ansible.builtin.git:
+    repo: "{{ _cs_meta.git_repo }}"
+    dest: "{{ _cs_dir }}/{{ _cs_meta.git_dest | default('src') }}"
+    version: "{{ _cs_meta.git_version | default('main') }}"
+    force: true
+  register: _cs_git
+  no_log: true
+  when: _cs_meta.git_repo | default('') | length > 0
+
+# Headplane's config template reads a controller-cached API key. Re-run the
+# idempotent bootstrap here so a headplane-only deploy also provisions that key.
+- name: Bootstrap Headscale before deploying Headplane
+  ansible.builtin.include_role:
+    name: headscale_bootstrap
+    apply:
+      tags: [always]
+  when:
+    - stack == 'headplane'
+    - "'headscale' in (caddy_services | default({}))"
+  tags: [always]
+
+# ==========================================================
 # Config files (templates *.j2 / plain files)
 # ==========================================================
 - name: Deploy stack config templates ({{ stack }})
@@ -163,9 +208,12 @@
 # Mounted config files (e.g. servers.json) are only read at container start,
 # so any changed config forces a recreate — same semantics as the old
 # per-service restart handlers.
+# --build (when the stack declares it) rebuilds from the git checkout; an
+# unchanged checkout is a cache hit and does not recreate anything.
 - name: Start stack ({{ stack }})
   ansible.builtin.command: >-
     docker compose up -d
+    {{ '--build' if (_cs_meta.build | default(false) | bool) else '' }}
     {{ '--force-recreate' if (_cs_compose.changed or _cs_config_templates.changed or _cs_config_files.changed) else '' }}
   args:
     chdir: "{{ _cs_dir }}"

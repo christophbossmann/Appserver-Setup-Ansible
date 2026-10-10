@@ -1,0 +1,7 @@
+---
+# The play calls this role several times (one call per checkpoint snapshot, each with a
+# different btrfs_snapshot label), so duplicate invocations must run.
+allow_duplicates: true
+galaxy_info:
+  role_name: btrfs_snapshots
+  description: Take named btrfs/snapper checkpoint snapshots on an already-prepared host.

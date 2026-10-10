@@ -1,0 +1,19 @@
+# Per-stack settings for compose_stack (see roles/compose_stack/defaults/main.yml).
+networks:
+  - backend
+dirs:
+  - config          # -> /opt/acme-dns/config (mounted /etc/acme-dns, ro)
+  - data            # -> /opt/acme-dns/data    (mounted /var/lib/acme-dns: sqlite)
+configs:
+  - { src: configs/config.cfg.j2, dest: config/config.cfg, mode: "0644" }
+pull: true
+# The HTTP API is loopback-only; hitting an unknown path proves it is listening
+# (acme-dns has no /health endpoint). 400/404 both mean "up".
+health_url: "http://127.0.0.1:{{ acme_dns_api_port }}/"
+health_status: [200, 400, 404, 405]
+health_retries: 15
+health_delay: 3
+status_msg: >-
+  Self-hosted acme-dns up. DNS on {{ acme_dns_public_ip }}:53 (public, read-only),
+  API on 127.0.0.1:{{ acme_dns_api_port }} (loopback). Next: NS-delegate
+  {{ acme_dns_domain }} to this host at the registrar, then register + migrate CNAMEs.

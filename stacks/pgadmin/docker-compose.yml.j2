@@ -10,12 +10,25 @@ services:
     volumes:
       - /opt/pgadmin/data:/var/lib/pgadmin
       - /opt/pgadmin/servers.json:/pgadmin4/servers.json:ro
+{% if pgadmin_oauth_enabled | default(false) %}
+      - /opt/pgadmin/config_local.py:/pgadmin4/config_local.py:ro
+{% endif %}
     environment:
       PGADMIN_DEFAULT_EMAIL: {{ pgadmin_email }}
       PGADMIN_DEFAULT_PASSWORD: {{ pgadmin_password }}
       PGADMIN_CONFIG_SERVER_MODE: "True"
+    networks:
+      - backend
+{% for net in pgadmin_extra_networks | default([]) %}
+      - {{ net.alias }}
+{% endfor %}
 
 networks:
-  default:
+  backend:
     name: backend
     external: true
+{% for net in pgadmin_extra_networks | default([]) %}
+  {{ net.alias }}:
+    name: {{ net.name }}
+    external: true
+{% endfor %}

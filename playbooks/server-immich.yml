@@ -1,0 +1,31 @@
+---
+# =============================================================================
+# server-immich.yml — minimal Immich test host: Docker + shared Postgres +
+# Immich + edge (Caddy/DNS/tunnel/post-check). No hardening/users/tailscale —
+# meant for quickly testing the stack on a throwaway VM; production hosts use
+# server-all.yml (which includes immich).
+#
+# Requires host_vars/<host>.yml (domain, ingress model) and
+# `immich: external` in its caddy_services.
+#
+# Usage:
+#   ansible-playbook playbooks/server-immich.yml --limit <host>
+# =============================================================================
+
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+
+- name: Immich Server (test)
+  hosts: all
+  become: true
+  # No vars_files: app config lives in group_vars/all/<service>.yml (auto-
+  # loaded), secrets in group_vars/all/vault.yml (vault_* convention).
+  roles:
+    - { role: docker, tags: [docker] }
+    - { role: compose_stack, vars: { stack: postgres }, tags: [postgres] }
+    - { role: compose_stack, vars: { stack: immich }, tags: [immich] }
+    - { role: compose_stack, vars: { stack: immich_uploader }, tags: [immich_uploader] }
+    - { role: caddy, tags: [caddy] }
+    - { role: cloudflare_dns, tags: [caddy, cloudflare_dns] }
+    - { role: cloudflared, tags: [caddy, cloudflared] }
+    - { role: caddy_post_check, tags: [caddy, caddy_post_check] }

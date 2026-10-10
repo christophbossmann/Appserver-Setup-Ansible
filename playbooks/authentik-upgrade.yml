@@ -1,0 +1,175 @@
+---
+# Authentik upgrade with automatic PITR rollback on failure.
+#
+#   ansible-playbook playbooks/authentik-upgrade.yml --limit <host> \
+#     -e authentik_upgrade_version=2026.8.3 \
+#     -e upgrade_confirm=YES \
+#     [-e upgrade_keep_old=false]   # drop the pre-rollback data dir if a rollback happens
+#     [-e force_rollback=true]      # DRILL: upgrade, then roll back on purpose
+#
+# Authentik has its OWN postgres instance (`authentik`, container authentik-postgres), so —
+# unlike immich/nextcloud on the shared business instance — nothing else has to be frozen
+# and a rollback touches only Authentik. Sequence: stop server + worker + LDAP outpost
+# (write-freeze), take the PITR anchor, start the new image (the server runs its own
+# migrations), verify. On ANY failure: PITR the instance back to the anchor and redeploy the
+# old image.
+#
+# While this runs NOBODY can log in through SSO (a few minutes), and sessions that already
+# exist in the apps keep working. If Authentik is the thing protecting the on-host upgrade
+# trigger: a started upgrade runs independently of it and rolls back on its own.
+# Read the release notes first — Authentik does not support skipping several feature
+# releases blindly, and server, worker and outpost must run the same version (they do here:
+# all three images follow authentik_version).
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+  when: not (upgrade_local_run | default(false) | bool)
+
+- name: Authentik upgrade (PITR auto-rollback)
+  hosts: all
+  become: true
+  vars:
+    upgrade_confirm: ""
+    authentik_upgrade_version: ""
+    upgrade_keep_old: true          # keep the pre-rollback data dir by default (safety)
+    force_rollback: false           # DRILL: roll back at the end even on success
+    upgrade_health_retries: 60      # readiness poll attempts (x5s); lower for drills
+    _akpg: authentik-postgres
+    _ak_containers: [authentik-server, authentik-worker, authentik-ldap]
+    _ak_api: "http://127.0.0.1:{{ authentik_http_port }}"
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that:
+          - upgrade_confirm | default('') == 'YES'
+          - (authentik_upgrade_version | default('')) | length > 0
+        fail_msg: "Need -e authentik_upgrade_version=<tag> and -e upgrade_confirm=YES"
+
+    - name: Reconcile versions with the host
+      ansible.builtin.include_tasks: tasks/adopt_host_versions.yml
+
+    - name: Refuse a no-op
+      ansible.builtin.assert:
+        that: authentik_upgrade_version != authentik_version
+        fail_msg: "Authentik is already at {{ authentik_version }}."
+
+    - name: Record the current version for rollback
+      ansible.builtin.set_fact:
+        _rollback_version: "{{ authentik_version }}"
+
+    # ---- QUIESCE ----------------------------------------------------------------------
+    - name: Stop server, worker and LDAP outpost (no writes while the anchor is taken)
+      ansible.builtin.command: "docker stop {{ _ak_containers | join(' ') }}"
+      changed_when: true
+
+    # ---- PITR ANCHOR ------------------------------------------------------------------
+    - name: Capture the PITR anchor time (UTC, from the authentik instance itself)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ _akpg }}", psql, -U, authentik, -tAc,
+               "select to_char(now() at time zone 'utc','YYYY-MM-DD HH24:MI:SS')"]
+      register: _anchor
+      changed_when: false
+
+    - name: Set the anchor fact (+00)
+      ansible.builtin.set_fact:
+        _pitr_target: "{{ _anchor.stdout | trim }}+00"
+
+    - name: Force a WAL switch (guarantee the anchor segment reaches the archive)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ _akpg }}", psql, -U, authentik, -c, "select pg_switch_wal()"]
+      changed_when: false
+
+    # ---- UPGRADE (block) with automatic PITR ROLLBACK (rescue) -------------------------
+    - name: Upgrade
+      block:
+        - name: Redeploy authentik with the new image (the server runs its migrations)
+          ansible.builtin.include_role:
+            name: compose_stack
+          vars:
+            stack: authentik
+            authentik_version: "{{ authentik_upgrade_version }}"
+
+        - name: Wait until authentik is ready (migrations done, server up)
+          ansible.builtin.uri:
+            url: "{{ _ak_api }}/-/health/ready/"
+            status_code: [200, 204]
+          register: _akr
+          until: _akr is not failed
+          retries: "{{ upgrade_health_retries | default(60) }}"
+          delay: 5
+
+        - name: Verify all three containers run the new version
+          ansible.builtin.command: "docker inspect {{ item }} -f {{ '{{.Config.Image}} {{.State.Running}}' }}"
+          register: _akimg
+          changed_when: false
+          failed_when: (':' ~ authentik_upgrade_version) not in _akimg.stdout or 'true' not in _akimg.stdout
+          loop: "{{ _ak_containers }}"
+
+        - name: Verify the API answers with the new version (DB readable, migrations applied)
+          ansible.builtin.uri:
+            url: "{{ _ak_api }}/api/v3/admin/version/"
+            headers:
+              Authorization: "Bearer {{ vault_authentik_bootstrap_token }}"
+            return_content: true
+          register: _akver
+          until: _akver is not failed and (_akver.json.version_current | default('')) == authentik_upgrade_version
+          retries: 12
+          delay: 5
+          no_log: true
+
+        - name: Verify the LDAP outpost came back healthy
+          ansible.builtin.command: "docker inspect authentik-ldap -f {{ '{{.State.Health.Status}}' }}"
+          register: _akldap
+          until: (_akldap.stdout | trim) == 'healthy'
+          retries: 24
+          delay: 5
+          changed_when: false
+          when: authentik_ldap_enabled | default(false) | bool
+
+        - name: Upgrade verified
+          ansible.builtin.debug:
+            msg: "Authentik upgraded {{ _rollback_version }} -> {{ authentik_upgrade_version }}. Ready, images + API version verified."
+
+        # Persist ONLY now — verified and kept (a force_rollback drill undoes the upgrade).
+        - name: Persist authentik_version to the private config (verified upgrade, kept)
+          ansible.builtin.lineinfile:
+            path: "{{ inventory_dir }}/group_vars/all/authentik.yml"
+            regexp: '^authentik_version:'
+            line: 'authentik_version: "{{ authentik_upgrade_version }}"'
+          delegate_to: localhost
+          become: false
+          when: not (force_rollback | default(false) | bool)
+
+        - name: Record the deployed version on the host
+          ansible.builtin.include_tasks: tasks/record_version.yml
+          vars:
+            rec_service: authentik
+            rec_var: authentik_version
+            rec_file: authentik.yml
+            rec_value: "{{ authentik_upgrade_version }}"
+            rec_previous: "{{ _rollback_version }}"
+          when: not (force_rollback | default(false) | bool)
+
+        # ---- force_rollback DRILL: undo the (successful) upgrade on purpose -----------
+        - name: force_rollback — roll the just-upgraded environment back (drill)
+          ansible.builtin.include_tasks: tasks/authentik_rollback.yml
+          when: force_rollback | default(false) | bool
+
+        - name: Drill complete
+          ansible.builtin.debug:
+            msg: "force_rollback drill complete — authentik rolled back to {{ _rollback_version }} (instance restored to {{ _pitr_target }})."
+          when: force_rollback | default(false) | bool
+
+      rescue:
+        - name: Upgrade FAILED — starting PITR rollback
+          ansible.builtin.debug:
+            msg: "Authentik upgrade failed. Rolling its instance back to {{ _pitr_target }} and redeploying {{ _rollback_version }}."
+
+        - name: Roll back (shared steps — same as the force_rollback drill)
+          ansible.builtin.include_tasks: tasks/authentik_rollback.yml
+
+        - name: Roll-back complete — fail the play so the outcome is unmistakable
+          ansible.builtin.fail:
+            msg: >-
+              Authentik upgrade to {{ authentik_upgrade_version }} FAILED and was rolled back
+              to {{ _rollback_version }} (instance restored to {{ _pitr_target }}).
+              Investigate before retrying.

@@ -1,0 +1,4 @@
+# Force LF everywhere: these files are DEPLOYED to Linux hosts — CRLF breaks
+# shebangs (#!/usr/bin/env python3\r) and shell scripts. Editing happens from
+# Windows AND WSL, so git must normalize regardless of editor behavior.
+* text=auto eol=lf

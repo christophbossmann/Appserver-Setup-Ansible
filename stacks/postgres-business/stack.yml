@@ -1,0 +1,14 @@
+# Business Postgres instance (nextcloud + immich). See group_vars/all/postgres.yml.
+owner: "999"   # postgres container user
+group: "999"
+mode: "0700"
+networks:
+  - backend    # shared net; nextcloud/immich compose join it as external
+dirs:
+  - { path: "{{ postgres_business_data_dir }}", owner: "999", group: "999", mode: "0700" }
+# Stateful: never auto-pull (a new image would recreate the DB container on a routine run).
+pull: false
+health_cmd: "docker exec {{ postgres_business_container }} pg_isready -U {{ postgres_business_user }}"
+health_retries: 10
+health_delay: 3
+status_msg: "Business Postgres running on 127.0.0.1:{{ postgres_business_port }} (nextcloud + immich)."

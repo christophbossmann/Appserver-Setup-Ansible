@@ -1,0 +1,199 @@
+#!/bin/bash
+# snapshot - btrfs/snapper helper. Installed to /usr/local/bin/snapshot by
+# btrfs-bootstrap.sh, runs from anywhere, auto-elevates with sudo.
+#
+# Works on ANY snapper config via  -c <config>  (default: root = the OS).
+#
+#   snapshot [-c CONFIG] list
+#   snapshot [-c CONFIG] create [--cleanup A] [description]
+#   snapshot [-c CONFIG] keep <N>              make snapshot N permanent (no cleanup)
+#   snapshot [-c CONFIG] delete <N> [N...]     delete snapshot(s) by number
+#   snapshot [-c CONFIG] undo <N>              revert FILE changes since N (no reboot)
+#   snapshot [-c CONFIG] rollback <N> [-y]     roll the config's subvolume back to N
+#        root -> swaps @ and REBOOTS. A data volume -> unmounts, swaps, remounts: NO reboot
+#        (stop the service using it first). History <= N is kept, snapshots > N are dropped.
+#
+#   snapshot volumes                           list snapper configs + their mountpoints
+#   snapshot volume-add <name> <mountpoint>    split an existing folder into its own subvolume
+#        @<name> (data) + @<name>_snapshots (flat) + snapper config <name>, mounted via fstab.
+#        A later system rollback then leaves this data untouched. STOP the service first.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"    # auto-elevate
+
+die() { echo "snapshot: $*" >&2; exit 1; }
+
+usage() {
+  sed -n '5,19p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# SUBVOLUME= path of a snapper config (e.g. root -> "/", immich -> "/opt/immich")
+config_subvolume() { grep -oE '^SUBVOLUME="[^"]*"' "/etc/snapper/configs/$1" 2>/dev/null | cut -d'"' -f2; }
+
+# --- optional -c CONFIG (before the command) --------------------------------
+CFG=root
+if [ "${1:-}" = "-c" ]; then
+  CFG="${2:-}"; shift 2 || true
+  [ -n "$CFG" ] || die "-c needs a config name (see 'snapshot volumes')"
+fi
+
+cmd="${1:-help}"; [ $# -gt 0 ] && shift || true
+case "$cmd" in
+  list|ls|l)
+    exec snapper -c "$CFG" list
+    ;;
+
+  create|c|new)
+    cleanup=""
+    if [ "${1:-}" = "--cleanup" ]; then cleanup="${2:-}"; shift 2 || true; fi
+    desc="${*:-manual}"
+    if [ -n "$cleanup" ]; then
+      snapper -c "$CFG" create -c "$cleanup" -d "$desc"
+    else
+      snapper -c "$CFG" create -d "$desc"
+    fi
+    echo "created snapshot in '$CFG': \"$desc\"${cleanup:+ (cleanup=$cleanup)}"
+    snapper -c "$CFG" list | tail -n 3
+    ;;
+
+  keep)
+    N="${1:-}"; case "$N" in ''|*[!0-9]*) die "usage: snapshot [-c CONFIG] keep <N>";; esac
+    snapper -c "$CFG" modify -c "" "$N"
+    echo "snapshot #$N in '$CFG' is now permanent (no auto-cleanup)"
+    ;;
+
+  delete|del|rm)
+    [ $# -gt 0 ] || die "usage: snapshot [-c CONFIG] delete <N> [N...]   (N = # from 'snapshot list')"
+    for a in "$@"; do
+      case "$a" in ''|*[!0-9]*) die "'$a' is not a snapshot number — run 'snapshot list' and use the # column.";; esac
+    done
+    snapper -c "$CFG" delete "$@"
+    echo "deleted from '$CFG': $*"
+    ;;
+
+  undo)
+    N="${1:-}"; case "$N" in ''|*[!0-9]*) die "usage: snapshot [-c CONFIG] undo <N>";; esac
+    echo "reverting file changes in '$CFG' made since snapshot #$N ..."
+    exec snapper -c "$CFG" undochange "${N}..0"
+    ;;
+
+  rollback|rb)
+    N="${1:-}"; case "$N" in ''|*[!0-9]*) die "usage: snapshot [-c CONFIG] rollback <N> [-y]";; esac
+    assume_yes=no; [ "${2:-}" = "-y" ] && assume_yes=yes
+
+    mp="$(config_subvolume "$CFG")"
+    [ -n "$mp" ] || die "no snapper config '$CFG' (see 'snapshot volumes')"
+    mountpoint -q "$mp" || [ "$mp" = "/" ] || die "$mp is not mounted — mount it first."
+    dev="$(findmnt -no SOURCE "$mp" | sed 's/\[.*//' || true)"
+    [ -n "$dev" ] || die "cannot determine the device of $mp"
+    sv="$(findmnt -no OPTIONS "$mp" | tr ',' '\n' | grep '^subvol=' | head -1 | sed 's|^subvol=/||' || true)"
+    [ -n "$sv" ] || die "cannot determine the subvolume mounted at $mp (mounted by subvol=?)"
+    if [ "$sv" = "@" ]; then snapsv="@snapshots"; else snapsv="${sv}_snapshots"; fi
+    is_root=0; [ "$mp" = "/" ] && is_root=1
+
+    mount -o subvolid=5 "$dev" /mnt
+    if [ -d "/mnt/$snapsv" ]; then flat=1; snapdir="/mnt/$snapsv"; else flat=0; snapdir="/mnt/$sv/.snapshots"; fi
+    if [ ! -e "$snapdir/$N/snapshot" ]; then
+      umount /mnt; die "snapshot #$N not found in config '$CFG' (see 'snapshot -c $CFG list')"
+    fi
+
+    if [ "$assume_yes" != yes ]; then
+      if [ "$is_root" = 1 ]; then q="Roll '$CFG' back to #$N and REBOOT now?"; else q="Roll '$CFG' ($mp) back to #$N now (no reboot)?"; fi
+      read -rp "$q [y/N] " ans
+      case "$ans" in y|Y|yes|YES) ;; *) umount /mnt; echo "aborted."; exit 1 ;; esac
+    fi
+
+    # A data volume must be unmounted before its @ can be swapped in (root can't be).
+    if [ "$is_root" = 0 ]; then
+      umount "$mp/.snapshots" 2>/dev/null || true
+      if ! umount "$mp" 2>/dev/null; then
+        umount /mnt; die "$mp is busy — stop the service using it first (e.g. 'docker compose stop')."
+      fi
+    fi
+
+    OLD="/mnt/${sv}_rollback_backup_$(date +%F_%H-%M)"
+    echo "renaming current $sv -> ${OLD#/mnt} (safety net) ..."
+    mv "/mnt/$sv" "$OLD"
+    echo "creating a fresh $sv from snapshot #$N ..."
+    if [ "$flat" = 1 ]; then src="/mnt/$snapsv/$N/snapshot"; else src="$OLD/.snapshots/$N/snapshot"; fi
+    btrfs subvolume snapshot "$src" "/mnt/$sv" >/dev/null
+    if [ "$flat" = 1 ]; then
+      for d in "/mnt/$snapsv"/*/; do
+        m="$(basename "$d")"; case "$m" in ''|*[!0-9]*) continue;; esac
+        if [ "$m" -gt "$N" ]; then
+          btrfs subvolume delete "$d/snapshot" >/dev/null 2>&1 || true
+          rm -rf "$d" && echo "  dropped snapshot #$m (newer than #$N)"
+        fi
+      done
+    else
+      rm -rf "/mnt/$sv/.snapshots" 2>/dev/null || true
+      btrfs subvolume create "/mnt/$sv/.snapshots" >/dev/null
+    fi
+    [ "$is_root" = 1 ] && btrfs subvolume set-default "/mnt/$sv"
+    umount /mnt
+
+    if [ "$is_root" = 1 ]; then
+      echo "rolled '$CFG' back to #$N — old system kept as ${OLD#/mnt}. Rebooting ..."
+      sleep 2; reboot
+    else
+      mount "$mp"; mount "$mp/.snapshots" 2>/dev/null || true
+      echo "rolled '$CFG' ($mp) back to #$N — no reboot. Old data kept as ${OLD#/mnt}."
+    fi
+    ;;
+
+  volumes|vols)
+    printf '%-14s %-24s %s\n' CONFIG MOUNTPOINT DEVICE
+    for f in /etc/snapper/configs/*; do
+      [ -f "$f" ] || continue
+      c="$(basename "$f")"; m="$(config_subvolume "$c")"
+      printf '%-14s %-24s %s\n' "$c" "${m:-?}" "$(findmnt -no SOURCE "$m" 2>/dev/null || echo '-')"
+    done
+    ;;
+
+  volume-add|vol-add)
+    name="${1:-}"; mp="${2:-}"
+    { [ -n "$name" ] && [ -n "$mp" ]; } || die "usage: snapshot volume-add <name> <mountpoint>   (e.g. immich /opt/immich)"
+    case "$name" in *[!a-zA-Z0-9_-]*|'') die "invalid name '$name' (use letters/digits/_/- )";; esac
+    [ -d "$mp" ] || die "'$mp' is not an existing directory"
+    mountpoint -q "$mp" && die "'$mp' is already a mount — looks like it's already a subvolume."
+    [ "$(findmnt -no FSTYPE --target "$mp")" = btrfs ] || die "'$mp' is not on a btrfs filesystem."
+    dev="$(findmnt -no SOURCE / | sed 's/\[.*//')"
+    ruuid="$(findmnt -no UUID /)"
+    echo "This moves '$mp' into a new subvolume @$name (+ flat @${name}_snapshots + snapper config '$name')."
+    echo ">>> STOP any service writing to $mp first (data must be static). <<<"
+    read -rp "Proceed? [y/N] " a; case "$a" in y|Y|yes|YES) ;; *) echo "aborted."; exit 1 ;; esac
+
+    mount -o subvolid=5 "$dev" /mnt
+    { [ -d "/mnt/@$name" ] || [ -d "/mnt/@${name}_snapshots" ]; } && { umount /mnt; die "@$name / @${name}_snapshots already exists."; }
+    echo "creating subvolumes + reflink-copying data ..."
+    btrfs subvolume create "/mnt/@$name" >/dev/null
+    btrfs subvolume create "/mnt/@${name}_snapshots" >/dev/null
+    cp -a --reflink=always "$mp/." "/mnt/@$name/"
+    btrfs subvolume delete "/mnt/@$name/.snapshots" >/dev/null 2>&1 || rm -rf "/mnt/@$name/.snapshots" 2>/dev/null || true
+    umount /mnt
+
+    echo "swapping in the new subvolume (fstab + mount) ..."
+    mv "$mp" "${mp}.premigrate"
+    mkdir -p "$mp"
+    echo "UUID=$ruuid $mp btrfs defaults,subvol=@$name 0 0" >> /etc/fstab
+    mount "$mp"
+
+    echo "creating snapper config '$name' (flat .snapshots) ..."
+    snapper -c "$name" create-config "$mp"
+    snapper -c "$name" set-config TIMELINE_CREATE=no          # data: snapshot on demand, not on a timer
+    btrfs subvolume delete "$mp/.snapshots" >/dev/null 2>&1 || true
+    echo "UUID=$ruuid $mp/.snapshots btrfs defaults,subvol=@${name}_snapshots 0 0" >> /etc/fstab
+    mkdir -p "$mp/.snapshots"; mount "$mp/.snapshots"; chmod 750 "$mp/.snapshots"
+
+    echo ""
+    echo "done. '$mp' is now the @$name subvolume — a system rollback no longer touches it."
+    echo "  manage it with:   snapshot -c $name list | create <desc> | rollback <N>"
+    echo "  verify the data, then remove the old copy:   sudo rm -rf ${mp}.premigrate"
+    ;;
+
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    die "unknown command '$cmd' (try: snapshot help)"
+    ;;
+esac

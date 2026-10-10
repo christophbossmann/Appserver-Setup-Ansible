@@ -1,0 +1,56 @@
+# Caddy route for this stack — loaded explicitly by the caddy role.
+# PUBLIC route: hardened share-link gateway. Two layers on top of immich's own
+# share-key auth:
+#   1) HTTP Basic Auth (caddy_extra below) sits IN FRONT of everything as a 0-day
+#      gate — without the share credentials Caddy 401s before immich ever runs, so
+#      a pre-auth immich vuln is unreachable. Creds are handed out WITH each share
+#      link (user "immich" / vault_basicauth_immich_share, plaintext → bcrypt at render).
+#   2) Path allowlist (immich_public_allow_paths) — only the share/view/upload API
+#      subset is proxied; enumeration/bulk/admin endpoints 404. Defense-in-depth for
+#      a credential holder / leaked password.
+# Full unrestricted access is the INTERNAL route below (VPN). Mark `immich: external`
+# and `immich_int: internal` in caddy_services.
+caddy_route_immich:
+  name: immich
+  hostname_label: immich
+  caddy_upstream: "127.0.0.1:2283"
+  caddy_allow_paths: "{{ immich_public_allow_paths | default([]) }}"   # empty = no restriction (full)
+  # With basic_auth in front, the bare root now returns 401 (not 404) to the
+  # unauthenticated post-check probe.
+  healthcheck_status_codes: [401]
+  # Basic Auth gate. Caddy orders basic_auth BEFORE the allow/handle logic, so it
+  # protects EVERY path (share page + API). Rendered at site scope via caddy_extra.
+  # Access log -> stderr -> journald (NOT a file: the caddy systemd sandbox blocks
+  # writing under /var/log/caddy). fail2ban reads the caddy journal unit and bans
+  # IPs after repeated 401s — see the caddy-immich jail in the hardening role.
+  caddy_extra: |
+    basic_auth {
+      immich {{ vault_basicauth_immich_share | password_hash('bcrypt', caddy_basicauth_salt, rounds=caddy_basicauth_rounds) }}
+    }
+    log {
+      output stderr
+      format json
+    }
+
+# FULL Immich over Tailscale (immich.int.<host>) — the private app, VPN-only. Same
+# upstream, no allowlist. This is your always-available full-access entry point.
+caddy_route_immich_int:
+  name: immich-int
+  depends_service: immich   # deployed by the immich stack (intent-aware post-check)
+  hostname_label: immich
+  caddy_upstream: "127.0.0.1:2283"
+  # Access log -> journald (same as the public route) for the "Access logs" dashboard
+  # (roles/monitoring access-metrics).
+  caddy_extra: |
+    log {
+      output stderr
+      format json
+    }
+
+# Read-only raw WebDAV over the upload dir — INTERNAL only (mark webdav_immich:
+# internal in caddy_services, so it lands under the *.int wildcard, Tailscale-bound).
+caddy_route_webdav_immich:
+  name: webdav-immich
+  depends_service: immich   # webdav sidecar of the immich stack (intent-aware post-check)
+  hostname_label: webdav-immich
+  caddy_upstream: "127.0.0.1:{{ immich_webdav_port }}"

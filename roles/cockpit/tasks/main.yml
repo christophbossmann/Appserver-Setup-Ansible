@@ -1,4 +1,10 @@
 ---
+# Intent-aware post-check: mark this service deployed in THIS run so its route (cockpit)
+# is only checked when the role actually ran. Route maps here via depends_service: cockpit.
+- name: Register cockpit as deployed (intent-aware post-check)
+  ansible.builtin.set_fact:
+    deployed_services: "{{ (deployed_services | default([])) + ['cockpit'] }}"
+
 - name: Install Cockpit
   ansible.builtin.apt:
     name: "{{ ['cockpit'] + (cockpit_extra_packages | default([])) }}"

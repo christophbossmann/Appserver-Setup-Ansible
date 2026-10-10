@@ -1,0 +1,61 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/n8n.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# n8n app config (was vars/n8n.yml). Non-secret defaults live in
+# roles/n8n/defaults/main.yml; secrets in group_vars/all/vault.yml.
+
+n8n_bind_address: "127.0.0.1"
+n8n_public_hostname: "{{ svc_edge_host['n8n'] }}"
+n8n_public_protocol: "https"
+n8n_secure_cookie: true
+n8n_proxy_hops: 1
+# Strongly recommended for production (credential encryption at rest);
+# uncomment here AND vault_n8n_encryption_key in group_vars/all/vault.yml:
+# n8n_encryption_key: "{{ vault_n8n_encryption_key }}"
+
+# Extra n8n environment variables — merged on top of role defaults via combine().
+# Keys = exact Docker env var names. User values win over role defaults.
+# Add overrides or new vars here without touching the role.
+n8n_extra_env:
+  N8N_RESTRICT_FILE_ACCESS_TO: "/files/;/home/node/.n8n-files/"
+  NODE_FUNCTION_ALLOW_BUILTIN: "fs"
+  NODE_FUNCTION_ALLOW_EXTERNAL: "*"
+  # N8N_LOG_LEVEL: "debug"
+  # N8N_METRICS: "true"
+
+# n8n uses the shared Postgres instance (group_vars/all/postgres.yml).
+n8n_db_user: "{{ postgres_user }}"
+n8n_db_password: "{{ postgres_password }}"
+n8n_db_name: "{{ postgres_db }}"
+
+# === Brain agents ===
+# Intentionally NOT configured here — the role default provisions the generic
+# agent_example only. Real agents (incl. their specific dir layouts) are
+# copied manually via WebDAV / from the n8n workflow repo where they are
+# versioned. To provision skeletons via Ansible anyway, set n8n_brain_agents
+# (+ n8n_brain_subdirs) here.
+
+# === WebDAV (Brain file access) ===
+# LDAP mode: authenticate WebDAV against Authentik via the LDAP outpost (rclone
+# --auth-proxy). Login = an Authentik user in the webdav-n8n-users group (bind DN
+# cn=<user>,ou=users,<base_dn>). Set false to fall back to the fixed basic_auth
+# below. Needs the LDAP outpost (authentik_ldap_apps: webdav-n8n) + rclone-ldap image.
+#
+# HINWEIS — Windows-Caching-Falle: Der Windows-WebDAV-Client (Dienst "WebClient")
+# cached Credentials im RAM und spielt ALTE weiter ab, selbst wenn du bei "net use"
+# ein neues Passwort tippst -> Symptom: im Browser (Inkognito) geht es sofort, im
+# Explorer/Laufwerk aber dauerhaft "Systemfehler 5 / Zugriff verweigert" bzw. im
+# Outpost-Log "flow error password: Invalid password" in Schleife (Username/Bind-DN
+# ist dabei KORREKT). Lösung (PowerShell als Admin, Reihenfolge wichtig — der
+# Dienst-Neustart ist der entscheidende Schritt):
+#   net use * /delete /y
+#   cmdkey /delete:webdav-n8n.int.<host>      # + alle Treffer aus `cmdkey /list`
+#   net stop webclient ; net start webclient
+#   net use Z: https://webdav-n8n.int.<host>/ /user:<authentik-user> *   # * = frischer PW-Prompt
+# Danach flott (rclone cached die Auth nach dem 1. Login; jeder LDAP-Bind fährt sonst
+# den vollen Auth-Flow ~2-3s).
+n8n_webdav_ldap: true
+n8n_webdav_ldap_base_dn: "dc=n8n,dc=ldap,dc=example,dc=com"
+# Fallback basic_auth (used when n8n_webdav_ldap is false):
+n8n_webdav_user: "{{ admin_user }}"
+n8n_webdav_password: "{{ vault_n8n_webdav_password }}"

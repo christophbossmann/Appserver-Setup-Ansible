@@ -1,3 +1,14 @@
+[DEFAULT]
+# Never banned (loopback + tailnet): hardening_fail2ban_ignoreip
+ignoreip = {{ hardening_fail2ban_ignoreip | default(['127.0.0.1/8', '::1']) | join(' ') }}
+{% if hardening_fail2ban_bantime_increment | default(false) | bool %}
+# Escalating bans (all jails): n-th ban of an IP = bantime x multiplier[n], capped at
+# maxtime. Ban history lives in fail2ban's DB (dbpurgeage in fail2ban.local).
+bantime.increment   = true
+bantime.multipliers = {{ hardening_fail2ban_bantime_multipliers }}
+bantime.maxtime     = {{ hardening_fail2ban_bantime_maxtime }}
+
+{% endif %}
 [sshd]
 enabled  = true
 port     = 22
@@ -6,3 +17,16 @@ backend  = systemd
 maxretry = {{ hardening_fail2ban_maxretry }}
 findtime = {{ hardening_fail2ban_findtime }}
 bantime  = {{ hardening_fail2ban_bantime }}
+{% if hardening_fail2ban_caddy_immich_enabled | default(false) %}
+
+# Public Immich share route: ban IPs failing the HTTP Basic Auth gate too often.
+# Caddy access log -> journald; the filter's journalmatch scopes to caddy.service.
+[caddy-immich]
+enabled  = true
+port     = http,https
+filter   = caddy-immich
+backend  = systemd
+maxretry = {{ hardening_fail2ban_caddy_immich_maxretry }}
+findtime = {{ hardening_fail2ban_caddy_immich_findtime }}
+bantime  = {{ hardening_fail2ban_caddy_immich_bantime }}
+{% endif %}

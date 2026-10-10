@@ -1,4 +1,10 @@
 ---
+# Intent-aware post-check: mark this service deployed in THIS run so its route (grafana)
+# is only checked when the role actually ran. Route maps here via depends_service: monitoring.
+- name: Register monitoring as deployed (intent-aware post-check)
+  ansible.builtin.set_fact:
+    deployed_services: "{{ (deployed_services | default([])) + ['monitoring'] }}"
+
 - name: Create monitoring directories
   ansible.builtin.file:
     path: "{{ item.path }}"
@@ -14,6 +20,122 @@
     - { path: /opt/monitoring/provisioning/datasources, owner: "root" }
     - { path: /opt/monitoring/provisioning/dashboards, owner: "root" }
     - { path: /opt/monitoring/provisioning/dashboards/json, owner: "root" }
+    # shared Prometheus file_sd dir (roles/caddy writes caddy-probes.json into it); must
+    # exist before the stack starts so the bind mount isn't created as an empty root dir
+    - { path: /etc/prometheus-file-sd, owner: "root" }
+
+# The two lists below are built by appending in loops. Start them empty on EVERY run of the
+# role: when the role runs twice in one play (an upgrade + its rollback in stack-upgrade.yml)
+# the second pass would otherwise append the same exporters again -> duplicate services ->
+# an unparsable docker-compose.yml.
+- name: Reset the discovery lists
+  ansible.builtin.set_fact:
+    _pg_exporters: []
+    _prom_apps: {}
+
+# --- postgres_exporter targets: instances actually running here -----------------------
+- name: List running containers (postgres_exporter targets)
+  ansible.builtin.command: docker ps --format '{{ "{{.Names}}" }}'
+  register: _mon_running
+  changed_when: false
+  check_mode: false
+
+- name: Inspect the networks of the running postgres instances
+  ansible.builtin.command: >-
+    docker inspect -f '{{ "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}" }}' {{ item.container }}
+  loop: "{{ postgres_pitr_instances | default([]) | selectattr('container', 'in', _mon_running.stdout_lines) | list }}"
+  loop_control: { label: "{{ item.container }}" }
+  register: _mon_pg_nets
+  changed_when: false
+  check_mode: false
+
+- name: Build the postgres_exporter list (name, container, superuser, network)
+  ansible.builtin.set_fact:
+    _pg_exporters: >-
+      {{ _pg_exporters | default([]) + [{'name': item.item.name, 'container': item.item.container,
+                                         'user': item.item.user, 'network': item.stdout.split() | first}] }}
+  loop: "{{ _mon_pg_nets.results }}"
+  loop_control: { label: "{{ item.item.name }}" }
+
+# App metrics scraped directly by Prometheus (built-in endpoints): only for apps whose
+# container runs here; Prometheus joins each app's docker network to reach them.
+- name: Inspect the networks of apps with built-in metrics (immich, authentik, headscale)
+  ansible.builtin.command: >-
+    docker inspect -f '{{ "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}" }}' {{ item }}
+  loop: "{{ ['immich-server', 'authentik-server', 'headscale'] | select('in', _mon_running.stdout_lines) | list }}"
+  register: _mon_app_nets
+  changed_when: false
+  check_mode: false
+
+- name: Build the app scrape list (container -> network)
+  ansible.builtin.set_fact:
+    _prom_apps: "{{ _prom_apps | default({}) | combine({item.item: item.stdout.split() | first}) }}"
+  loop: "{{ _mon_app_nets.results }}"
+  loop_control: { label: "{{ item.item }}" }
+
+# Caddy's read-only metrics site is bound to docker0 (roles/caddy); UFW must admit the
+# docker subnets to it (container -> host traffic hits the INPUT chain).
+- name: Allow docker subnets to reach Caddy's metrics endpoint (UFW)
+  community.general.ufw:
+    rule: allow
+    from_ip: 172.16.0.0/12
+    to_ip: "{{ caddy_metrics_bind | default('172.17.0.1') }}"
+    port: "{{ caddy_metrics_port | default(9180) | string }}"
+    proto: tcp
+    comment: "prometheus -> caddy metrics"
+  when: caddy_metrics_enabled | default(false) | bool
+
+# Read-only monitoring role per instance (statistics via pg_monitor, no table data).
+# docker exec + local socket as the instance superuser — no superuser password needed.
+- name: Ensure the read-only prom_exporter role exists (per instance)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ item.container }}"
+      - psql
+      - -U
+      - "{{ item.user }}"
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -qc
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'prom_exporter') THEN CREATE ROLE prom_exporter LOGIN; END IF;
+        END $$;
+        ALTER ROLE prom_exporter WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{{ pg_exporter_password }}';
+        GRANT pg_monitor TO prom_exporter;
+  loop: "{{ _pg_exporters | default([]) }}"
+  loop_control: { label: "{{ item.name }}" }
+  changed_when: false
+  no_log: true
+  when: not ansible_check_mode
+
+- name: Write postgres_exporter credentials (root-only env files)
+  ansible.builtin.copy:
+    dest: "/opt/monitoring/pg-exporter-{{ item.name }}.env"
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      DATA_SOURCE_URI={{ item.container }}:5432/postgres?sslmode=disable
+      DATA_SOURCE_USER=prom_exporter
+      DATA_SOURCE_PASS={{ pg_exporter_password }}
+  loop: "{{ _pg_exporters | default([]) }}"
+  loop_control: { label: "{{ item.name }}" }
+  no_log: true
+  notify: Restart monitoring stack
+
+- name: Deploy blackbox_exporter config
+  ansible.builtin.template:
+    src: blackbox.yml.j2
+    dest: /opt/monitoring/blackbox.yml
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart monitoring stack
 
 - name: Deploy Prometheus config
   ansible.builtin.template:
@@ -57,17 +179,35 @@
   until: node_dashboard is not failed
   when: not ansible_check_mode
 
-- name: Download Docker Container dashboard (ID 10619)
-  ansible.builtin.get_url:
-    url: https://grafana.com/api/dashboards/10619/revisions/1/download
-    dest: /opt/monitoring/provisioning/dashboards/json/docker-containers.json
+# The upstream "Docker Container & Host Metrics" dashboard (grafana.com ID 10619)
+# was built for a different environment and shows "No data" on several panels here
+# (host instance/port template split doesn't resolve, xfs vs our btrfs root, the
+# pre-0.16 node_disk_bytes_* metric names, and 1m rate windows below cAdvisor's
+# 120s housekeeping). We ship a corrected copy as a role file instead of
+# downloading it, so the fixes are authoritative and survive re-runs. Do NOT
+# re-add a get_url for 10619 — it would overwrite the corrected version.
+- name: Deploy custom (role-managed) dashboards
+  ansible.builtin.copy:
+    src: "dashboards/{{ item }}"
+    dest: "/opt/monitoring/provisioning/dashboards/json/{{ item }}"
+    owner: root
+    group: root
     mode: "0644"
-    force: true
-  register: docker_dashboard
-  retries: 3
-  delay: 5
-  until: docker_dashboard is not failed
-  when: not ansible_check_mode
+  loop:
+    - docker-stats.json         # per-container CPU/Memory min/max/mean tables
+    - docker-containers.json    # corrected upstream 10619 (host + container overview)
+    - scheduled-jobs.json       # systemd timers/services: last run, age, last result (node_exporter systemd collector)
+    - security.json             # SSH attacks, UFW blocks, fail2ban, effective sshd policy (security-metrics)
+    - disk-usage.json           # treemap of directory sizes (disk-usage-metrics + treemap plugin)
+    - endpoints.json            # blackbox probes of every Caddy route: up, status, latency, TLS expiry
+    - postgres.json             # postgres_exporter: health, sizes, load, cache, PITR WAL archiver
+    - caddy.json                # Caddy per-host requests, status codes, latency, traffic
+    - immich.json               # Immich job queues + completed jobs (+ Caddy view of its hosts)
+    - authentik.json            # Authentik logins (flow stages), outposts, tasks, latency
+    - access-logs.json          # Caddy access logs per host (top IPs/paths, recent requests) + headscale
+    - vulnerabilities.json      # trivy: CRITICAL/HIGH vulnerabilities of the running images (trivy-metrics)
+  # No restart needed: the provider auto-reloads (updateIntervalSeconds). The fix
+  # script below normalises the datasource uid in-place before Grafana picks it up.
 
 - name: Fix datasource references in downloaded dashboards
   ansible.builtin.copy:
@@ -88,10 +228,244 @@
     mode: "0644"
   notify: Restart monitoring stack
 
+# --- Host-side textfile collectors (security + access + disk usage + immich storage + PITR + trivy) ----------------------------
+# Small scripts on a systemd timer write .prom files into a dir node_exporter reads
+# (--collector.textfile.directory). They run on the HOST because they need the journal,
+# fail2ban-client, sshd -T and du across all filesystems.
+- name: Textfile collectors
+  vars:
+    _textfile_collectors:
+      - name: security-metrics
+        description: Security metrics for node_exporter (sshd, UFW, fail2ban, sshd policy)
+        exec: /usr/local/bin/security-metrics
+        oncalendar: "*-*-* *:*:00"
+        enabled: "{{ monitoring_security_metrics_enabled | bool }}"
+      - name: access-metrics
+        description: Caddy access-log metrics for node_exporter (per served host)
+        exec: /usr/local/bin/access-metrics
+        oncalendar: "*-*-* *:*:30"
+        enabled: "{{ monitoring_access_metrics_enabled | bool }}"
+      - name: disk-usage-metrics
+        description: Directory sizes for node_exporter (disk usage treemap)
+        exec: "/usr/local/bin/disk-usage-metrics {{ monitoring_disk_usage_paths | join(' ') }}"
+        oncalendar: "{{ monitoring_disk_usage_oncalendar }}"
+        enabled: "{{ monitoring_disk_usage_enabled | bool }}"
+      - name: immich-storage-metrics
+        description: Immich DB/file consistency for node_exporter (orphan + missing files)
+        exec: >-
+          /usr/local/bin/immich-storage-metrics {{ immich_upload_dir | default('') }} /data
+          {{ immich_db_host | default('postgres') }} {{ immich_db_admin_user | default(postgres_user | default('postgres')) }}
+          {{ immich_db_name | default('immich') }} {{ monitoring_immich_storage_dirs | join(' ') }}
+        oncalendar: "{{ monitoring_immich_storage_oncalendar }}"
+        enabled: "{{ monitoring_immich_storage_enabled | bool }}"
+      # only instances whose container runs here — a declared-but-undeployed instance
+      # (e.g. the dev `postgres` on a host without it) would report 0 base backups = false alarm
+      - name: pitr-metrics
+        description: PostgreSQL PITR archive state for node_exporter (base backups, WAL)
+        exec: >-
+          /usr/local/bin/pitr-metrics
+          {% for i in postgres_pitr_instances | default([]) | selectattr('container', 'in', _mon_running.stdout_lines) %}{{ i.name }}:{{ i.host_archive }} {% endfor %}
+        oncalendar: "{{ monitoring_pitr_metrics_oncalendar }}"
+        enabled: "{{ monitoring_pitr_metrics_enabled | bool }}"
+      - name: trivy-metrics
+        description: Vulnerabilities of the running container images for node_exporter (trivy)
+        exec: "/usr/local/bin/trivy-metrics {{ monitoring_trivy_cache_dir }} /etc/trivy-update-rules.tsv"
+        oncalendar: "{{ monitoring_trivy_oncalendar }}"
+        enabled: "{{ monitoring_trivy_enabled | bool }}"
+        onboot: false      # heavy: never right after boot ...
+        kickoff: false     # ... and not on every deploy (only right after trivy was installed, see below)
+        service_extra:
+          - "MemoryMax={{ monitoring_trivy_memory_max }}"
+          - "MemorySwapMax=0"
+          - "CPUWeight=20"
+          - "TimeoutStartSec=4h"
+  block:
+    # trivy for the trivy-metrics collector: pinned upstream .deb (the distro has none),
+    # verified against the release's checksum file before it is installed.
+    - name: Check the installed trivy version
+      ansible.builtin.command: dpkg-query -W -f=${Version} trivy
+      register: _trivy_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: monitoring_trivy_enabled | bool
+
+    - name: Download the pinned trivy package (checksum-verified)
+      ansible.builtin.get_url:
+        url: "https://github.com/aquasecurity/trivy/releases/download/v{{ monitoring_trivy_version }}/trivy_{{ monitoring_trivy_version }}_Linux-64bit.deb"
+        dest: "/var/cache/trivy_{{ monitoring_trivy_version }}_Linux-64bit.deb"
+        checksum: "sha256:https://github.com/aquasecurity/trivy/releases/download/v{{ monitoring_trivy_version }}/trivy_{{ monitoring_trivy_version }}_checksums.txt"
+        mode: "0644"
+      when:
+        - monitoring_trivy_enabled | bool
+        - (_trivy_installed.stdout | default('')) != monitoring_trivy_version
+
+    - name: Install the pinned trivy package
+      ansible.builtin.apt:
+        deb: "/var/cache/trivy_{{ monitoring_trivy_version }}_Linux-64bit.deb"
+      register: _trivy_install
+      when:
+        - monitoring_trivy_enabled | bool
+        - (_trivy_installed.stdout | default('')) != monitoring_trivy_version
+        - not ansible_check_mode
+
+    # skopeo lists a repository's tags (docker itself cannot) for the version comparison.
+    - name: Install skopeo (registry tag listing for trivy-metrics)
+      ansible.builtin.apt:
+        name: skopeo
+        state: present
+      when: monitoring_trivy_enabled | bool
+
+    - name: Deploy the image update rules (repository <TAB> version tag pattern)
+      ansible.builtin.copy:
+        dest: /etc/trivy-update-rules.tsv
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {% for r in monitoring_trivy_update_rules | default([]) %}
+          {{ r.image }}	{{ r.tags }}{{ ('	' ~ r.tags_from) if r.tags_from is defined else '' }}
+          {% endfor %}
+      when: monitoring_trivy_enabled | bool
+
+    - name: Ensure the trivy cache dir exists (vuln DB + scratch space)
+      ansible.builtin.file:
+        path: "{{ monitoring_trivy_cache_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: monitoring_trivy_enabled | bool
+
+    # --- Scan button backend: distro `webhook` on loopback, one hook -> start the scan ---
+    - name: Install webhook (scan button backend)
+      ansible.builtin.apt:
+        name: webhook
+        state: present
+      when: (monitoring_trivy_enabled | bool) and (monitoring_scan_button_enabled | bool)
+
+    - name: Define the scan hook (POST /hooks/trivy-scan -> systemctl start trivy-metrics)
+      ansible.builtin.copy:
+        dest: /etc/webhook.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {{ [{'id': 'trivy-scan',
+               'execute-command': '/usr/bin/systemctl',
+               'pass-arguments-to-command': [{'source': 'string', 'name': 'start'},
+                                             {'source': 'string', 'name': '--no-block'},
+                                             {'source': 'string', 'name': 'trivy-metrics.service'}],
+               'http-methods': ['POST'],
+               'response-message': 'scan started'}] | to_nice_json }}
+      register: _webhook_conf
+      when: (monitoring_trivy_enabled | bool) and (monitoring_scan_button_enabled | bool)
+
+    - name: Ensure the webhook drop-in dir exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/webhook.service.d
+        state: directory
+        mode: "0755"
+      when: (monitoring_trivy_enabled | bool) and (monitoring_scan_button_enabled | bool)
+
+    # The packaged unit listens on 0.0.0.0:9000 — bind it to loopback (Caddy is the only client).
+    - name: Bind webhook to loopback
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/webhook.service.d/10-loopback.conf
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/monitoring)
+          [Service]
+          ExecStart=
+          ExecStart=/usr/bin/webhook -nopanic -hooks /etc/webhook.conf -ip 127.0.0.1 -port {{ monitoring_webhook_port }}
+      register: _webhook_dropin
+      when: (monitoring_trivy_enabled | bool) and (monitoring_scan_button_enabled | bool)
+
+    - name: Enable + (re)start webhook
+      ansible.builtin.systemd:
+        name: webhook.service
+        enabled: true
+        state: "{{ 'restarted' if (_webhook_conf.changed or _webhook_dropin.changed) else 'started' }}"
+        daemon_reload: "{{ _webhook_dropin.changed }}"
+      when:
+        - (monitoring_trivy_enabled | bool) and (monitoring_scan_button_enabled | bool)
+        - not ansible_check_mode
+
+    - name: Ensure the textfile collector directory exists
+      ansible.builtin.file:
+        path: /var/lib/node_exporter/textfile
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install collector scripts
+      ansible.builtin.copy:
+        src: "{{ item.name }}"
+        dest: "/usr/local/bin/{{ item.name }}"
+        owner: root
+        group: root
+        mode: "0755"
+      loop: "{{ _textfile_collectors | selectattr('enabled') | list }}"
+      loop_control: { label: "{{ item.name }}" }
+
+    - name: Install collector service units
+      ansible.builtin.template:
+        src: textfile-collector.service.j2
+        dest: "/etc/systemd/system/{{ item.name }}.service"
+        mode: "0644"
+      loop: "{{ _textfile_collectors | selectattr('enabled') | list }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _tfc_svc
+
+    - name: Install collector timer units
+      ansible.builtin.template:
+        src: textfile-collector.timer.j2
+        dest: "/etc/systemd/system/{{ item.name }}.timer"
+        mode: "0644"
+      loop: "{{ _textfile_collectors | selectattr('enabled') | list }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _tfc_tmr
+
+    - name: Enable + start collector timers
+      ansible.builtin.systemd:
+        name: "{{ item.name }}.timer"
+        enabled: true
+        state: started
+        daemon_reload: "{{ _tfc_svc.changed or _tfc_tmr.changed }}"
+      loop: "{{ _textfile_collectors | selectattr('enabled') | list }}"
+      loop_control: { label: "{{ item.name }}" }
+      # --check: a NEW collector's unit isn't written yet, so systemd can't find it.
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    # Run once now (non-blocking) so the dashboards have data right away instead of
+    # after the first timer tick (disk usage: up to an hour).
+    - name: Kick off a first collector run
+      ansible.builtin.command: "systemctl start --no-block {{ item.name }}.service"
+      changed_when: false
+      loop: "{{ _textfile_collectors | selectattr('enabled') | list }}"
+      loop_control: { label: "{{ item.name }}" }
+      when:
+        - not ansible_check_mode
+        - item.kickoff | default(true)
+
+    # trivy-metrics has kickoff: false (heavy — not on every deploy), but right after trivy
+    # was actually INSTALLED (first deploy or a version bump) one scan runs immediately, so
+    # the "Vulnerabilities" dashboard has data without waiting for the nightly timer.
+    - name: Run the first vulnerability scan after a fresh trivy install
+      ansible.builtin.command: systemctl start --no-block trivy-metrics.service
+      changed_when: true
+      when:
+        - monitoring_trivy_enabled | bool
+        - _trivy_install is changed
+        - not ansible_check_mode
+
 # Start — guarded against --check: command tasks validate chdir even in check
 # mode, and on a fresh host /opt/monitoring does not exist there yet.
+# --ignore-pull-failures: a registry hiccup / Docker Hub rate limit (429) must not fail the
+# deploy while the images are present locally; a really missing image still fails at `up`.
 - name: Pull monitoring stack images
-  ansible.builtin.command: docker compose pull
+  ansible.builtin.command: docker compose pull --ignore-pull-failures
   args:
     chdir: /opt/monitoring
   register: monitoring_pull
@@ -125,7 +499,7 @@
       {% else %}
       Health check skipped (check mode).
       {% endif %}
-      Grafana: http://{{ ansible_host }}:{{ grafana_port }}
+      Grafana: {{ ('https://' ~ (svc_edge_host | default({})).get('grafana')) if (svc_edge_host | default({})).get('grafana') else ('loopback only (127.0.0.1:' ~ grafana_port ~ ') — reach it via its Caddy route or ssh -L') }}
       Login: {{ grafana_admin_user }}
       Prometheus datasource and dashboards are auto-configured.
       Dashboards: Node Exporter Full (host metrics) + Docker Container & Host Metrics.

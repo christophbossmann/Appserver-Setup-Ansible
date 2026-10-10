@@ -1,0 +1,24 @@
+services:
+  dozzle:
+    container_name: dozzle
+    image: {{ dozzle_image }}
+    restart: unless-stopped
+    environment:
+      DOZZLE_NO_ANALYTICS: "true"
+{% if dozzle_enable_actions | default(false) %}
+      # Start/stop/restart buttons. NOTE: the :ro on the socket mount below does
+      # NOT make the Docker API read-only (it only write-protects the socket
+      # inode) — actions work regardless. Real access control = the SSO gate on
+      # the route (admins only).
+      DOZZLE_ENABLE_ACTIONS: "true"
+{% endif %}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      # Loopback only; Caddy fronts it at dozzle.<internal_host> (forward-auth).
+      - "127.0.0.1:{{ dozzle_port }}:8080"
+    healthcheck:
+      test: ["CMD", "/dozzle", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

@@ -1,0 +1,130 @@
+---
+# Version reconciliation between the HOST and the private config repo — run before anything
+# is deployed (server-all pre_tasks, every upgrade playbook).
+#
+# Why: an upgrade can be triggered on the host itself (roles/local_upgrade), which cannot
+# write to the config repo. Without this step the next run from the laptop would render the
+# OLD version from the repo and quietly downgrade the service — for a database-backed app
+# that means an old image on a migrated database.
+#
+# Each upgrade leaves /var/lib/app-upgrade/versions/<var>.json on the host (value, previous,
+# source). For every record:
+#   repo == record.value                         nothing to do
+#   record.source == host, repo == previous      ADOPT: write the host's version into the
+#                                                private config, use it for this run, and
+#                                                tell the operator to commit it
+#   record.source == host, repo is something else  the repo was changed AFTER the host-side
+#                                                upgrade -> ambiguous: STOP (re-run with
+#                                                -e version_conflict_ok=true to let the repo win)
+#   record.source == controller                  the repo is the source of truth (it was
+#                                                written by the playbook itself, or edited
+#                                                on purpose afterwards)
+# Skipped when the playbook runs on the host (upgrade_local_run): its config copy IS the
+# place the versions get written to.
+- name: Version reconciliation
+  when: not (upgrade_local_run | default(false) | bool)
+  block:
+    - name: Read the version records from the host
+      ansible.builtin.shell: |
+        for f in /var/lib/app-upgrade/versions/*.json; do [ -e "$f" ] && { cat "$f"; echo "@@"; }; done; true
+      args:
+        executable: /bin/bash
+      register: _ver_raw
+      changed_when: false
+      check_mode: false
+
+    # Version variables of role-deployed services live in that role's DEFAULTS, which are not
+    # visible here. The fallback below reads just that ONE key from the defaults file
+    # (parsed as plain YAML — loading the whole file as variables would template entries
+    # that reference each other, and would outrank the private group_vars).
+    - name: Load the upgrade catalog
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/vars/upgrade_catalog.yml"
+        name: _ver_cat
+
+    - name: Parse the records
+      ansible.builtin.set_fact:
+        _ver_recs: "{{ (_ver_raw.stdout | default('')).split('@@') | map('trim') | select | map('from_json') | list }}"
+        _ver_adopt: []
+        _ver_conflict: []
+
+    # Only host-side upgrades can be ahead of the repo; `repo_value` is what the config says now.
+    - name: Find host-side upgrades the repo does not know yet
+      ansible.builtin.set_fact:
+        _ver_adopt: "{{ _ver_adopt + [item | combine({'repo_value': _cur})] }}"
+      vars:
+        _role: "{{ (_ver_cat.upgrade_catalog[item.service] | default({})).role | default('') }}"
+        _role_default: "{{ ((lookup('ansible.builtin.file', playbook_dir ~ '/../roles/' ~ _role ~ '/defaults/main.yml') | from_yaml)[item.var] | default('__undefined__')) if _role else '__undefined__' }}"
+        _cur: "{{ lookup('ansible.builtin.vars', item.var, default=_role_default) | string }}"
+      loop: "{{ _ver_recs }}"
+      loop_control:
+        label: "{{ item.var }}"
+      when:
+        - item.source == 'host'
+        - _cur != (item.value | string)
+        - _cur == (item.previous | string)
+
+    - name: Find host-side upgrades the repo contradicts
+      ansible.builtin.set_fact:
+        _ver_conflict: "{{ _ver_conflict + [item | combine({'repo_value': _cur})] }}"
+      vars:
+        _role: "{{ (_ver_cat.upgrade_catalog[item.service] | default({})).role | default('') }}"
+        _role_default: "{{ ((lookup('ansible.builtin.file', playbook_dir ~ '/../roles/' ~ _role ~ '/defaults/main.yml') | from_yaml)[item.var] | default('__undefined__')) if _role else '__undefined__' }}"
+        _cur: "{{ lookup('ansible.builtin.vars', item.var, default=_role_default) | string }}"
+      loop: "{{ _ver_recs }}"
+      loop_control:
+        label: "{{ item.var }}"
+      when:
+        - item.source == 'host'
+        - _cur != (item.value | string)
+        - _cur != (item.previous | string)
+
+    - name: STOP — a host-side upgrade and the config repo disagree
+      ansible.builtin.fail:
+        msg: >-
+          Version conflict for {{ _ver_conflict | map(attribute='var') | join(', ') }}:
+          {% for r in _ver_conflict %}the host was upgraded {{ r.previous }} -> {{ r.value }}
+          ({{ r.time }}, on the host), but the config repo now says {{ r.repo_value }}. {% endfor %}
+          Deploying would replace what is running. Set the repo to the version you want
+          (the host's value to keep it), or re-run with -e version_conflict_ok=true to deploy
+          the repo's value on purpose.
+      when:
+        - _ver_conflict | length > 0
+        - not (version_conflict_ok | default(false) | bool)
+
+    - name: Adopt host-side upgrades into the private config
+      ansible.builtin.lineinfile:
+        path: "{{ inventory_dir }}/group_vars/all/{{ item.file }}"
+        regexp: '^{{ item.var }}:'
+        line: '{{ item.var }}: "{{ item.value }}"'
+      delegate_to: localhost
+      become: false
+      loop: "{{ _ver_adopt }}"
+      loop_control:
+        label: "{{ item.var }}: {{ item.previous }} -> {{ item.value }}"
+
+    - name: Use the adopted versions for this run
+      ansible.builtin.set_fact:
+        "{{ item.var }}": "{{ item.value }}"
+      loop: "{{ _ver_adopt }}"
+      loop_control:
+        label: "{{ item.var }}"
+
+    # The repo now matches the host: mark the record as taken over so the next run is quiet.
+    - name: Mark the adopted records as synced
+      ansible.builtin.copy:
+        dest: "/var/lib/app-upgrade/versions/{{ item.var }}.json"
+        mode: "0644"
+        content: "{{ item | dict2items | rejectattr('key', 'in', ['repo', 'repo_value']) | items2dict | combine({'source': 'controller'}) | to_nice_json }}\n"
+      loop: "{{ _ver_adopt }}"
+      loop_control:
+        label: "{{ item.var }}"
+
+    - name: NOTICE — versions were taken over from the host
+      ansible.builtin.debug:
+        msg: >-
+          Adopted from the host (upgraded there since the last run):
+          {{ _ver_adopt | map(attribute='var') | zip(_ver_adopt | map(attribute='value')) | map('join', ' = ') | join('; ') }}.
+          The private config was updated — review and COMMIT it
+          ({{ inventory_dir }}/group_vars/all/).
+      when: _ver_adopt | length > 0

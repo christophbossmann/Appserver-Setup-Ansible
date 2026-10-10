@@ -40,6 +40,15 @@
     state: link
   when: not (ansible_check_mode and _pgctl_app_deploy is changed)
 
+- name: Render the environments allowlist (root-owned; broker reads it for --env)
+  ansible.builtin.template:
+    src: environments.json.j2
+    dest: "{{ playground_ctl_environments_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart playground-ctl
+
 - name: Install the playground-ctl systemd unit
   ansible.builtin.template:
     src: playground-ctl.service.j2

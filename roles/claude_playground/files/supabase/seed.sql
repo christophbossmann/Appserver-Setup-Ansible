@@ -1,0 +1,9 @@
+-- Optional seed (runs after migrations). NOTE: with RLS + `owner default auth.uid()`
+-- there is no request user when you seed as service_role/postgres, so auth.uid() is
+-- NULL -> you must set `owner` explicitly. Safe no-op by default.
+--
+-- Example (uncomment; picks the first existing auth user as the owner):
+--
+-- insert into public.notes (content, owner)
+-- select 'demo note from seed', id from auth.users limit 1
+-- on conflict do nothing;

@@ -90,6 +90,14 @@ caddy_build_acme_dns_plugin: "{{ caddy_tls_mode == 'acme_dns' }}"
 # -1 disables the self-check entirely (required for acmedns: libdns/acmedns
 # does not implement GetRecords, so the check always times out with no error).
 caddy_acme_dns_propagation_timeout: "-1"
+
+# Resolvers Caddy uses for the DNS-01 challenge (zone detection + propagation checks).
+# Empty = the host's system resolver. Override with PUBLIC resolvers when the host's
+# resolver (e.g. systemd-resolved) can't resolve the acme-dns delegation — acme-dns is a
+# minimal DNS server that strict resolvers SERVFAIL on, even though 8.8.8.8/the acme-dns
+# server itself answer fine. The acme-dns TXT records are public, so a public resolver is
+# both correct and reliable here. E.g. ["8.8.8.8", "1.1.1.1"].
+caddy_acme_dns_resolvers: []
 # Nameserver to use when verifying CNAME propagation in the pause prompt.
 # Override with your registrar's authoritative NS for instant verification
 # (bypasses TTL-based caching). E.g. ns1.manitu.net for Manitu customers.
@@ -108,28 +116,64 @@ caddy_acme_dns_confirm_delay: 10
 caddy_acme_cert_wait_retries: 30
 caddy_acme_cert_wait_delay: 10
 
-# Seed acme-dns credentials for fresh servers to avoid re-registration.
-# If set and the credentials file does not yet exist on the server, these
-# credentials are written before the registration check runs. The check then
-# finds the domains already registered and skips re-registration — no new
-# CNAME needed.
-#
-# DEFAULT: automatically restore from the controller-side backup that the
-# fetch task below maintains (caddy_acme_dns_credentials_backup_path). A wiped
-# /etc/caddy (e.g. apt purge caddy) is then transparently re-seeded and the
-# existing CNAME keeps working. Override with an explicit dict (e.g. from
-# Vault) or set to {} to force a fresh registration.
-caddy_acme_dns_seed_credentials: >-
-  {{
-    ((lookup('file', caddy_acme_dns_credentials_backup_path | expanduser, errors='ignore') or '{}') | from_json)
-    if (caddy_acme_dns_credentials_backup_path | length > 0) else {}
-  }}
+# ACME CA override (host_vars). Empty = Caddy's default (Let's Encrypt prod, with a
+# ZeroSSL fallback). Set a directory URL to issue from a DIFFERENT CA — useful when LE's
+# per-domain rate limit is exhausted (a fresh dev host, repeated rebuilds): the other
+# free, browser-TRUSTED CAs have SEPARATE limits, so you get a trusted cert immediately.
+#   Buypass (no EAB): https://api.buypass.com/acme/directory
+#   LE staging (untrusted, unlimited — only for pipeline tests): https://acme-staging-v02.api.letsencrypt.org/directory
+# Applies globally (acme_ca in the Caddyfile global block) -> acme_dns AND cloudflare_dns.
+#   Google Trust Services (free, TRUSTED, allows WILDCARDS, own rate limit; REQUIRES EAB —
+#     see caddy_acme_eab): https://dv.acme-v02.api.pki.goog/directory
+#   LE staging (untrusted, unlimited — only for pipeline tests): https://acme-staging-v02.api.letsencrypt.org/directory
+caddy_acme_ca: ""
 
-# Optional: local path on the Ansible controller where the current acmedns.json is
-# fetched after each run. Use this to seed caddy_acme_dns_seed_credentials on a
-# fresh server without re-registering (which would require a new CNAME at the registrar).
-# Example: "~/.ansible/acmedns/{{ inventory_hostname }}.json"
-caddy_acme_dns_credentials_backup_path: ""
+# Optional ACME External Account Binding. Some CAs REQUIRE it to tie ACME issuance to an
+# account you registered out-of-band — notably Google Trust Services (get creds via
+# `gcloud publicca external-account-keys create`) and ZeroSSL-via-URL. Provide a dict:
+#   caddy_acme_eab: { key_id: "<keyId>", mac_key: "<b64MacKey>" }
+# Rendered as an acme_eab block in the Caddyfile global options, next to caddy_acme_ca.
+# Empty = no EAB (LE default needs none). Store the values in the vault.
+caddy_acme_eab: {}
+
+# Explicit ACME issuer for the DNS-01 sites (acme_dns / cloudflare_dns). Empty = Caddy's
+# default issuer chain (Let's Encrypt, then ZeroSSL). Set to a named issuer to force ONE CA:
+#   zerossl  -> ZeroSSL (browser-TRUSTED, SEPARATE rate limit from LE). Caddy fetches the
+#              required EAB credentials AUTOMATICALLY from ZeroSSL's API using caddy_email —
+#              no manual EAB/API-key signup. Use this to dodge an exhausted LE limit.
+#   acme     -> plain ACME (combine with caddy_acme_ca to point at any directory URL).
+# Renders as `issuer <name> { dns ... }` INSIDE each site's tls block (overrides acme_ca there).
+caddy_acme_issuer: ""
+
+# Optional ZeroSSL API key (only used when caddy_acme_issuer == 'zerossl'). When set, Caddy
+# uses it to generate the ACME EAB credentials ZeroSSL requires (more reliable than the
+# email-only fallback). Store it in the vault (vault_zerossl_api_key) and reference it from
+# host_vars. Empty = Caddy falls back to email-based EAB via caddy_email.
+caddy_zerossl_api_key: ""
+
+# --- Certificate store cache (controller-side) --------------------------------
+# Cache Caddy's cert store on the controller so a WIPED/rebuilt host can REUSE its certs
+# instead of re-issuing them — which avoids the CA rate limit AND keeps trusted certs
+# across rebuilds (no staging, no per-container CA hacks).
+#   cache_ssl_certificates: after a successful run, back up the cert store to the controller.
+#   restore_cached_ssl_certificates: BEFORE Caddy starts, restore the cached certs — but
+#     ONLY if the cache exists and EVERY cert in it is still valid (unexpired). Expired/
+#     missing -> skip and let Caddy issue fresh.
+cache_ssl_certificates: true
+restore_cached_ssl_certificates: false
+caddy_cert_cache_dir: "~/.ansible/caddy-certs"
+caddy_user: caddy
+
+# Seed acme-dns credentials for fresh servers to avoid re-registration. If set and the
+# credentials file does not yet exist on the server, these credentials are written before
+# the registration check runs — the check then finds the domains already registered and
+# skips re-registration (no new CNAME needed).
+#
+# DEFAULT: {} (no seeding). The DECLARATIVE flow supplies this: the acme_dns_bootstrap role
+# derives it from acme_dns_accounts (group_vars + vault) via set_fact, so the same fixed
+# UUIDs — and thus the same registrar CNAMEs — are re-created from git on every rebuild.
+# (The old controller-side backup/seed flow for acme-dns.io has been removed.)
+caddy_acme_dns_seed_credentials: {}
 
 # Optional: if true, allow local firewall ports 80/443 using UFW.
 # Keep false if UFW is managed by the hardening role.
@@ -200,9 +244,40 @@ caddy_sites: []
 #     tunnel_manage_dns: true
 proxy_routes: []
 
+# === Authentik forward-auth (SSO) ===
+# When a route (caddy_route_<svc> or a proxy_routes entry) sets
+# `caddy_forward_auth: true`, the caddy role wraps its site in an Authentik
+# forward_auth gate pointing at the server's EMBEDDED outpost (this address).
+# Authentik (stacks/authentik) publishes on the host loopback, so Caddy — a host
+# process — reaches it here.
+#   - Protects BROWSER access only. NEVER set it on API/webhook paths
+#     (immich mobile/API, supabase /rest+/auth, n8n /webhook) — they would break.
+#   - WebDAV clients can't do interactive SSO — keep those on basic_auth.
+#   - Each protected hostname ALSO needs a matching Proxy Provider + Application
+#     configured in Authentik and assigned to the embedded outpost.
+caddy_authentik_outpost: "127.0.0.1:{{ authentik_http_port | default(9000) }}"
+
+# Basic-auth convention: store the PLAINTEXT password in the vault as
+# vault_basicauth_<name> (like every other secret), and derive the bcrypt hash Caddy
+# needs at render time with a FIXED salt — deterministic, so the Caddyfile stays
+# idempotent across runs (a random salt would re-hash every deploy and churn the config):
+#   {{ vault_basicauth_<name> | password_hash('bcrypt', caddy_basicauth_salt, rounds=14) }}
+# The salt is not a secret (it only prevents rainbow tables); it lives here, not in the
+# vault. 22 chars from bcrypt's alphabet (./A-Za-z0-9); passlib normalises the last char.
+caddy_basicauth_salt: "Kf3Rq9pLzW7mYbN2xCvH4t"
+caddy_basicauth_rounds: 14
+
 # Re-verification of already-confirmed acme-dns CNAMEs (see tasks/acme_dns_verify.yml).
 # Caddy's certificate store (default storage path for the caddy systemd user).
 caddy_acme_cert_store: /var/lib/caddy/.local/share/caddy
 # A cert counts as "valid" only if it still has at least this many seconds left
 # (default 7 days). Below that, a broken CNAME blocks instead of just warning.
 caddy_acme_cert_min_seconds: 604800
+
+# Prometheus HTTP metrics (per host): global `metrics` option + a read-only metrics site
+# bound to the docker bridge, scraped by roles/monitoring via host.docker.internal. The
+# admin API (:2019, can change config) stays loopback-only. UFW opening for docker
+# subnets is done by roles/monitoring (it owns the scrape).
+caddy_metrics_enabled: true
+caddy_metrics_bind: 172.17.0.1        # docker0 = what host.docker.internal resolves to
+caddy_metrics_port: 9180

@@ -1,3 +1,5 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/komodo.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
 ---
 # Komodo stack defaults (was roles/komodo/defaults/main.yml).
 # Override per host in host_vars or per play via vars_files (vars/monitoring.yml).
@@ -24,17 +26,43 @@ komodo_data_dir: /opt/komodo
 komodo_periphery_root_dir: /etc/komodo
 
 # === Credentials ===
-# CHANGE THESE — especially passkey (used for Core<->Periphery auth).
-# Use a long random string for passkey (e.g. openssl rand -hex 32).
-komodo_passkey: "changeme-replace-with-long-random-string"
+# Secret values live in group_vars/all/vault.yml.
+komodo_passkey: "{{ vault_komodo_passkey }}"
 komodo_database_username: "komodo"
-komodo_database_password: "changeme"
+komodo_database_password: "{{ vault_komodo_database_password }}"
 
 # === Core Config ===
-komodo_host: "https://komodo.{{ internal_host }}"
+# Stats polling interval (core -> periphery -> ferretdb). Komodo default is
+# "15-sec"; "1-min" (=60s) halves a good chunk of idle CPU on busy hosts.
+# NOTE: Komodo accepts only a fixed enum (…,30-sec,1-min,2-min,…) — there is NO
+# "60-sec"; using it makes core panic on startup ("unknown variant `60-sec`").
+komodo_monitoring_interval: "1-min"
+komodo_host: "https://{{ svc_edge_host['komodo'] }}"
 komodo_local_auth: true
+# init_admin seeds a LOCAL admin as Komodo's FIRST user. We leave it OFF so the
+# FIRST OIDC login (akadmin) becomes Komodo's first user -> Komodo makes the first
+# user admin automatically (the Immich-equivalent, but native — no bootstrap role).
+# IMPORTANT: only works on a FRESH komodo DB; an existing first user keeps admin.
+# Flip to true + wipe (--tags komodo -e compose_stack_fresh=true) to recover a
+# local break-glass admin.
+komodo_init_admin_enabled: false
 komodo_init_admin_username: "admin"
-komodo_init_admin_password: "changeme"
+komodo_init_admin_password: "{{ vault_komodo_init_admin_password }}"
+# Auto-enable new users on signup (else they're disabled until an admin enables
+# them). The very first user is always enabled+admin regardless. Safe here because
+# the komodo OAuth app is bound to "authentik Admins" only.
+komodo_enable_new_users: true
+
+# === Native OIDC (Authentik SSO) ===
+# Komodo runs OIDC discovery on the provider URL, which for Authentik is the
+# issuer WITH the app path (analogous to a Keycloak realm URL). Local auth stays
+# on as break-glass. Callback that Komodo sends back: <komodo_host>/auth/oidc/callback
+# (registered in authentik_oauth_apps). OIDC users come in without permissions —
+# grant them in Komodo (Settings -> Users); no group->role mapping in Komodo.
+komodo_oidc_enabled: true
+komodo_oidc_provider: "{{ authentik_oidc_issuer_base }}/komodo/"
+komodo_oidc_client_id: "komodo"
+komodo_oidc_client_secret: "{{ vault_authentik_oauth_komodo_secret }}"
 # Auto-register the local Periphery on first Core startup.
 # first_server_address must be reachable from the Core container.
 komodo_first_server_name: "{{ inventory_hostname }}"

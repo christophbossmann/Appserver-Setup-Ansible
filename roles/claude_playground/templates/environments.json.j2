@@ -1,0 +1,8 @@
+{
+  "default": "{{ playground_environments[0] }}",
+  "environments": {
+{% for env in playground_environments %}
+    "{{ env }}": { "workspace": "{{ playground_ctl_workspace }}/{{ env }}", "port": {{ playground_env_base_port + loop.index0 }} }{{ "," if not loop.last else "" }}
+{% endfor %}
+  }
+}

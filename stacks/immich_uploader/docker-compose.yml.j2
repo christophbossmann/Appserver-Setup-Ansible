@@ -1,0 +1,30 @@
+services:
+  uploader-backend:
+    build: ./src/backend
+    container_name: uploader-backend
+    restart: unless-stopped
+    environment:
+      DEBUG_MODE: "false"
+      # immich runs on the same shared backend network — internal, no TLS hop.
+      IMMICH_URL: "http://immich-server:2283"
+      JWT_SECRET: "{{ immich_uploader_jwt_secret }}"
+      JWT_EXPIRATION_HOURS: "{{ immich_uploader_jwt_expiration_hours }}"
+      # Same-origin via the frontend's /api proxy — no CORS needed.
+      ENABLE_CORS: "false"
+
+  uploader-frontend:
+    build: ./src/frontend
+    container_name: uploader-frontend
+    restart: unless-stopped
+    depends_on:
+      - uploader-backend
+    environment:
+      ENABLE_API_PROXY: "true"
+      API_UPSTREAM: "http://uploader-backend:8000/"
+    ports:
+      - "127.0.0.1:{{ immich_uploader_port }}:80"
+
+networks:
+  default:
+    name: backend
+    external: true

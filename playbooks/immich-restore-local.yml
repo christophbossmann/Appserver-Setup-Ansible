@@ -1,0 +1,237 @@
+---
+# Restore Immich from the LOCAL pull backup (./backups/<host>/immich/), the
+# counterpart to playbooks/backup-pull.yml — no restic/cloud needed. DESTRUCTIVE:
+# overwrites the live upload dir + the immich database with the local backup.
+#
+#   ansible-playbook playbooks/immich-restore-local.yml \
+#     --limit <host> -e immich_restore_confirm=YES \
+#     [-e immich_restore_files=false] [-e immich_restore_db=false] \
+#     [-e immich_restore_thumbs=false] [-e immich_restore_encoded_video=false] \
+#     [-e immich_restore_clear_oauth=false] [-e immich_restore_reimport_orphans=true]
+#
+# thumbs/ + encoded-video/ are restored when the backup contains them (see
+# backup_immich_thumbs / backup_immich_encoded_video in group_vars/all/backup.yml);
+# otherwise the live ones are left untouched. AFTER a restore run Administration ->
+# Job Queues -> Generate Thumbnails -> "Missing" (cheap: fills only gaps). If the
+# backup had NO thumbs/, use "All" instead (else the grid shows "Error loading image").
+# On a rebuilt/declarative Authentik, immich_restore_clear_oauth (default true)
+# clears stale OIDC sub-links so SSO re-attaches by email (set false if you also
+# restored the same-era Authentik DB).
+# immich_restore_reimport_orphans (default false): afterwards re-import originals that are on
+# disk/Storage Box but not in the restored DB (uploads newer than the dump) as normal uploads
+# of their owner — same as the standalone playbooks/immich-reimport-orphans.yml.
+#
+# Immich's DB lives on the `postgres-business` instance (superuser `business`); the
+# restore only touches the `immich` database there, so Nextcloud (same instance) is
+# unaffected — only immich-server + immich-machine-learning are stopped (to release
+# DB connections for pg_restore --clean), then restarted. rsync PUSHES from the
+# controller up to the host (delegate_to localhost, direct rsync over SSH —
+# synchronize breaks on the WSL controller). --rsync-path=sudo rsync writes the
+# root-owned target dir.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+
+- name: Restore Immich from the local pull backup
+  hosts: servers
+  become: true
+  vars:
+    immich_restore_files: true          # the upload dir (the actual photos/videos)
+    immich_restore_db: true             # albums/faces/metadata (postgres-business.immich)
+    # Derived data — only takes effect when the backup HAS the dir. false = skip it and
+    # leave the live copy untouched (then regenerate via the Immich job queues).
+    immich_restore_thumbs: true         # thumbs/
+    immich_restore_encoded_video: true  # encoded-video/
+    immich_restore_clear_oauth: true    # after a DB restore, clear stale OIDC sub-links (see task below)
+    immich_restore_reimport_orphans: false   # afterwards re-import originals missing from the restored DB
+    _src: "{{ backup_pull_dir | default(playbook_dir ~ '/../backups') }}/{{ inventory_hostname }}/immich"
+    _tgt_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+    _tgt_user: "{{ hostvars[inventory_hostname].ansible_user | default('ansible') }}"
+    _ssh: "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+    _remote_dump: /opt/backups/restore-immich-db.dump
+    _biz: "{{ postgres_business_container }}"
+    _bu: "{{ postgres_business_user }}"
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that: [immich_restore_confirm | default('') == 'YES']
+        fail_msg: "Refusing to restore. Re-run with -e immich_restore_confirm=YES (this OVERWRITES live data)."
+
+    - name: Verify the local backup exists
+      ansible.builtin.stat:
+        path: "{{ _src }}/immich-db/db.dump"
+      delegate_to: localhost
+      become: false
+      register: _dump_stat
+      failed_when: not _dump_stat.stat.exists
+
+    # Derived data (thumbs/, encoded-video/) is restored only if the backup HAS it
+    # (backup_immich_thumbs / backup_immich_encoded_video at pull time). If absent it
+    # stays excluded, so --delete leaves the live copy alone instead of wiping it.
+    - name: Detect derived data present in the backup
+      ansible.builtin.stat:
+        path: "{{ _src }}/immich/{{ item }}"
+      delegate_to: localhost
+      become: false
+      register: _derived_stat
+      loop: [thumbs, encoded-video]
+
+    # A derived dir is restored only if the backup has it AND its switch is on.
+    - name: Build the restore exclude list
+      ansible.builtin.set_fact:
+        _restore_excludes: >-
+          {{ ['.snapshots/', 'backups/']
+             + ([] if (_derived_stat.results[0].stat.exists and immich_restore_thumbs | bool) else ['thumbs/'])
+             + ([] if (_derived_stat.results[1].stat.exists and immich_restore_encoded_video | bool) else ['encoded-video/']) }}
+        _restored_thumbs: "{{ _derived_stat.results[0].stat.exists and immich_restore_thumbs | bool }}"
+
+    - name: Stop immich (server + ML) so the DB restore can drop/recreate cleanly
+      ansible.builtin.command: "docker stop immich-server immich-machine-learning"
+      changed_when: true
+
+    - block:
+        - name: Push the upload dir back over live (rsync --delete = live matches backup)
+          # Source is the whole backed-up immich dir (_src/immich/ = library/ +
+          # profile/ + upload/ [+ thumbs/ + encoded-video/ when backed up]). Excludes
+          # come from _restore_excludes: immich's internal backups/ always, derived dirs
+          # only when the backup lacks them (so --delete never wipes the live copy).
+          # .snapshots/ is the per-subvolume btrfs snapshot store mounted read-only at
+          # the immich upload root (@immich_data) — exclude it so --delete never tries
+          # to remove it (would fail: Read-only file system) and it's never restored.
+          # --no-owner/--no-group/--chmod: NEVER take ownership/modes from the backup. It
+          # usually sits on NTFS (/mnt/d via WSL), which reports EVERY file as uid 1000 +
+          # 0777 — plain -a pushed that onto the server (world-writable thumbs/, owned by
+          # the admin user). Received files are owned by the rsync user (root via sudo)
+          # with sane 755/644 modes instead.
+          # --keep-dirlinks: with externalized originals, live library/ + upload/ are
+          # symlinks onto the Storage Box. A backup WITH originals holds them as real
+          # dirs — without -K rsync would replace the symlink by a local dir (originals
+          # silently land on the local disk). -K writes THROUGH the symlink onto the box.
+          ansible.builtin.command:
+            argv: >-
+              {{ ['rsync', '-az', '--keep-dirlinks', '--delete',
+                  '--no-owner', '--no-group', '--chmod=D755,F644']
+                 + (_restore_excludes | map('regex_replace', '^', '--exclude=') | list)
+                 + ['-e', _ssh, '--rsync-path=sudo rsync',
+                    _src ~ '/immich/',
+                    _tgt_user ~ '@' ~ _tgt_host ~ ':' ~ immich_upload_dir ~ '/'] }}
+          delegate_to: localhost
+          become: false
+          when: immich_restore_files | bool
+
+        - name: Push the DB dump up to the host
+          ansible.builtin.command:
+            argv:
+              - rsync
+              - -az
+              - -e
+              - "{{ _ssh }}"
+              - "--rsync-path=sudo rsync"
+              - "{{ _src }}/immich-db/db.dump"
+              - "{{ _tgt_user }}@{{ _tgt_host }}:{{ _remote_dump }}"
+          delegate_to: localhost
+          become: false
+          when: immich_restore_db | bool
+
+        - name: Restore the database (pg_restore --clean, DESTRUCTIVE)
+          # NO --no-owner: the dump (made by the `business` superuser) records
+          # owner=immich; restoring as the superuser re-applies it so the
+          # least-privilege `immich` app role keeps access. The vchord extension in
+          # the dump is recreated as superuser (the business image ships it).
+          ansible.builtin.shell: >-
+            cat {{ _remote_dump }} |
+            docker exec -i {{ _biz }} pg_restore -U {{ _bu }}
+            -d {{ immich_db_name }} --clean --if-exists
+          args: { executable: /bin/bash }
+          register: _pg_restore
+          failed_when: false   # --clean emits benign "does not exist" notices; inspect output
+          when: immich_restore_db | bool
+
+        - name: Ensure every restored object is owned by the immich DB role
+          # Belt-and-suspenders: reassign anything in public not owned by the DB owner
+          # (datdba = immich) back to it, so the least-privilege app role keeps access.
+          ansible.builtin.shell: |
+            docker exec -i {{ _biz }} psql -U {{ _bu }} -d {{ immich_db_name }} <<'SQL'
+            DO $$
+            DECLARE r record; dbowner text;
+            BEGIN
+              SELECT datdba::regrole::text INTO dbowner FROM pg_database WHERE datname = current_database();
+              FOR r IN SELECT tablename AS n FROM pg_tables WHERE schemaname='public' AND tableowner <> dbowner LOOP
+                EXECUTE format('ALTER TABLE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+              FOR r IN SELECT sequencename AS n FROM pg_sequences WHERE schemaname='public' AND sequenceowner <> dbowner LOOP
+                EXECUTE format('ALTER SEQUENCE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+              FOR r IN SELECT viewname AS n FROM pg_views WHERE schemaname='public' AND viewowner <> dbowner LOOP
+                EXECUTE format('ALTER VIEW public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+            END $$;
+            SQL
+          args: { executable: /bin/bash }
+          changed_when: true
+          when: immich_restore_db | bool
+
+        - name: Clear stale OIDC links so SSO re-attaches by email (Authentik-state-independent)
+          # Immich links a local account to the IdP by the `sub` it stored in
+          # user.oauthId. A freshly REBUILT Authentik issues NEW subs
+          # (sub_mode=hashed_user_id), so the restored oauthId no longer matches and
+          # the SSO login fails with 400 {"message":"OAuth authentication failed"}
+          # (immich refuses to relink an email whose oauthId already points at a
+          # different sub — even with autoRegister=true; the 400 is a thrown
+          # BadRequestException and is NOT logged). Emptying oauthId makes immich
+          # re-adopt the CURRENT sub on the next login, joining by EMAIL. Therefore:
+          #  - the immich user's email MUST equal the Authentik email (else immich
+          #    autoRegister creates a duplicate instead of relinking), and
+          #  - email is the trust anchor (fine here: Authentik users are declarative).
+          # Set immich_restore_clear_oauth=false ONLY if you ALSO restored the
+          # same-era Authentik DB (subs preserved -> keep the existing links).
+          # NOTE: Nextcloud (user_oidc) needs NO equivalent — it maps uid=preferred_username
+          # (--unique-uid=0), so it re-attaches by USERNAME, immune to sub changes.
+          ansible.builtin.shell: |
+            docker exec -i {{ _biz }} psql -U {{ _bu }} -d {{ immich_db_name }} <<'SQL'
+            UPDATE "user" SET "oauthId"='' WHERE "oauthId" IS NOT NULL AND "oauthId" <> '';
+            SQL
+          args: { executable: /bin/bash }
+          register: _immich_oauth_clear
+          changed_when: "'UPDATE 0' not in (_immich_oauth_clear.stdout | default(''))"
+          when:
+            - immich_restore_db | bool
+            - immich_restore_clear_oauth | bool
+      always:
+        - name: Remove the staged dump on the host
+          ansible.builtin.file:
+            path: "{{ _remote_dump }}"
+            state: absent
+
+        - name: Start immich again (server + ML)
+          ansible.builtin.command: "docker start immich-server immich-machine-learning"
+          changed_when: true
+
+    - name: Wait until immich-server is healthy again
+      ansible.builtin.command: "docker inspect immich-server -f {{ '{{.State.Health.Status}}' }}"
+      register: _ih
+      until: (_ih.stdout | trim) == 'healthy'
+      retries: 48
+      delay: 5
+      changed_when: false
+
+    - name: Re-import originals that are not in the restored DB
+      ansible.builtin.include_tasks: tasks/immich_reimport_orphans.yml
+      vars:
+        immich_reimport_confirm: "YES"   # the restore itself was already confirmed
+      when:
+        - immich_restore_reimport_orphans | bool
+        - immich_restore_db | bool
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Local Immich restore complete (files={{ immich_restore_files }}, db={{ immich_restore_db }},
+          clear_oauth={{ immich_restore_clear_oauth and immich_restore_db }}).
+          On startup immich runs any pending migrations. Admin-vs-user is re-asserted from
+          the Authentik immich_role claim on each login (a restore may reset isAdmin to the
+          backup era — just log in again, or grant-admin as break-glass).
+          {% if (immich_restore_files | bool) and (_restored_thumbs | bool) %}NEXT STEP — thumbnails were
+          restored from the backup; fill any gaps via Administration -> Job Queues ->
+          Generate Thumbnails -> "Missing" (cheap, only what's absent).{% else %}NEXT
+          STEP — no thumbnails were restored (not in the backup, or
+          immich_restore_thumbs=false), so the UI shows "Error loading image"
+          until you rebuild them via Administration -> Job Queues -> Generate Thumbnails
+          -> "All" (re-reads every original). Keep backup_immich_thumbs=true to avoid
+          this next time.{% endif %}

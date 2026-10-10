@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Managed by Ansible (roles/docker). Keeps "no swap" containers swap-free.
+#
+# A container started with memswap_limit == mem_limit gets memory.swap.max=0 from runc —
+# but only written into the cgroup, not onto the container's systemd scope (systemd keeps
+# MemorySwapMax=infinity there). The next `systemctl daemon-reload` re-applies systemd's
+# view and swap.max silently goes back to "max". This watcher sets MemorySwapMax=0 on the
+# scope (runtime, dies with the container) for every such container: once at startup for
+# the running ones, then on every container start event.
+set -uo pipefail
+
+sync_one() {
+  local id="$1" mem swap full name
+  read -r mem swap full name < <(docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.Id}} {{.Name}}' "$id" 2>/dev/null) || return 0
+  [ "${mem:-0}" -gt 0 ] && [ "$mem" = "$swap" ] || return 0
+  if systemctl set-property --runtime "docker-${full}.scope" MemorySwapMax=0; then
+    echo "no-swap enforced on scope: ${name#/}"
+  else
+    echo "WARN: could not set MemorySwapMax=0 for ${name#/}" >&2
+  fi
+}
+
+for id in $(docker ps -q); do sync_one "$id"; done
+# Blocks; systemd restarts the service if docker (and with it the event stream) goes away.
+docker events --filter type=container --filter event=start --format '{{.Actor.ID}}' \
+  | while read -r id; do sync_one "$id"; done

@@ -1,0 +1,11 @@
+# Managed by Ansible (roles/docker).
+[Unit]
+Description=Weekly docker image/build-cache prune
+
+[Timer]
+OnCalendar={{ docker_prune_oncalendar }}
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

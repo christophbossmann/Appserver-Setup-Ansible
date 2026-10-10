@@ -13,7 +13,7 @@ pgAdmin, Grafana/Prometheus monitoring, Komodo container management, a Playwrigh
 browser agent, a sandboxed Claude AI playground, and a Caddy reverse proxy — but every
 piece is a self-contained role or compose stack you can mix and match.
 
-**New here?** → [QUICKSTART.md](QUICKSTART.md)  ·  **Adding a service?** → [stacks/README.md](stacks/README.md)
+**New here?** → [QUICKSTART.md](QUICKSTART.md)  ·  **Backup / restore / upgrade?** → [QUICKSTART.md § Maintenance tasks](QUICKSTART.md#7-maintenance-tasks)  ·  **Adding a service?** → [stacks/README.md](stacks/README.md)
 
 ---
 
@@ -55,23 +55,46 @@ profiles in host_vars). The application configuration does not change.
 .
 ├── ansible.cfg
 ├── ansible-bootstrap.sh            # one-time: create the "ansible" service account on a new host
-├── inventory.ini                   # your hosts (git-ignored; copy inventory.ini.example)
+├── inventory.ini.example           # → ../ansible-private/inventory.ini (see QUICKSTART §2)
 ├── playbooks/
-│   ├── server-n8n.yml              # the full application host (apps + edge)
+│   ├── server-all.yml              # the full application host (apps + edge)
 │   ├── server-playground.yml       # Claude AI playground (can share a host with the above)
 │   ├── server-base.yml             # hardening + users + docker + tailscale + caddy
-│   └── server-proxy.yml            # cloudflared + Caddy proxy host (no apps)
+│   ├── server-proxy.yml            # cloudflared + Caddy proxy host (no apps)
+│   ├── backup-pull.yml             # OPS: pull a local backup to the controller
+│   ├── nextcloud-restore*.yml      # OPS: restore (DESTRUCTIVE) — run deliberately
+│   └── tests/                      # TEST-only, NEVER deployed (see playbooks/tests/README.md)
 ├── roles/                          # dedicated roles — services WITH lifecycle logic
+│                                   #   (everything here is PRODUCTION; no test roles)
 ├── stacks/<name>/                  # generic compose services, deployed by the
 │                                   #   compose_stack role (postgres, komodo, pgadmin, …)
-├── group_vars/all/
-│   ├── <service>.yml               # per-service config (auto-loaded, committable)
-│   ├── vault.yml                   # ALL secrets, vault_* convention (ansible-vault)
-│   ├── vault.example.yml           # committable template for vault.yml
-│   ├── users.yml                   # admin_user — the primary human account name
-│   └── proxy_routes.yml            # base wildcard-cert routes + profile docs
-└── host_vars/<host>.yml            # per-host: domain, ingress model, caddy_services
+├── group_vars/all/                 # TEMPLATES only — real files live in ../ansible-private/
+│   ├── <service>.yml.example       # per-service config (sanitized)
+│   ├── vault.yml.example           # template for vault.yml (ALL secrets, vault_* convention)
+│   ├── users.yml.example           # admin_user — the primary human account name
+│   └── proxy_routes.yml.example    # base wildcard-cert routes + profile docs
+└── host_vars/<host>.example.yml    # per-host: domain, ingress model, caddy_services
 ```
+
+### Test vs. production (naming convention)
+
+To keep test scaffolding from ever being mistaken for something that gets rolled
+out:
+
+- **`roles/`** is **production only** — every role is deployed by `server-all.yml`.
+  There are **no test roles** here.
+- **Verification/test playbooks** live under **`playbooks/tests/`**, are prefixed
+  **`test-`**, carry a loud "NOT a deploy" header, and are **never** included by the
+  productive playbook. They are **non-destructive** (restore into throwaway scratch
+  resources, then clean up) and run on demand, e.g.:
+  ```bash
+  ansible-playbook playbooks/tests/test-backup-restore.yml --limit <host>
+  ```
+- **Operational** playbooks that *do* act on live data (`backup-pull.yml`,
+  `nextcloud-restore*.yml`, `backup-setup.yml`) stay in `playbooks/` and are run
+  deliberately when needed — they are not part of a routine deploy either.
+
+See `playbooks/tests/README.md` for the current list of tests.
 
 ---
 
@@ -86,9 +109,9 @@ single run touches.** Three independent decisions:
 
    ```bash
    # everything:
-   ansible-playbook -i inventory.ini playbooks/server-n8n.yml --limit myserver
+   ansible-playbook playbooks/server-all.yml --limit myserver
    # just update n8n + re-render the edge (fast):
-   ansible-playbook -i inventory.ini playbooks/server-n8n.yml --limit myserver --tags n8n,caddy
+   ansible-playbook playbooks/server-all.yml --limit myserver --tags n8n,caddy
    ```
 
 2. **Routes live next to their service** — `roles/<role>/defaults/caddy_route.yml` or
@@ -231,13 +254,13 @@ Compose stacks (`stacks/<name>/`, deployed by `compose_stack`):
 
 ## Secrets
 
-Every secret is a `vault_*` variable in `group_vars/all/vault.yml` — consumers
+Every secret is a `vault_*` variable in `group_vars/all/vault.yml` of the private config dir (`../ansible-private`) — consumers
 (host_vars, group_vars, route files) only ever reference `{{ vault_* }}`. Set it up
 from the committed template:
 
 ```bash
-cp group_vars/all/vault.example.yml group_vars/all/vault.yml
-$EDITOR group_vars/all/vault.yml            # fill in real values
+cp group_vars/all/vault.yml.example ../ansible-private/group_vars/all/vault.yml
+cd ../ansible-private && $EDITOR group_vars/all/vault.yml   # fill in real values
 ansible-vault encrypt group_vars/all/vault.yml
 echo 'vault_password_file = ~/.ansible/vault-pass' # → [defaults] in ansible.cfg
 ```
@@ -258,7 +281,7 @@ Notes:
 The repo is `--check --diff` safe end-to-end, including against fresh hosts:
 
 ```bash
-ansible-playbook -i inventory.ini playbooks/server-n8n.yml --limit myserver --check --diff
+ansible-playbook playbooks/server-all.yml --limit myserver --check --diff
 ```
 
 Real runs fail hard when something is broken: health checks have no

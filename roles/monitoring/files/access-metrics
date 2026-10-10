@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+# Managed by Ansible (roles/monitoring). Caddy access-log metrics for node_exporter's
+# textfile collector -> the "Access logs" Grafana dashboard. Every minute
+# (access-metrics.timer). Same lightweight design as security-metrics: reads only NEW
+# journal lines (cursor), keeps counters + rolling per-window tallies in a state file,
+# writes one .prom file atomically.
+#
+# Source: Caddy JSON access logs in the journal (routes with `log { output stderr }`).
+# Only hostnames Caddy actually serves are kept (the blackbox target list written by
+# roles/caddy) — requests with foreign Host headers (stale DNS, scanners) are dropped.
+#
+# Metrics (window = 1h | 24h | 7d | 30d):
+#   access_requests_total{host,class}            counter: class = 2xx 3xx 401 403 4xx 5xx
+#   access_requests{host,class,window}           gauge: totals per window
+#   access_unique_ips{host,window}               gauge
+#   access_top_ip{host,ip,window}                gauge: top-10 client IPs
+#   access_top_path{host,path,window}            gauge: top-10 paths (normalised, see norm())
+#   access_recent_request_timestamp{host,ip,method,path,status}  gauge: last 30 per host
+import json, os, re, subprocess, time
+
+TEXTFILE_DIR = "/var/lib/node_exporter/textfile"
+OUT = os.path.join(TEXTFILE_DIR, "access.prom")
+STATE = "/var/lib/node_exporter/access-state.json"
+TARGETS = "/etc/prometheus-file-sd/caddy-probes.json"
+WINDOWS = {"1h": 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+FINE = 300
+TOP = 10
+RECENT = 30
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+TOKEN = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=120).stdout
+
+
+def served_hosts():
+    try:
+        groups = json.load(open(TARGETS))
+    except (OSError, ValueError):
+        return set()
+    return {t.split("://", 1)[-1].split("/")[0] for g in groups for t in g.get("targets", [])}
+
+
+def norm(uri):
+    """Low-cardinality, non-secret path: no query string, UUIDs -> :id, long random
+    segments (share keys, tokens) -> first 6 chars + '…', max 3 segments shown."""
+    path = uri.split("?", 1)[0]
+    segs = []
+    for s in path.split("/")[1:]:
+        if UUID.fullmatch(s):
+            s = ":id"
+        elif TOKEN.match(s):
+            s = s[:6] + "…"
+        segs.append(s)
+    shown = "/" + "/".join(segs[:3]) + ("/…" if len(segs) > 3 else "")
+    return shown[:64]
+
+
+def klass(status):
+    if status in (401, 403):
+        return str(status)
+    return f"{status // 100}xx" if 100 <= status < 600 else "other"
+
+
+def esc(v):
+    return str(v)[:80].replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+def main():
+    now = time.time()
+    try:
+        st = json.load(open(STATE))
+    except (OSError, ValueError):
+        st = {}
+    for k in ("counters", "hourly", "fine", "recent"):
+        st.setdefault(k, {})
+    hosts = served_hosts()
+
+    def inc(d, k, n=1):
+        d[k] = d.get(k, 0) + n
+
+    cmd = ["journalctl", "--no-pager", "-o", "json", "-u", "caddy"]
+    cmd += ["--after-cursor", st["cursor"]] if st.get("cursor") else ["--since", "-30d"]
+    last = None
+    for line in run(cmd).splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        last = e.get("__CURSOR", last)
+        msg = e.get("MESSAGE")
+        if not isinstance(msg, str) or '"http.log.access' not in msg:
+            continue
+        try:
+            a = json.loads(msg)
+        except ValueError:
+            continue
+        req = a.get("request", {})
+        host = (req.get("host") or "").split(":")[0]
+        if host not in hosts:
+            continue
+        # our own blackbox probes (roles/monitoring, every minute) are not "access"
+        ua = " ".join(req.get("headers", {}).get("User-Agent", []))
+        if ua.lower().startswith("blackbox"):     # "Blackbox-Exporter/0.28.0"
+            continue
+        ts = float(a.get("ts", now))
+        ip = req.get("client_ip") or req.get("remote_ip") or "?"
+        status = int(a.get("status", 0))
+        c = klass(status)
+        path = norm(req.get("uri", "/"))
+        inc(st["counters"].setdefault(host, {}), c)
+        for store, size in (("hourly", 3600), ("fine", FINE)):
+            b = st[store].setdefault(host, {}).setdefault(str(int(ts // size) * size), {})
+            inc(b.setdefault("class", {}), c)
+            inc(b.setdefault("ip", {}), ip)
+            inc(b.setdefault("path", {}), path)
+        rec = st["recent"].setdefault(host, {})
+        rec[f"{ip}|{req.get('method', '?')}|{path}|{status}"] = ts
+        if len(rec) > RECENT:
+            for k, _ in sorted(rec.items(), key=lambda kv: kv[1])[:len(rec) - RECENT]:
+                del rec[k]
+    if last:
+        st["cursor"] = last
+
+    longest = max(WINDOWS.values())
+    for host in list(st["hourly"]):
+        st["hourly"][host] = {k: v for k, v in st["hourly"][host].items() if int(k) + 3600 > now - longest}
+    for host in list(st["fine"]):
+        st["fine"][host] = {k: v for k, v in st["fine"][host].items() if int(k) + FINE > now - 7200}
+
+    def agg(host, window, kind):
+        store, size = (st["fine"], FINE) if window == "1h" else (st["hourly"], 3600)
+        out_ = {}
+        for start, b in store.get(host, {}).items():
+            if int(start) + size > now - WINDOWS[window]:
+                for k, n in b.get(kind, {}).items():
+                    out_[k] = out_.get(k, 0) + n
+        return out_
+
+    out = []
+    def metric(name, help_, typ, samples):
+        out.append(f"# HELP {name} {help_}")
+        out.append(f"# TYPE {name} {typ}")
+        for labels, value in samples:
+            lab = ",".join(f'{k}="{esc(v)}"' for k, v in labels.items())
+            out.append(f"{name}{{{lab}}} {value}")
+
+    known = sorted(set(st["counters"]) | set(st["hourly"]))
+    classes = ["2xx", "3xx", "401", "403", "4xx", "5xx"]
+    metric("access_requests_total", "Requests per host and status class (since first run)", "counter",
+           [({"host": h, "class": c}, st["counters"].get(h, {}).get(c, 0)) for h in known for c in classes])
+    metric("access_requests", "Requests per host, status class and window", "gauge",
+           [({"host": h, "class": c, "window": w}, agg(h, w, "class").get(c, 0))
+            for h in known for w in WINDOWS for c in classes])
+    metric("access_unique_ips", "Distinct client IPs per host and window", "gauge",
+           [({"host": h, "window": w}, len(agg(h, w, "ip"))) for h in known for w in WINDOWS])
+    metric("access_top_ip", "Top client IPs per host and window", "gauge",
+           [({"host": h, "ip": ip, "window": w}, n) for h in known for w in WINDOWS
+            for ip, n in sorted(agg(h, w, "ip").items(), key=lambda kv: -kv[1])[:TOP]])
+    metric("access_top_path", "Top paths (normalised) per host and window", "gauge",
+           [({"host": h, "path": p, "window": w}, n) for h in known for w in WINDOWS
+            for p, n in sorted(agg(h, w, "path").items(), key=lambda kv: -kv[1])[:TOP]])
+    metric("access_recent_request_timestamp", "Last requests per host (value = unix time)", "gauge",
+           [({"host": h, "ip": k.split("|")[0], "method": k.split("|")[1], "path": k.split("|")[2],
+              "status": k.split("|")[3]}, int(v))
+            for h in known for k, v in st["recent"].get(h, {}).items()])
+
+    os.makedirs(TEXTFILE_DIR, exist_ok=True)
+    with open(OUT + ".tmp", "w") as f:
+        f.write("\n".join(out) + "\n")
+    os.chmod(OUT + ".tmp", 0o644)
+    os.replace(OUT + ".tmp", OUT)
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(st, f)
+    os.replace(STATE + ".tmp", STATE)
+
+
+if __name__ == "__main__":
+    main()

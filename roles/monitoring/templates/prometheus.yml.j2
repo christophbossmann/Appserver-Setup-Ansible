@@ -1,6 +1,6 @@
 global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
+  scrape_interval: {{ prometheus_scrape_interval }}
+  evaluation_interval: {{ prometheus_scrape_interval }}
 
 scrape_configs:
   - job_name: "prometheus"
@@ -11,6 +11,70 @@ scrape_configs:
     static_configs:
       - targets: ["node-exporter:9100"]
 
+  # Scraping cadvisor forces a FULL on-demand stats collection across all
+  # containers (heavy cgroup syscall load, big payload) — every scrape,
+  # independent of cadvisor's own housekeeping interval. Per-container
+  # dashboards don't need 15s resolution.
+  # Probe every hostname Caddy serves (file_sd list written by roles/caddy; re-read on
+  # change). The target URL becomes the probe parameter; the scrape goes to blackbox.
+  - job_name: "blackbox"
+    metrics_path: /probe
+    params:
+      module: [https_up]
+    scrape_interval: {{ blackbox_scrape_interval }}
+    file_sd_configs:
+      - files: ["/etc/prometheus/file_sd/caddy-probes.json"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+{% if _pg_exporters | default([]) | length > 0 %}
+  # One postgres_exporter per running instance (label pg_instance = instance name).
+  - job_name: "postgres"
+    static_configs:
+{% for pg in _pg_exporters %}
+      - targets: ["pg-exporter-{{ pg.name }}:9187"]
+        labels:
+          pg_instance: "{{ pg.name }}"
+{% endfor %}
+
+{% endif %}
+{% if caddy_metrics_enabled | default(false) | bool %}
+  # Caddy (host) — read-only metrics site on docker0, see roles/caddy
+  - job_name: "caddy"
+    static_configs:
+      - targets: ["host.docker.internal:{{ caddy_metrics_port | default(9180) }}"]
+
+{% endif %}
+{% if 'immich-server' in (_prom_apps | default({})) %}
+  # Immich telemetry (IMMICH_TELEMETRY_INCLUDE=all): 8081 = API, 8082 = microservices/jobs
+  - job_name: "immich"
+    static_configs:
+      - targets: ["immich-server:8081"]
+        labels: { component: api }
+      - targets: ["immich-server:8082"]
+        labels: { component: microservices }
+
+{% endif %}
+{% if 'authentik-server' in (_prom_apps | default({})) %}
+  # Authentik server metrics (always on, container port 9300)
+  - job_name: "authentik"
+    static_configs:
+      - targets: ["authentik-server:9300"]
+
+{% endif %}
+{% if 'headscale' in (_prom_apps | default({})) %}
+  # Headscale control server (metrics_listen_addr 0.0.0.0:9090, container-internal)
+  - job_name: "headscale"
+    static_configs:
+      - targets: ["headscale:9090"]
+
+{% endif %}
   - job_name: "cadvisor"
+    scrape_interval: {{ cadvisor_scrape_interval }}
     static_configs:
       - targets: ["cadvisor:8080"]

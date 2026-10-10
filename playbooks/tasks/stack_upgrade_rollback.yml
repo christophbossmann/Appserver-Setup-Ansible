@@ -1,0 +1,38 @@
+---
+# Roll the service of stack-upgrade.yml back to its pre-upgrade image (and state copy).
+# Included from BOTH the rescue (failure) and the force_rollback drill. Does NOT fail the
+# play — the caller decides that. Expects: _svc, _old_value, _stamp, upgrade_keep_old.
+- name: Switch back to the previous version
+  ansible.builtin.set_fact:
+    "{{ _svc.var }}": "{{ _old_value }}"
+
+# The new image may have migrated the files — put the copy taken before the upgrade back.
+# The upgraded state is kept next to it as .failed-<ts> for inspection.
+- name: Stop the containers before restoring the state
+  ansible.builtin.command: "docker stop {{ _svc.containers | join(' ') }}"
+  changed_when: true
+  failed_when: false
+  when: _svc.state_paths | default([]) | length > 0
+
+- name: Put the pre-upgrade state back
+  ansible.builtin.shell: |
+    set -e
+    [ -e "{{ item }}.pre-upgrade-{{ _stamp }}" ] || exit 0
+    mv "{{ item }}" "{{ item }}.failed-{{ _stamp }}"
+    mv "{{ item }}.pre-upgrade-{{ _stamp }}" "{{ item }}"
+  args:
+    executable: /bin/bash
+  loop: "{{ _svc.state_paths | default([]) }}"
+  changed_when: true
+
+- name: Redeploy the previous version
+  ansible.builtin.include_tasks: stack_upgrade_deploy.yml
+  vars:
+    _expect_tag: "{{ _old_value | regex_replace('^.*:', '') }}"
+
+- name: Remove the failed state (not kept)
+  ansible.builtin.file:
+    path: "{{ item }}.failed-{{ _stamp }}"
+    state: absent
+  loop: "{{ _svc.state_paths | default([]) }}"
+  when: not (upgrade_keep_old | default(false) | bool)

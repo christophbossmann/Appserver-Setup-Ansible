@@ -1,0 +1,17 @@
+{# =========================================================================
+   One Headscale extra_record per ACTIVE INTERNAL service on this host.
+   Mirrors roles/caddy/templates/proxy_routes_resolved.yml.j2 exactly for the
+   internal profile, so the DNS names always equal the hostnames Caddy serves.
+   Empty output (-> []) when this host is not on its own headscale net yet
+   (_hs_node_ip == ""), so we never publish an unreachable target.
+   ========================================================================= #}
+{% if (_hs_node_ip | default('')) | length > 0 %}
+{%   for svc, profile in (caddy_services | default({})).items() if profile == 'internal' %}
+{%     set route = lookup('vars', 'caddy_route_' ~ svc) %}
+{%     if route.caddy_enabled | default(true) | bool %}
+- name: "{{ route.hostname_label }}.{{ internal_host }}"
+  type: A
+  value: "{{ _hs_node_ip }}"
+{%     endif %}
+{%   endfor %}
+{% endif %}

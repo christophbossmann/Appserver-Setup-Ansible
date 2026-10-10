@@ -1,0 +1,142 @@
+# Managed by Ansible — declarative forward-auth SSO config for Authentik.
+# Rendered from authentik_forward_auth_apps (group_vars/all/authentik.yml) and
+# applied automatically by Authentik's blueprint discovery on start.
+#
+# For each app: a Proxy Provider (forward_single) + an Application, then ALL
+# providers are bound to the embedded outpost in one entry (setting the outpost's
+# `providers` replaces the list, so they must all be listed together).
+#
+# User/group access policies are intentionally NOT managed here — set those in
+# the Authentik UI. If an entry fails to apply, see Admin -> Blueprints (the
+# stack keeps running regardless).
+version: 1
+metadata:
+  name: "ansible-forward-auth-apps"
+entries:
+{# Ensure the access-control groups exist here too (idempotent with the oauth-apps
+   blueprint, which creates the same names) so the !Find bindings below always
+   resolve regardless of blueprint apply order. #}
+{% for grp in authentik_groups | default([]) %}
+  - model: authentik_core.group
+    id: fa-group-{{ grp }}
+    identifiers:
+      name: "{{ grp }}"
+{% endfor %}
+{# The MFA exemption group (also created by mfa.yaml.j2) — declared here too so the
+   service-account membership below resolves regardless of blueprint apply order. #}
+  - model: authentik_core.group
+    id: fa-group-mfa-exempt
+    identifiers:
+      name: "{{ authentik_mfa_exempt_group | default('mfa-exempt') }}"
+{# Dedicated non-interactive users (e.g. playwright-bot). The blueprint creates the
+   user + group membership; the PASSWORD is set out-of-band via the Authentik API
+   by roles/authentik_bootstrap (blueprints can't set passwords). #}
+{% for sa in authentik_service_accounts | default([]) %}
+  - model: authentik_core.user
+    id: user-{{ sa.username }}
+    identifiers:
+      username: "{{ sa.username }}"
+    attrs:
+      name: "{{ sa.name | default(sa.username) }}"
+      path: users
+      groups:
+{% for grp in sa.groups | default([]) %}
+        - !Find [authentik_core.group, [name, "{{ grp }}"]]
+{% endfor %}
+{# Non-interactive logins cannot hold a second factor: exempt them from the MFA stage
+   (mfa.yaml.j2). Set mfa_exempt: false on an account that should be forced nevertheless. #}
+{% if sa.mfa_exempt | default(true) %}
+        - !Find [authentik_core.group, [name, "{{ authentik_mfa_exempt_group | default('mfa-exempt') }}"]]
+{% endif %}
+{% endfor %}
+{# Human users — declarative + reproducible, never pruned. Password (if any) is set
+   INITIAL-ONLY by roles/authentik_bootstrap. Group membership is managed here. #}
+{# Human users: the blueprint only CREATES them (username/name/email). Group
+   membership is intentionally NOT set here — a blueprint replaces the whole M2M on
+   every apply (destroying additive/UI membership). roles/authentik_bootstrap syncs
+   groups instead: additive by default, exact-match only with authentik_fullsync=true.
+   (Service accounts above keep blueprint-managed groups — they are fully managed.) #}
+{% for u in authentik_users | default([]) %}
+  - model: authentik_core.user
+    id: humanuser-{{ u.username }}
+    identifiers:
+      username: "{{ u.username }}"
+    attrs:
+      name: "{{ u.name | default(u.username) }}"
+{% if u.email is defined %}
+      email: "{{ u.email }}"
+{% endif %}
+      path: users
+{% endfor %}
+{% for app in authentik_forward_auth_apps if (app.hostname | default('') | length > 0) %}
+  - model: authentik_providers_proxy.proxyprovider
+    id: provider-{{ app.name }}
+    identifiers:
+      name: "{{ app.name }}"
+    attrs:
+      mode: forward_single
+      external_host: "https://{{ app.hostname }}"
+{% if app.cookie_domain is defined %}
+      # Share the auth cookie across the whole domain so ONE login covers every
+      # subdomain that uses this domain (e.g. all pgN.<host>).
+      cookie_domain: "{{ app.cookie_domain }}"
+{% endif %}
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+  - model: authentik_core.application
+    id: app-{{ app.name }}
+    identifiers:
+      slug: "{{ app.name }}"
+    attrs:
+      name: "{{ app.display_name | default(app.name) }}"
+      provider: !KeyOf provider-{{ app.name }}
+{% if app.admins_only | default(true) %}
+  # Restrict access to the built-in "authentik Admins" group (akadmin is in it).
+  # Set admins_only: false on the app to open it to all authenticated users.
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-{{ app.name }}
+      group: !Find [authentik_core.group, [name, "authentik Admins"]]
+      order: 0
+    attrs:
+      enabled: true
+{% endif %}
+{% for grp in app.access_groups | default([]) %}
+  # Additional group granted access to THIS app (created via authentik_groups
+  # in the oauth-apps blueprint). Members are not admins.
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-{{ app.name }}
+      group: !Find [authentik_core.group, [name, "{{ grp }}"]]
+      order: {{ loop.index }}
+    attrs:
+      enabled: true
+{% endfor %}
+{% endfor %}
+  - model: authentik_outposts.outpost
+    identifiers:
+      managed: goauthentik.io/outposts/embedded
+    attrs:
+      # authentik_host MUST be set declaratively: without it a fresh install
+      # redirects forward-auth logins to http://localhost/application/o/authorize
+      # (the outpost falls back to an empty host). Mirrors the LDAP outpost config.
+      config:
+        authentik_host: "https://authentik.{{ global_host }}"
+        authentik_host_insecure: false
+        authentik_host_browser: ""
+        log_level: info
+        object_naming_template: "ak-outpost-%(name)s"
+        docker_network: null
+        docker_map_ports: true
+        docker_labels: null
+        container_image: null
+        refresh_interval: "minutes=5"
+        kubernetes_replicas: 1
+        kubernetes_namespace: default
+        kubernetes_service_type: ClusterIP
+        kubernetes_disabled_components: []
+        kubernetes_image_pull_secrets: []
+      providers:
+{% for app in authentik_forward_auth_apps if (app.hostname | default('') | length > 0) %}
+        - !Find [authentik_providers_proxy.proxyprovider, [name, "{{ app.name }}"]]
+{% endfor %}

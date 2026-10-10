@@ -1,0 +1,132 @@
+# Authentik self-hosted (IdP/SSO) — adapted from the official goauthentik compose.
+# Managed by Ansible (compose_stack). Self-contained: own Postgres, NOT the shared
+# prod-postgres (the auth foundation must not depend on the DB it protects).
+#
+# Deltas vs. upstream:
+#   - images from group_vars (authentik_*_image) — repo image convention.
+#   - server publishes ONLY on 127.0.0.1 (Caddy fronts it at authentik.<host> and
+#     terminates TLS); the 9443 listener is dropped.
+#   - worker does NOT mount /var/run/docker.sock: we use the server's EMBEDDED
+#     outpost via Caddy forward_auth, so Authentik never needs Docker access.
+#   - no Redis service (2026.x no longer requires it).
+#   - secrets/config come from the templated .env next to this file.
+name: authentik
+
+services:
+  postgresql:
+    image: {{ authentik_postgres_image }}
+    container_name: authentik-postgres
+    restart: unless-stopped
+{% if authentik_postgres_port | default('') %}
+    # Loopback-ONLY admin access (local pgAdmin via SSH tunnel). Apps still reach this DB
+    # INTERNALLY over the docker network by name (authentik-postgres) — this only adds a
+    # 127.0.0.1 host port; nothing is exposed to the network. Empty var = not published.
+    ports:
+      - "127.0.0.1:{{ authentik_postgres_port }}:5432"
+{% endif %}
+    env_file: [.env]
+    environment:
+      POSTGRES_DB: ${PG_DB:-authentik}
+      POSTGRES_USER: ${PG_USER:-authentik}
+      POSTGRES_PASSWORD: ${PG_PASS:?database password required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    volumes:
+      - {{ authentik_pg_data_dir }}:/var/lib/postgresql/data
+{% if postgres_pitr_enabled | default(false) %}
+      - {{ (postgres_pitr_instances | selectattr('name', 'equalto', 'authentik') | first).host_archive }}:/archive   # PITR: WAL archive + base backups (roles/postgres_pitr; @pg_archive subvolume)
+{% endif %}
+
+  server:
+    image: {{ authentik_server_image }}
+    container_name: authentik-server
+    command: server
+    restart: unless-stopped
+    shm_size: 512mb
+    env_file: [.env]
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?secret key required}
+      AUTHENTIK_HOST: ${AUTHENTIK_HOST}
+    ports:
+      # Loopback only — Caddy (authentik.<host>) is the public front + TLS.
+      # Caddy's forward_auth for other services also targets this port.
+      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    volumes:
+      - {{ authentik_data_dir }}:/data
+      - {{ authentik_templates_dir }}:/templates
+      # Declarative SSO config (proxy providers + apps + outpost binding),
+      # rendered by Ansible and auto-applied by blueprint discovery.
+      - ./blueprints:/blueprints/custom:ro
+
+  worker:
+    image: {{ authentik_server_image }}
+    container_name: authentik-worker
+    command: worker
+    restart: unless-stopped
+    shm_size: 512mb
+    env_file: [.env]
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?secret key required}
+      AUTHENTIK_HOST: ${AUTHENTIK_HOST}
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    volumes:
+      - {{ authentik_data_dir }}:/data
+      - {{ authentik_certs_dir }}:/certs
+      - {{ authentik_templates_dir }}:/templates
+      # The worker applies blueprints — it needs the same mount.
+      - ./blueprints:/blueprints/custom:ro
+
+{% if authentik_ldap_enabled | default(false) %}
+  # LDAP outpost — lets LDAP-only clients (e.g. WebDAV via rclone --auth-proxy)
+  # verify credentials against Authentik. Its token is written to ldap-outpost.env
+  # by roles/authentik_ldap_token AFTER the outpost exists; until then this
+  # crash-loops harmlessly (required:false lets compose start without the file).
+  ldap:
+    image: {{ authentik_ldap_image }}
+    container_name: authentik-ldap
+    restart: unless-stopped
+    env_file:
+      - path: ldap-outpost.env
+        required: false
+    environment:
+      AUTHENTIK_HOST: "http://server:9000"
+      AUTHENTIK_INSECURE: "true"
+    ports:
+      # Published per address in authentik_ldap_bind_addresses (loopback + optionally
+      # the host's tailscale IP for tailnet access). WebDAV containers reach it at
+      # authentik-ldap:3389 over the shared backend network regardless of these.
+{% for addr in authentik_ldap_bind_addresses | default(['127.0.0.1']) %}
+      - "{{ addr }}:{{ authentik_ldap_bind_port }}:3389"
+      - "{{ addr }}:{{ authentik_ldap_bind_port_ssl | default(6636) }}:6636"
+{% endfor %}
+    depends_on:
+      - server
+    networks:
+      - default
+      - backend
+{% endif %}
+
+{% if authentik_ldap_enabled | default(false) %}
+networks:
+  default:
+    name: authentik_default
+  backend:
+    external: true
+{% endif %}

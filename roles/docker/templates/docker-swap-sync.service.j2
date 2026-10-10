@@ -1,0 +1,14 @@
+# Managed by Ansible (roles/docker) — see /usr/local/bin/docker-swap-sync.
+[Unit]
+Description=Keep no-swap docker containers swap-free across systemd reloads
+After=docker.service
+BindsTo=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/docker-swap-sync
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=docker.service

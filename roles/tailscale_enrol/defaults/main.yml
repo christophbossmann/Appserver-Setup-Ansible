@@ -1,0 +1,29 @@
+---
+# =============================================================================
+# tailscale_enrol role — defaults
+# =============================================================================
+# Enrols THIS host's own tailscale client into its CO-LOCATED headscale, using a
+# cached reusable pre-auth key. It exists to break a bootstrap deadlock: the early
+# `tailscale` role runs before docker/headscale/caddy, so on a fresh build a node
+# whose control server is its OWN headscale cannot enrol yet. This role runs LATE
+# (right after headscale_bootstrap, still BEFORE caddy) and enrols via the headscale
+# LOOPBACK endpoint — needing neither Caddy (:443) nor public DNS — so tailscale0 has
+# an IP by the time Caddy renders the tailscale0-bound `.int` sites. One-pass converge.
+
+# OFF by default. Turn on (host_vars) for a host that runs its own co-located
+# headscale and should self-enrol into it.
+tailscale_self_enrol: false
+
+# Control URL for the co-located enrol: the headscale LOOPBACK endpoint. headscale
+# speaks plain HTTP there (Caddy only adds public TLS for OTHER devices), so this
+# path is independent of Caddy and DNS. The infra node's control traffic then stays
+# on-host — self-contained and robust.
+tailscale_enrol_control_url: "http://127.0.0.1:{{ headscale_port | default(8099) }}"
+
+# Which headscale user's cached reusable pre-auth key the node enrols with (the
+# infra/server account). The key file is written by headscale_bootstrap on the
+# CONTROLLER at {{ headscale_keys_dir }}/{{ inventory_hostname }}/<user>.preauthkey.
+tailscale_enrol_user: "{{ headscale_server_enrol_user | default('server') }}"
+
+# Extra `tailscale up` args (mirrors the tailscale role's knob).
+tailscale_enrol_extra_args: "{{ tailscale_extra_args | default('') }}"

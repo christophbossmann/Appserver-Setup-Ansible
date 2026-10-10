@@ -1,0 +1,84 @@
+---
+# cgroup v2 caps a container's memory.low at its parent's effective protection. Docker scopes
+# live in system.slice (systemd cgroup driver), whose MemoryLow defaults to 0 — so the
+# immich-server mem_reservation would protect nothing. Give system.slice the same amount;
+# with memory_recursiveprot it flows to the child that claims it (immich-server).
+# set-property persists under /etc/systemd/system.control/ and applies live.
+- name: Protect immich-server memory reservation at the system.slice level
+  when: immich_server_mem_reservation | default('') | length > 0
+  block:
+    - name: Read current system.slice MemoryLow
+      ansible.builtin.command: systemctl show system.slice -P MemoryLow
+      register: _immich_slice_low
+      changed_when: false
+
+    - name: Set system.slice MemoryLow
+      ansible.builtin.command: >-
+        systemctl set-property system.slice
+        MemoryLow={{ immich_server_mem_reservation | human_to_bytes }}
+      when: _immich_slice_low.stdout | trim != (immich_server_mem_reservation | human_to_bytes | string)
+
+# Externalize immich ORIGINALS onto the Storage Box, BEFORE the immich stack starts, so the
+# container mounts a library/ that already points at the box. Host-gated by
+# immich_originals_external (needs storagebox_enabled). Idempotent: a normal run is a no-op
+# once the symlinks are in place. See group_vars/all/immich.yml + roles/storagebox.
+- name: immich originals externalization
+  when: immich_originals_external | bool
+  block:
+    - name: Assert the Storage Box is enabled + mounted on this host
+      ansible.builtin.assert:
+        that:
+          - storagebox_enabled | default(false) | bool
+        fail_msg: >-
+          immich_originals_external=true but storagebox_enabled is false. The originals
+          need the Storage Box mount — enable it in host_vars (storagebox_*).
+        quiet: true
+
+    - name: Verify the Storage Box mount is live
+      ansible.builtin.command: "mountpoint -q {{ storagebox_mountpoint }}"
+      register: _immich_sb_mount
+      changed_when: false
+      failed_when: _immich_sb_mount.rc != 0
+
+    - name: Ensure rsync is available (for the one-time library migration)
+      ansible.builtin.apt:
+        name: rsync
+        state: present
+
+    - name: Ensure the immich upload root exists
+      ansible.builtin.file:
+        path: "{{ immich_upload_dir }}"
+        state: directory
+        mode: "0755"
+
+    # Per subdir: create it on the box, migrate any existing LOCAL contents once, then
+    # replace the local dir with a symlink to the box. All cases handled idempotently.
+    - name: Externalize immich subdirs onto the Storage Box (symlink)
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+          LOCAL="{{ immich_upload_dir }}/{{ item }}"
+          BOX="{{ immich_storagebox_root }}/{{ item }}"
+          mkdir -p "$BOX"
+          if [ -L "$LOCAL" ]; then
+            cur=$(readlink "$LOCAL")
+            if [ "$cur" = "$BOX" ]; then echo "NOCHANGE already-linked:{{ item }}"; exit 0; fi
+            rm -f "$LOCAL"; ln -s "$BOX" "$LOCAL"; echo "CHANGED relinked:{{ item }}"; exit 0
+          fi
+          if [ -e "$LOCAL" ] && [ ! -d "$LOCAL" ]; then
+            echo "FAILED not-a-dir:{{ item }}"; exit 1
+          fi
+          if [ -d "$LOCAL" ]; then
+            if [ -n "$(ls -A "$LOCAL" 2>/dev/null)" ]; then
+              echo "migrating existing {{ item }} to the box..."
+              rsync -a "$LOCAL"/ "$BOX"/
+            fi
+            rm -rf "$LOCAL"
+          fi
+          ln -s "$BOX" "$LOCAL"
+          echo "CHANGED externalized:{{ item }}"
+      loop: "{{ immich_external_subdirs | default(['library']) }}"
+      register: _immich_ext
+      changed_when: "'CHANGED' in (_immich_ext.stdout | default(''))"
+      failed_when: _immich_ext.rc != 0 or ('FAILED' in (_immich_ext.stdout | default('')))

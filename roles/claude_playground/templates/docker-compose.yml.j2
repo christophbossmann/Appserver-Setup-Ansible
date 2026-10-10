@@ -19,19 +19,69 @@ services:
     environment:
       REMOTE_CONTROL: "{{ playground_remote_control_autoactivate | lower }}"
       PLAYGROUND_CTL_SOCKET: "{{ playground_ctl_socket }}"
+{% if playground_playwright_mcp_enabled | default(true) %}
+      # Playwright MCP: registered into ~/.claude.json by the entrypoint; the AI
+      # reaches it over the isolated playground-mcp network at this SSE URL.
+      PLAYWRIGHT_MCP_URL: "{{ playwright_mcp_claude_sse_url }}"
+      # pgN.<host> are behind Authentik SSO (forward-auth), not basic_auth anymore.
+      # To test a deployed app end-to-end, Playwright logs in ONCE as this dedicated
+      # bot account via the Authentik login form (navigate to the pgN URL -> it
+      # redirects to Authentik -> fill username/password), then reuses the session
+      # cookie (storageState). cookie_domain covers all pgN with a single login.
+      PLAYGROUND_SSO_USER: "playwright-bot"
+      PLAYGROUND_SSO_PASS: "{{ vault_authentik_playwright_password }}"
+{% endif %}
+{% if playground_supabase_enabled | default(false) %}
+      # Shared Supabase for the apps the AI builds, via the dedicated API host
+      # (key-auth + RLS in Kong; the DB is never directly reachable). The AI bakes
+      # these into the apps it deploys to pgN. anon key is public-by-design.
+      SUPABASE_URL: "{{ playground_supabase_url }}"
+      SUPABASE_ANON_KEY: "{{ playground_supabase_anon_key }}"
+{% if playground_supabase_service_key_enabled | default(false) %}
+      # WARNING: service key BYPASSES RLS (full DB access) — enabled deliberately.
+      SUPABASE_SERVICE_ROLE_KEY: "{{ playground_supabase_service_key }}"
+{% endif %}
+{% if playground_supabase_db_direct | default(false) %}
+      # Direct, DDL-capable Postgres URL (postgres role) for schema migrations via
+      # the supabase CLI / psql. Server/CLI ONLY — never put in a browser bundle.
+      SUPABASE_DB_URL: "{{ playground_supabase_db_url }}"
+      # JWT secret: sign/verify tokens locally (debug / custom auth). Sensitive.
+      SUPABASE_JWT_SECRET: "{{ playground_supabase_jwt_secret }}"
+{% endif %}
+{% if playground_supabase_studio_url is defined %}
+      SUPABASE_STUDIO_URL: "{{ playground_supabase_studio_url }}"
+{% endif %}
+{% endif %}
     # uid stays 10001 (Claude login persistence is untouched). Access to the
     # shared workspace and the broker socket is granted purely via group
     # membership:
     group_add:
       - "{{ playground_ctl_workspace_gid }}"   # write into {{ playground_ctl_workspace }}
       - "{{ playground_ctl_socket_gid }}"       # talk to the broker socket
+{% if (playground_playwright_mcp_enabled | default(true)) or (playground_supabase_db_direct | default(false)) %}
+    # playground-mcp: isolated network to reach playwright-mcp. Normally that is the
+    # ONLY network (no path to postgres/n8n/… from the AI runtime). Outbound internet
+    # works via NAT.
+    networks:
+{% if playground_playwright_mcp_enabled | default(true) %}
+      - playground-mcp
+{% endif %}
+{% if playground_supabase_db_direct | default(false) %}
+      # DELIBERATE isolation break (dev Supabase only): reach supabase-db directly
+      # for migrations/psql via SUPABASE_DB_URL. See group_vars/all/playground.yml.
+      - supabase
+{% endif %}
+{% endif %}
     volumes:
       # Shared workspace, owned by the playground user (setgid playground group).
       - "{{ playground_ctl_workspace }}:/workspace"
       # Persisted Claude config + credentials (login survives rebuilds).
       - "claude_home:/home/claude"
       # The ONLY path to Docker: the broker socket. Never the host docker.sock.
-      - "{{ playground_ctl_socket }}:{{ playground_ctl_socket }}"
+      # Mount the DIRECTORY, not the socket file — after a reboot the socket
+      # does not exist yet, and docker would create the missing path as a
+      # directory (which crash-looped the broker). Dir mounts are race-free.
+      - "{{ playground_ctl_socket_dir }}:{{ playground_ctl_socket_dir }}"
 
 {% if playground_webdav_enabled %}
   # WebDAV access to workspace + claude-home (rclone serve webdav), mirroring
@@ -42,18 +92,32 @@ services:
   # The Claude login token (.credentials.json) is excluded from serving.
   # Bound to 127.0.0.1 only; exposed via the webdav-playground.<host> Caddy route.
   playground-webdav:
-    image: {{ playground_webdav_image }}
+    image: "{{ 'rclone-ldap:local' if playground_webdav_ldap | default(false) else playground_webdav_image }}"
+{% if playground_webdav_ldap | default(false) %}
+    pull_policy: never   # rclone-ldap:local is built locally (rclone_ldap_image role)
+{% endif %}
     container_name: playground-webdav
     restart: unless-stopped
     user: "10001:{{ playground_ctl_workspace_gid }}"
     command: >
-      serve webdav /data
+      serve webdav {{ '' if playground_webdav_ldap | default(false) else '/data' }}
       --addr :8888
+{% if playground_webdav_ldap | default(false) %}
+      --auth-proxy /usr/local/bin/auth-proxy.sh
+{% else %}
       --user {{ playground_webdav_user }}
       --pass {{ playground_webdav_password }}
+{% endif %}
       --dir-cache-time {{ playground_webdav_cachetime }}
       --exclude "/claude-home/.claude/.credentials.json"
 {% if playground_webdav_readonly %}      --read-only
+{% endif %}
+{% if playground_webdav_ldap | default(false) %}
+    environment:
+      # WebDAV login = an Authentik user in webdav-playground-users (LDAP bind).
+      LDAP_BASE_DN: "{{ playground_webdav_ldap_base_dn }}"
+    networks:
+      - backend   # reach the Authentik LDAP outpost (authentik-ldap:3389)
 {% endif %}
     volumes:
       - "{{ playground_ctl_workspace }}:/data/workspace"
@@ -66,3 +130,25 @@ services:
 
 volumes:
   claude_home:
+{% if (playground_playwright_mcp_enabled | default(true)) or (playground_webdav_enabled and playground_webdav_ldap | default(false)) or (playground_supabase_db_direct | default(false)) %}
+
+networks:
+{% if playground_playwright_mcp_enabled | default(true) %}
+  # Shared only between claude-ctl and playwright-mcp.
+  playground-mcp:
+    external: true
+{% endif %}
+{% if playground_webdav_enabled and playground_webdav_ldap | default(false) %}
+  # playground-webdav joins backend to reach the Authentik LDAP outpost.
+  backend:
+    name: backend
+    external: true
+{% endif %}
+{% if playground_supabase_db_direct | default(false) %}
+  # claude-ctl joins the supabase stack's network to reach supabase-db directly
+  # (SUPABASE_DB_URL) for schema migrations. Dev Supabase only — see playground.yml.
+  supabase:
+    name: "{{ playground_supabase_network }}"
+    external: true
+{% endif %}
+{% endif %}

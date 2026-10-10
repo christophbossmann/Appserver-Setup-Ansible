@@ -1,0 +1,18 @@
+# Caddy route for headplane — INTERNAL (tailscale-only). Auth is headplane's OWN
+# native OIDC against Authentik (authentik_oauth_apps: headplane), so NO Caddy
+# forward-auth here — otherwise the user would hit two logins (Caddy's Authentik
+# gate AND headplane's OIDC). headplane redirects unauthenticated users to
+# Authentik itself; the OIDC callback is /oidc/callback.
+caddy_route_headplane:
+  name: headplane
+  hostname_label: headplane
+  caddy_upstream: "127.0.0.1:{{ headplane_port }}"
+  caddy_forward_auth: false
+  # headplane serves its UI under /admin (bare "/" 404s). Redirect ONLY the exact
+  # root "/" -> /admin so the bare hostname / a bookmark just works. Now possible
+  # since forward-auth is gone (no ordered route{} block intercepting "/"). The
+  # post-check then hits "/" and gets 302 -> allow 200/302/404 to be safe.
+  healthcheck_status_codes: [200, 302, 404]
+  caddy_extra: |
+    @root path /
+    redir @root /admin 302

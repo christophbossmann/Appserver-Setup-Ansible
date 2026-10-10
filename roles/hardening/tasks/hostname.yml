@@ -1,0 +1,21 @@
+---
+# The OS hostname comes from the INVENTORY, not from whatever was typed into the installer.
+# It shows up in every shell prompt and journal line, so a wrong one invites acting on the
+# wrong machine (seen: a host reinstalled by mistake carried the OTHER server's name).
+# Nothing else depends on it here (routes, certs, tailnet name and Ansible all use their
+# own names), so changing it is cosmetic for the services — and deliberate for the humans.
+
+# /etc/hosts first: sudo resolves the local hostname on every call and warns when it can't.
+- name: Map the hostname to loopback in /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1\s'
+    line: "127.0.1.1 {{ system_hostname }}"
+    insertafter: '^127\.0\.0\.1\s'
+  when: hardening_set_hostname | bool
+
+- name: Set the hostname from the inventory
+  ansible.builtin.hostname:
+    name: "{{ system_hostname }}"
+    use: systemd
+  when: hardening_set_hostname | bool

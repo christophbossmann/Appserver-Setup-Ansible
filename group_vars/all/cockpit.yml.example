@@ -1,0 +1,6 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/cockpit.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# Cockpit (was vars/monitoring.yml). External hostname used by the Caddy
+# route — required so Cockpit allows WebSocket connections via the proxy.
+cockpit_hostname: "{{ svc_edge_host['cockpit'] }}"

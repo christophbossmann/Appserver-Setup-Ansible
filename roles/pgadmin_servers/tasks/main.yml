@@ -1,0 +1,60 @@
+---
+# Import pgAdmin's shared server definitions (stacks/pgadmin/configs/servers.json)
+# so every user — including OAuth/SSO users — sees the registered Postgres
+# instances. The container's own first-start auto-import is unreliable (it can
+# race with DB init and silently do nothing), so we run load-servers explicitly.
+#
+# Idempotent WITHOUT --replace: we only import when the server table is empty
+# (fresh install). --replace would delete+recreate the servers every run, which
+# reassigns their IDs and orphans each user's per-user sharedserver credentials
+# (host/port/db are shared, but username/password are stored per user). So on an
+# existing install we skip. To pick up servers.json CHANGES later, clear the
+# pgAdmin data dir once (bind mount) and redeploy, or run load-servers by hand.
+
+# On a FRESH host the container is "up" while pgAdmin is still creating its
+# internal SQLite schema (first-boot init) — querying too early fails with
+# "no such table: server". Retry until the schema exists.
+- name: Count existing pgAdmin servers (wait out first-boot DB init)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - pgadmin
+      - /venv/bin/python3
+      - -c
+      - "import sqlite3;print(next(sqlite3.connect('/var/lib/pgadmin/pgadmin4.db').execute('select count(*) from server'))[0])"
+  register: _pgadmin_server_count
+  changed_when: false
+  failed_when: false
+  until: _pgadmin_server_count.rc == 0
+  retries: 18
+  delay: 10
+  when: not ansible_check_mode
+
+- name: Fail if pgAdmin never finished initializing its DB
+  ansible.builtin.fail:
+    msg: >-
+      pgAdmin's internal DB (/var/lib/pgadmin/pgadmin4.db) still has no server
+      table after ~3 minutes — first-boot init seems stuck. Check:
+      cd /opt/pgadmin && docker compose logs -f
+  when:
+    - not ansible_check_mode
+    - _pgadmin_server_count.rc != 0
+
+- name: Import shared servers from servers.json (only when none exist yet)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - pgadmin
+      - /venv/bin/python3
+      - /pgadmin4/setup.py
+      - load-servers
+      - /pgadmin4/servers.json
+      - --user
+      - "{{ pgadmin_email }}"
+  register: _pgadmin_load
+  changed_when: "'Added' in _pgadmin_load.stdout"
+  when:
+    - not ansible_check_mode
+    - (_pgadmin_server_count.stdout | default('0') | int) == 0

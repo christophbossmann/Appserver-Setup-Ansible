@@ -4,7 +4,7 @@ import subprocess
 
 from .policy import (
     PLAYGROUND_USER,
-    PLAYGROUND_WORKSPACE,
+    PLAYGROUND_WORKSPACE_ROOT,
     READ_TIMEOUT,
     MUTATION_TIMEOUT,
     MAX_LOG_TAIL,
@@ -79,19 +79,19 @@ def playground_prefix_command(cmd):
     ] + cmd
 
 
-def require_playground_workspace():
-    if not PLAYGROUND_WORKSPACE.exists():
+def require_playground_workspace(workspace):
+    if not workspace.exists():
         return result(
             ok=False,
             exit_code=1,
-            stderr=f"Playground workspace missing: {PLAYGROUND_WORKSPACE}\n",
+            stderr=f"Playground workspace missing: {workspace}\n",
         )
 
-    if PLAYGROUND_WORKSPACE.is_symlink():
+    if workspace.is_symlink():
         return result(
             ok=False,
             exit_code=1,
-            stderr=f"Playground workspace must not be a symlink: {PLAYGROUND_WORKSPACE}\n",
+            stderr=f"Playground workspace must not be a symlink: {workspace}\n",
         )
 
     return None
@@ -136,13 +136,50 @@ def host_compose_ls():
     )
 
 
+def functions_reload():
+    """The ONE allowed host-daemon mutation, surgically scoped: restart the
+    supabase edge-runtime container so edited playground functions drop their
+    cached workers immediately (new functions are picked up without this; an
+    edited one may otherwise be served stale for up to ~60s worker idle-timeout).
+    The container name is HARDCODED — the sandbox cannot pick a target."""
+    return run_command(
+        ["docker", "restart", "supabase-edge-functions"],
+        timeout=MUTATION_TIMEOUT,
+    )
+
+
+def host_stats():
+    """Read-only, per-container attribution of host load: docker stats snapshot
+    (CPU/mem/net/block per container) + docker system df -v (image/volume/build-
+    cache sizes). Lets the sandboxed agent name the container that eats the host
+    instead of only seeing the aggregate loadavg."""
+    stats = run_command(
+        [
+            "docker", "stats", "--no-stream", "--format",
+            "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}",
+        ],
+        timeout=60,
+    )
+    df = run_command(["docker", "system", "df", "-v"], timeout=60)
+
+    out = "=== docker stats (snapshot) ===\n" + stats["stdout"]
+    out += "\n=== docker system df -v ===\n" + df["stdout"]
+
+    return result(
+        ok=stats["ok"] and df["ok"],
+        exit_code=0 if (stats["ok"] and df["ok"]) else 1,
+        stdout=out,
+        stderr=stats["stderr"] + df["stderr"],
+    )
+
+
 # ---------------------------------------
 # Playground rootless Docker: read/write
 # ---------------------------------------
 
 def playground_docker(cmd, timeout=60, cwd=None):
     if cwd is None:
-        cwd = PLAYGROUND_WORKSPACE
+        cwd = PLAYGROUND_WORKSPACE_ROOT
 
     return run_command(
         playground_prefix_command(cmd),
@@ -150,6 +187,8 @@ def playground_docker(cmd, timeout=60, cwd=None):
         cwd=cwd,
     )
 
+
+# --- Daemon-wide (not scoped to a single environment) -----------------------
 
 def playground_ps():
     return playground_docker(
@@ -190,20 +229,22 @@ def playground_compose_ls():
     )
 
 
-def playground_compose_ps():
-    err = require_playground_workspace()
+# --- Environment-scoped (cwd = that environment's workspace) ----------------
+
+def playground_compose_ps(workspace):
+    err = require_playground_workspace(workspace)
     if err:
         return err
 
     return playground_docker(
         ["docker", "compose", "ps"],
         timeout=READ_TIMEOUT,
-        cwd=PLAYGROUND_WORKSPACE,
+        cwd=workspace,
     )
 
 
-def playground_compose_logs(tail=200):
-    err = require_playground_workspace()
+def playground_compose_logs(workspace, tail=200):
+    err = require_playground_workspace(workspace)
     if err:
         return err
 
@@ -217,48 +258,48 @@ def playground_compose_logs(tail=200):
     return playground_docker(
         ["docker", "compose", "logs", "--no-color", f"--tail={tail}"],
         timeout=READ_TIMEOUT,
-        cwd=PLAYGROUND_WORKSPACE,
+        cwd=workspace,
     )
 
 
-def playground_compose_up():
-    err = require_playground_workspace()
+def playground_compose_up(workspace):
+    err = require_playground_workspace(workspace)
     if err:
         return err
 
     return playground_docker(
         ["docker", "compose", "up", "-d", "--build", "--remove-orphans"],
         timeout=MUTATION_TIMEOUT,
-        cwd=PLAYGROUND_WORKSPACE,
+        cwd=workspace,
     )
 
 
-def playground_compose_stop():
-    err = require_playground_workspace()
+def playground_compose_stop(workspace):
+    err = require_playground_workspace(workspace)
     if err:
         return err
 
     return playground_docker(
         ["docker", "compose", "stop"],
         timeout=MUTATION_TIMEOUT,
-        cwd=PLAYGROUND_WORKSPACE,
+        cwd=workspace,
     )
 
 
-def playground_compose_restart():
-    err = require_playground_workspace()
+def playground_compose_restart(workspace):
+    err = require_playground_workspace(workspace)
     if err:
         return err
 
     return playground_docker(
         ["docker", "compose", "restart"],
         timeout=MUTATION_TIMEOUT,
-        cwd=PLAYGROUND_WORKSPACE,
+        cwd=workspace,
     )
 
 
-def playground_compose_down(remove_volumes=False):
-    err = require_playground_workspace()
+def playground_compose_down(workspace, remove_volumes=False):
+    err = require_playground_workspace(workspace)
     if err:
         return err
 
@@ -270,38 +311,38 @@ def playground_compose_down(remove_volumes=False):
     return playground_docker(
         cmd,
         timeout=MUTATION_TIMEOUT,
-        cwd=PLAYGROUND_WORKSPACE,
+        cwd=workspace,
     )
 
 
-def playground_compose_kill():
-    err = require_playground_workspace()
+def playground_compose_kill(workspace):
+    err = require_playground_workspace(workspace)
     if err:
         return err
 
     return playground_docker(
         ["docker", "compose", "kill"],
         timeout=MUTATION_TIMEOUT,
-        cwd=PLAYGROUND_WORKSPACE,
+        cwd=workspace,
     )
 
 
-def playground_compose_build():
-    err = require_playground_workspace()
+def playground_compose_build(workspace):
+    err = require_playground_workspace(workspace)
     if err:
         return err
 
     return playground_docker(
         ["docker", "compose", "build"],
         timeout=MUTATION_TIMEOUT,
-        cwd=PLAYGROUND_WORKSPACE,
+        cwd=workspace,
     )
 
 
-def playground_compose_reset():
-    down = playground_compose_down(remove_volumes=True)
+def playground_compose_reset(workspace):
+    down = playground_compose_down(workspace, remove_volumes=True)
 
     if not down["ok"]:
         return down
 
-    return playground_compose_up()
+    return playground_compose_up(workspace)

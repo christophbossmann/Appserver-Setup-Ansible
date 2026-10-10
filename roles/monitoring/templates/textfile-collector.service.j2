@@ -1,0 +1,12 @@
+# Managed by Ansible (roles/monitoring) — textfile collector: {{ item.name }}
+[Unit]
+Description={{ item.description }}
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart={{ item.exec }}
+{% for line in item.service_extra | default([]) %}
+{{ line }}
+{% endfor %}

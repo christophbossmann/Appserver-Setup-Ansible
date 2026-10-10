@@ -1,0 +1,51 @@
+# headplane config — managed by Ansible (stacks/headplane/configs/config.yaml.j2).
+# Schema: headplane v0.7.x. Auth = native OIDC against Authentik (headplane
+# redirects to Authentik and logs the user in). management via the Headscale API
+# key. No docker integration (slim & safe).
+
+server:
+  host: "0.0.0.0"
+  port: 3000
+  base_url: "{{ headplane_base_url }}"
+  cookie_secret: "{{ headplane_cookie_secret }}"
+  cookie_secure: true
+  data_path: /var/lib/headplane
+
+# Native OIDC (Authentik). headplane redirects unauthenticated users to the issuer
+# and logs them in; callback = {{ headplane_base_url }}/oidc/callback (registered as
+# a redirect_uri on the Authentik provider). API-key login stays as a fallback
+# unless disable_api_key_login is set true.
+oidc:
+  enabled: true
+  issuer: "{{ headplane_oidc_issuer }}"
+  client_id: "{{ headplane_oidc_client_id }}"
+  client_secret: "{{ headplane_oidc_client_secret }}"
+  use_pkce: true
+  scope: "openid email profile"
+  disable_api_key_login: {{ headplane_oidc_disable_api_key_login | default(false) | bool | lower }}
+  # Role for newly-created OIDC users (owner is auto-granted to the FIRST user only).
+  default_role: {{ headplane_oidc_default_role | default('viewer') }}
+{% if headplane_oidc_role_claim | default('') | length > 0 %}
+  # OIDC claim -> Headplane role, synced every login (Authentik: group -> role).
+  role_claim: {{ headplane_oidc_role_claim }}
+{% endif %}
+  # RP-initiated logout: end the Authentik session too (else reload re-auths via SSO).
+  use_end_session: {{ headplane_oidc_use_end_session | default(false) | bool | lower }}
+{% if headplane_oidc_post_logout_redirect | default('') | length > 0 %}
+  post_logout_redirect_uri: "{{ headplane_oidc_post_logout_redirect }}"
+{% endif %}
+
+headscale:
+  url: "{{ headplane_headscale_url }}"
+  public_url: "{{ headplane_headscale_public_url }}"
+  config_path: /etc/headscale/config.yaml
+  # API key from headscale (created + cached on the controller by headscale_bootstrap).
+  api_key: "{{ lookup('file', (headscale_keys_dir | expanduser) ~ '/' ~ inventory_hostname ~ '/headplane.apikey') | trim }}"
+
+# No orchestration integration (no docker socket) — read-only settings view +
+# API-based node/user/key management only.
+integration:
+  docker:
+    enabled: false
+  proc:
+    enabled: false

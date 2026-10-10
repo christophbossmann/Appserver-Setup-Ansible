@@ -1,0 +1,40 @@
+---
+# DESTRUCTIVE Point-in-Time Recovery: restore ONE postgres instance to a target time
+# from its base backup + archived WAL. This restores the WHOLE cluster (every DB on
+# that instance) to that moment — you cannot PITR a single database.
+#
+#   ansible-playbook playbooks/postgres-pitr-restore.yml --limit <host> \
+#     -e pitr_instance=postgres \
+#     -e pitr_target_time="2026-09-06 18:00:00+00" \
+#     -e pitr_confirm=YES \
+#     [-e pitr_base=20260906-181548]   # else: newest base backup taken before the target
+#     [-e pitr_keep_old=true]          # keep the pre-restore data dir (default: delete it)
+#
+# The current data dir is moved aside during the restore and, once recovery is VERIFIED
+# (promoted out of recovery to the target), DELETED by default to reclaim space — you
+# can always re-run PITR from the archive, and the logical dumps are the independent
+# fallback. If the target can't be reached the play aborts first, so the old dir stays.
+# Pass pitr_keep_old=true to keep it. After recovery a NEW timeline starts; take a fresh
+# base backup afterwards.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+
+- name: PostgreSQL PITR restore
+  hosts: servers
+  become: true
+  vars:
+    pitr_target_action: promote
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that:
+          - pitr_confirm | default('') == 'YES'
+          - (pitr_instance | default('')) | length > 0
+          - (pitr_target_time | default('')) | length > 0
+          - postgres_pitr_instances | selectattr('name', 'equalto', pitr_instance | default('')) | list | length == 1
+        fail_msg: >-
+          Need -e pitr_instance=<{{ postgres_pitr_instances | map(attribute='name') | join('|') }}>
+          -e pitr_target_time='YYYY-MM-DD HH:MM:SS+00' -e pitr_confirm=YES
+
+    - name: Run the PITR restore (shared steps — same logic the upgrade auto-rollback uses)
+      ansible.builtin.include_tasks: tasks/pitr_restore.yml

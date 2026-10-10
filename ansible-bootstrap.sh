@@ -20,10 +20,10 @@ SERVICE_ACCOUNT="${4:-ansible}"
 if [ -z "$TARGET_HOST" ] || [ -z "$SSH_USER" ]; then
     echo "Usage: $0 [--gen-key] <target_ip> <ssh_user> [ssh_key_path] [service_account]"
     echo ""
-    echo "Example: $0 192.168.0.10 admin"
-    echo "         $0 --gen-key 192.168.0.10 admin"
-    echo "         $0 192.168.0.10 admin ~/.ssh/ansible_key"
-    echo "         $0 192.168.0.10 admin ~/.ssh/ansible_key ansible"
+    echo "Example: $0 203.0.113.10 admin"
+    echo "         $0 --gen-key 203.0.113.10 admin"
+    echo "         $0 203.0.113.10 admin ~/.ssh/ansible_key"
+    echo "         $0 203.0.113.10 admin ~/.ssh/ansible_key ansible"
     exit 1
 fi
 
@@ -60,4 +60,26 @@ ssh -tt "$SSH_USER@$TARGET_HOST" "
 # Verify
 echo ""
 echo "Verifying SSH key login..."
-ssh -i "$ANSIBLE_KEY" -o BatchMode=yes "$SERVICE_ACCOUNT@$TARGET_HOST" 'echo "Success: connected as $(whoami) on $(hostname)"'
+
+# A passphrase-protected key can't be used non-interactively — and Ansible never prompts
+# for it either. So a protected key MUST sit in a running ssh-agent: load it there now
+# (one passphrase prompt), then verify the same way Ansible will connect (BatchMode).
+if ! ssh-keygen -y -P "" -f "$ANSIBLE_KEY" >/dev/null 2>&1; then
+    KEY_FP=$(ssh-keygen -lf "${ANSIBLE_KEY}.pub" | awk '{print $2}')
+    AGENT_RC=0; ssh-add -l >/dev/null 2>&1 || AGENT_RC=$?   # 0 = keys loaded, 1 = empty agent, 2 = no agent
+    if [ "$AGENT_RC" -eq 2 ]; then
+        echo "Key $ANSIBLE_KEY has a passphrase, but no ssh-agent is running."
+        echo "Ansible needs the key in an agent. Start one and load the key, e.g.:"
+        echo "    eval \"\$(ssh-agent -s)\" && ssh-add $ANSIBLE_KEY"
+        echo "(or use keychain / the Windows agent bridge so it survives new shells). Verifying"
+        echo "once interactively now:"
+        ssh -i "$ANSIBLE_KEY" -o IdentitiesOnly=yes "$SERVICE_ACCOUNT@$TARGET_HOST" 'echo "Success: connected as $(whoami) on $(hostname)"'
+        exit $?
+    fi
+    if ! ssh-add -l 2>/dev/null | grep -q "$KEY_FP"; then
+        echo "Key $ANSIBLE_KEY has a passphrase — adding it to the ssh-agent (needed for Ansible too):"
+        ssh-add "$ANSIBLE_KEY"
+    fi
+fi
+
+ssh -i "$ANSIBLE_KEY" -o IdentitiesOnly=yes -o BatchMode=yes "$SERVICE_ACCOUNT@$TARGET_HOST" 'echo "Success: connected as $(whoami) on $(hostname)"'

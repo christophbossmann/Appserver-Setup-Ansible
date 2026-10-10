@@ -14,7 +14,7 @@
   ansible.builtin.find:
     paths:
       - "{{ role_path }}/.."           # roles/<role>/defaults/caddy_route.yml
-      - "{{ inventory_dir }}/stacks"   # stacks/<stack>/caddy_route.yml (compose_stack)
+      - "{{ role_path }}/../../stacks"   # stacks/<stack>/caddy_route.yml (compose_stack; repo-relative, NOT inventory_dir: the inventory lives in the private repo)
     patterns: "caddy_route.yml"
     recurse: true
   delegate_to: localhost

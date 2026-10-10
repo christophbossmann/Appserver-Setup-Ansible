@@ -1,0 +1,74 @@
+---
+# ┌───────────────────────────────────────────────────────────────────────────┐
+# │  TEST / VERIFICATION PLAYBOOK — NOT a deploy. Never rolled out.            │
+# │  Lives under playbooks/tests/ and is NEVER included by server-all.yml.     │
+# │  Safe to run anytime: it only READS the backups and restores them into     │
+# │  THROWAWAY scratch databases (verify_restore_<app>) that are dropped again.│
+# │  Live app databases and files are never touched.                           │
+# └───────────────────────────────────────────────────────────────────────────┘
+#
+# Proves the LOCAL pull backups (./backups/<host>/<app>/) are actually restorable.
+# For each app it restores the DB dump into a scratch DB, checks it has tables +
+# passes a sanity query, verifies the file/photo backup is non-empty, then drops the
+# scratch DB. Non-zero exit if any selected app fails -> usable in CI/cron.
+#
+#   ansible-playbook playbooks/tests/test-backup-restore.yml --limit <host>
+#   ansible-playbook playbooks/tests/test-backup-restore.yml --limit <host> -e verify_only=immich
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: ../preflight-ssh-agent.yml
+
+- name: "TEST: verify local backups are restorable (non-destructive)"
+  hosts: servers
+  become: true
+  vars:
+    # Where backup-pull.yml landed the local backup. Respect backup_pull_dir (e.g.
+    # /mnt/d/backup) exactly like backup-pull.yml does; fall back to repo-root/backups
+    # (this playbook sits two levels down: playbooks/tests/).
+    backup_pull_dest: "{{ backup_pull_dir | default(playbook_dir ~ '/../../backups') }}/{{ inventory_hostname }}"
+    _tgt_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+    _tgt_user: "{{ hostvars[inventory_hostname].ansible_user | default('ansible') }}"
+    _ssh: "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+    # -e verify_only=immich (comma-sep) | full | all. Default = every target.
+    verify_only: "full"
+    _want: "{{ (verify_only | string | lower | replace(' ', '')).split(',') }}"
+    # Per-app restore-verify spec: postgres container, its superuser, the DB name,
+    # the owner role the scratch DB should have, an app-specific sanity query, and
+    # the local backup data subdir to check for files (omit if DB-only).
+    backup_verify_targets:
+      - app: nextcloud
+        container: "{{ nextcloud_db_host | default('postgres') }}"
+        su: "{{ nextcloud_db_admin_user | default(postgres_user) }}"
+        db: "{{ nextcloud_db_name }}"
+        owner: nextcloud
+        sanity: "select count(*) from oc_users"
+        dump_dir: nextcloud-db
+        data_dir: data
+      - app: immich
+        container: "{{ immich_db_host | default('postgres') }}"
+        su: "{{ immich_db_admin_user | default(postgres_user) }}"
+        db: "{{ immich_db_name }}"
+        owner: "{{ immich_db_user }}"
+        sanity: "select count(*) from information_schema.tables where table_schema='public'"
+        dump_dir: immich-db      # dump staged separately (see backup.yml immich note)
+        data_dir: immich         # upload dir basename after the data-domain move
+      - app: authentik
+        container: authentik-postgres
+        su: authentik
+        db: authentik
+        owner: authentik
+        sanity: "select count(*) from authentik_core_user"
+        dump_dir: authentik-db
+  tasks:
+    - name: Verify each selected target
+      ansible.builtin.include_tasks: test-backup-restore-target.yml
+      loop: "{{ backup_verify_targets }}"
+      loop_control:
+        loop_var: t
+        label: "{{ t.app }}"
+      when: ('full' in _want) or ('all' in _want) or (t.app in _want)
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          TEST finished for: {{ verify_only }}. A failed restore would have aborted
+          the run (non-zero exit). Scratch DBs were dropped; live data untouched.

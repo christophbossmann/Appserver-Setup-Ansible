@@ -1,0 +1,180 @@
+---
+# ┌───────────────────────────────────────────────────────────────────────────┐
+# │  TEST / VERIFICATION PLAYBOOK — NOT a deploy. Never rolled out.            │
+# │  Lives under playbooks/tests/ and is NEVER included by server-all.yml.     │
+# │  NON-DESTRUCTIVE: operates only on a THROWAWAY btrfs subvolume under        │
+# │  /var/tmp — the OS root (@), snapper history and live data are never        │
+# │  touched, and the host is NOT rebooted.                                    │
+# └───────────────────────────────────────────────────────────────────────────┘
+#
+# Proves the btrfs snapshot -> write -> ROLLBACK -> verify cycle works on the host,
+# on a disposable scratch subvolume:
+#
+#   1. create a scratch subvolume
+#   2. write  keep_before_snapshot.txt   (exists BEFORE the snapshot)
+#   3. take a read-only snapshot          (the "known good" state to roll back to)
+#   4. write  created_after_snapshot.txt  (exists only AFTER the snapshot)
+#   5. ROLLBACK: delete the scratch subvolume, re-create it from the ro snapshot
+#   6. ASSERT:  keep_before_snapshot.txt  is STILL there  (pre-snapshot data survives)
+#          AND  created_after_snapshot.txt is GONE        (post-snapshot change undone)
+#   7. always: delete both subvolumes + the scratch dir (nothing left behind)
+#
+# This validates the core btrfs CoW snapshot/restore MECHANISM without a reboot. It does
+# NOT exercise the production root-rollback path (@ rename + GRUB + reboot) — that lives
+# in ./btrfs-rollback_LEGACY.sh and can only be verified by actually rebooting.
+#
+#   ansible-playbook playbooks/tests/test-snapshot-rollback.yml --limit <host>
+#
+# On a non-btrfs host it skips with a warning (like the btrfs_snapshots role's 'auto').
+# Set -e snap_selftest_require=true to make a non-btrfs host a hard failure instead.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: ../preflight-ssh-agent.yml
+
+- name: "TEST: btrfs snapshot rollback selftest (scratch subvolume, non-destructive)"
+  hosts: servers
+  become: true
+  vars:
+    snap_selftest_base: /var/tmp/btrfs_rollback_selftest
+    snap_selftest_require: false
+    _scratch: "{{ snap_selftest_base }}/scratch"
+    _ro_snap: "{{ snap_selftest_base }}/snap_ro"
+    _keep_file: "{{ snap_selftest_base }}/scratch/keep_before_snapshot.txt"
+    _after_file: "{{ snap_selftest_base }}/scratch/created_after_snapshot.txt"
+
+  tasks:
+    - name: Detect filesystem type of the scratch location's parent
+      ansible.builtin.command: "findmnt -no FSTYPE --target {{ snap_selftest_base | dirname }}"
+      register: _snap_fs
+      changed_when: false
+      check_mode: false
+
+    - name: Require btrfs when snap_selftest_require=true
+      ansible.builtin.assert:
+        that: (_snap_fs.stdout | trim) == 'btrfs'
+        fail_msg: >-
+          {{ snap_selftest_base | dirname }} on {{ inventory_hostname }} is
+          '{{ _snap_fs.stdout | trim }}', not btrfs — cannot run the snapshot rollback
+          selftest. Run against a btrfs host, or drop snap_selftest_require.
+        success_msg: "btrfs detected — running the snapshot rollback selftest."
+        quiet: true
+      when: snap_selftest_require | bool
+
+    - name: Not a btrfs host — skip the selftest (snap_selftest_require=false)
+      ansible.builtin.debug:
+        msg: >-
+          [SKIP] {{ snap_selftest_base | dirname }} is '{{ _snap_fs.stdout | trim }}', not
+          btrfs — snapshot rollback selftest not applicable on {{ inventory_hostname }}.
+      when:
+        - not (snap_selftest_require | bool)
+        - (_snap_fs.stdout | trim) != 'btrfs'
+
+    - name: Run the snapshot rollback selftest
+      when: (_snap_fs.stdout | trim) == 'btrfs'
+      block:
+        # ---- clean slate (in case a previous run aborted before its cleanup) ----------
+        - name: Pre-clean any leftover scratch/ro subvolumes from an aborted run
+          ansible.builtin.command: "btrfs subvolume delete {{ item }}"
+          loop:
+            - "{{ _scratch }}"
+            - "{{ _ro_snap }}"
+          register: _preclean
+          changed_when: _preclean.rc == 0
+          failed_when: false
+
+        - name: Remove any leftover scratch base dir
+          ansible.builtin.file:
+            path: "{{ snap_selftest_base }}"
+            state: absent
+
+        - name: Create the scratch base dir
+          ansible.builtin.file:
+            path: "{{ snap_selftest_base }}"
+            state: directory
+            mode: "0700"
+
+        # ---- 1. scratch subvolume --------------------------------------------------
+        - name: Create the scratch subvolume
+          ansible.builtin.command: "btrfs subvolume create {{ _scratch }}"
+          register: _mk_subvol
+          changed_when: _mk_subvol.rc == 0
+
+        # ---- 2. file that exists BEFORE the snapshot (must SURVIVE rollback) --------
+        - name: Write keep_before_snapshot.txt (pre-snapshot data)
+          ansible.builtin.copy:
+            dest: "{{ _keep_file }}"
+            content: "this file existed before the snapshot and MUST survive the rollback\n"
+            mode: "0644"
+
+        # ---- 3. read-only snapshot = the state we roll back to ---------------------
+        - name: Take a read-only snapshot (the rollback target)
+          ansible.builtin.command: "btrfs subvolume snapshot -r {{ _scratch }} {{ _ro_snap }}"
+          register: _mk_snap
+          changed_when: _mk_snap.rc == 0
+
+        # ---- 4. file created AFTER the snapshot (must be GONE after rollback) -------
+        - name: Write created_after_snapshot.txt (post-snapshot change)
+          ansible.builtin.copy:
+            dest: "{{ _after_file }}"
+            content: "this file was created AFTER the snapshot and MUST vanish on rollback\n"
+            mode: "0644"
+
+        - name: Sanity — both files present in the pre-rollback state
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          register: _pre
+          failed_when: not _pre.stat.exists
+          loop:
+            - "{{ _keep_file }}"
+            - "{{ _after_file }}"
+
+        # ---- 5. ROLLBACK: drop the working subvolume, re-create it from the ro snap -
+        - name: Rollback step 1 — delete the working scratch subvolume
+          ansible.builtin.command: "btrfs subvolume delete {{ _scratch }}"
+          register: _rb_del
+          changed_when: _rb_del.rc == 0
+
+        - name: Rollback step 2 — re-create scratch (writable) from the ro snapshot
+          ansible.builtin.command: "btrfs subvolume snapshot {{ _ro_snap }} {{ _scratch }}"
+          register: _rb_restore
+          changed_when: _rb_restore.rc == 0
+
+        # ---- 6. verify the rollback outcome ----------------------------------------
+        - name: "Stat keep_before_snapshot.txt after rollback (expect present)"
+          ansible.builtin.stat:
+            path: "{{ _keep_file }}"
+          register: _keep_after
+
+        - name: "Stat created_after_snapshot.txt after rollback (expect absent)"
+          ansible.builtin.stat:
+            path: "{{ _after_file }}"
+          register: _after_after
+
+        - name: ASSERT rollback worked (pre-snapshot file kept, post-snapshot file gone)
+          ansible.builtin.assert:
+            that:
+              - _keep_after.stat.exists
+              - not _after_after.stat.exists
+            fail_msg: >-
+              ROLLBACK FAILED on {{ inventory_hostname }}:
+              keep_before_snapshot.txt present={{ _keep_after.stat.exists }} (want true),
+              created_after_snapshot.txt present={{ _after_after.stat.exists }} (want false).
+            success_msg: >-
+              ROLLBACK OK on {{ inventory_hostname }} — pre-snapshot data survived and the
+              post-snapshot change was undone (file deleted).
+            quiet: true
+
+      always:
+        # ---- 7. always tear down the scratch subvolumes + dir ----------------------
+        - name: Cleanup — delete scratch + ro subvolumes
+          ansible.builtin.command: "btrfs subvolume delete {{ item }}"
+          loop:
+            - "{{ _scratch }}"
+            - "{{ _ro_snap }}"
+          register: _cleanup
+          changed_when: _cleanup.rc == 0
+          failed_when: false
+
+        - name: Cleanup — remove the scratch base dir
+          ansible.builtin.file:
+            path: "{{ snap_selftest_base }}"
+            state: absent

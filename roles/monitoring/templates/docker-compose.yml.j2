@@ -11,6 +11,20 @@ services:
     volumes:
       - /opt/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - {{ prometheus_data_dir }}:/prometheus
+      # file_sd target lists published by other roles (caddy-probes.json from roles/caddy)
+      - /etc/prometheus-file-sd:/etc/prometheus/file_sd:ro
+{% if caddy_metrics_enabled | default(false) | bool %}
+    # Caddy runs on the host; its metrics site listens on docker0 (= host-gateway)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+{% endif %}
+{% if _prom_apps | default({}) | length > 0 %}
+    networks:
+      - default
+{% for net in _prom_apps.values() | unique %}
+      - {{ net }}             # reaches {{ _prom_apps | dict2items | selectattr('value', 'equalto', net) | map(attribute='key') | join(', ') }} metrics
+{% endfor %}
+{% endif %}
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=30d"
@@ -22,16 +36,58 @@ services:
     image: {{ node_exporter_image }}
     container_name: node-exporter
     restart: unless-stopped
+    # Docker's default AppArmor profile blocks D-Bus messages ("An AppArmor policy
+    # prevents this sender..."), which the systemd collector needs. Unconfined for THIS
+    # container only — it already mounts /proc, /sys and / read-only to observe the host.
+    security_opt:
+      - apparmor:unconfined
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /:/rootfs:ro
+      # systemd collector talks to the HOST's systemd over D-Bus (read-only queries)
+      - /run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
+      # .prom files from the host-side collectors (security-metrics, disk-usage-metrics)
+      - /var/lib/node_exporter/textfile:/textfile:ro
     command:
       - "--path.procfs=/host/proc"
       - "--path.sysfs=/host/sys"
       - "--path.rootfs=/rootfs"
       - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+      # unit state + timer last-trigger for the "Scheduled jobs" dashboard
+      - "--collector.systemd"
+      - "--collector.textfile.directory=/textfile"
+      # single-quoted YAML: the regex's backslashes must stay literal (\. is an invalid
+      # escape in a double-quoted YAML string)
+      - '--collector.systemd.unit-include={{ node_exporter_systemd_units | replace('$', '$$') }}'
 
+  # ============================================================
+  # Blackbox Exporter — probes every route Caddy serves (up, status, latency, TLS expiry)
+  # ============================================================
+  blackbox:
+    image: {{ blackbox_exporter_image }}
+    container_name: blackbox
+    restart: unless-stopped
+    volumes:
+      - /opt/monitoring/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    command:
+      - "--config.file=/etc/blackbox_exporter/config.yml"
+
+{% for pg in _pg_exporters | default([]) %}
+  # ============================================================
+  # postgres_exporter for {{ pg.name }} (read-only prom_exporter role, see tasks)
+  # ============================================================
+  pg-exporter-{{ pg.name }}:
+    image: {{ postgres_exporter_image }}
+    container_name: pg-exporter-{{ pg.name }}
+    restart: unless-stopped
+    env_file:
+      - /opt/monitoring/pg-exporter-{{ pg.name }}.env
+    networks:
+      - default                # reached by prometheus
+      - {{ pg.network }}       # reaches {{ pg.container }}
+
+{% endfor %}
   # ============================================================
   # cAdvisor — container metrics
   # ============================================================
@@ -50,7 +106,8 @@ services:
       - /dev/disk/:/dev/disk:ro
     command:
       - "--docker_only=true"
-      - "--housekeeping_interval=30s"
+      - "--housekeeping_interval={{ cadvisor_housekeeping_interval }}"
+      - "--disable_metrics={{ cadvisor_disabled_metrics }}"
 
   # ============================================================
   # Grafana — visualization
@@ -68,7 +125,58 @@ services:
       - /opt/monitoring/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - /opt/monitoring/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
     environment:
+{% if grafana_plugins | default([]) | length > 0 %}
+      # installed on container start (treemap for the "Disk usage" dashboard)
+      GF_PLUGINS_PREINSTALL: "{{ grafana_plugins | join(',') }}"
+{% endif %}
+{% if (monitoring_trivy_enabled | default(false)) and (monitoring_scan_button_enabled | default(false)) %}
+      # lets dashboard buttons POST to the scan hook behind Grafana's own host name
+      GF_SECURITY_ACTIONS_ALLOW_POST_URL: "/hooks/*"
+{% endif %}
       GF_SECURITY_ADMIN_USER: {{ grafana_admin_user }}
       GF_SECURITY_ADMIN_PASSWORD: {{ grafana_admin_password }}
+{% if grafana_oidc_enabled | default(false) %}
+      # Native OIDC via Authentik. The built-in admin login above stays as a
+      # break-glass fallback; SSO users are auto-provisioned + role-mapped.
+      GF_SERVER_ROOT_URL: "{{ grafana_root_url }}"
+      GF_AUTH_GENERIC_OAUTH_ENABLED: "true"
+      GF_AUTH_GENERIC_OAUTH_NAME: "{{ grafana_oidc_name }}"
+      GF_AUTH_GENERIC_OAUTH_CLIENT_ID: "{{ grafana_oidc_client_id }}"
+      GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET: "{{ grafana_oidc_client_secret }}"
+      GF_AUTH_GENERIC_OAUTH_SCOPES: "{{ grafana_oidc_scopes }}"
+      GF_AUTH_GENERIC_OAUTH_AUTH_URL: "{{ grafana_oidc_auth_url }}"
+      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: "{{ grafana_oidc_token_url }}"
+      GF_AUTH_GENERIC_OAUTH_API_URL: "{{ grafana_oidc_api_url }}"
+      GF_AUTH_GENERIC_OAUTH_USE_PKCE: "true"
+      GF_AUTH_GENERIC_OAUTH_ALLOW_SIGN_UP: "true"
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH: "{{ grafana_oidc_role_path }}"
+{% if grafana_oidc_sso_logout | default(false) %}
+      # On logout, redirect to Authentik's end-session endpoint so the SSO session
+      # is ended too (Authentik shows its logout-confirmation window, like Immich).
+      # Without this Grafana only clears its OWN session; Authentik stays logged in.
+      GF_AUTH_SIGNOUT_REDIRECT_URL: "{{ grafana_oidc_signout_redirect_url }}"
+{% endif %}
+{% if grafana_oidc_disable_local_login | default(false) %}
+      # Hide the username/password form + jump straight to Authentik. Flip this
+      # ON only AFTER SSO works. Break-glass: set it false and redeploy, or reach
+      # Grafana via an SSH tunnel to 127.0.0.1:3000 (the local admin still works).
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_OAUTH_AUTO_LOGIN: "true"
+{% endif %}
+{% endif %}
     depends_on:
       - prometheus
+{% set _ext_nets = ((_pg_exporters | default([])) | map(attribute='network') | list
+                     + (_prom_apps | default({})).values() | list) | unique | list %}
+{% if _ext_nets | length > 0 %}
+
+# The postgres instances' networks (joined by their exporters). Declared external: they
+# belong to the database stacks, this stack only attaches to them.
+networks:
+  default:
+    name: monitoring_default
+{% for net in _ext_nets %}
+  {{ net }}:
+    external: true
+{% endfor %}
+{% endif %}

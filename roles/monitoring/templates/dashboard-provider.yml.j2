@@ -7,5 +7,11 @@ providers:
     type: file
     disableDeletion: false
     updateIntervalSeconds: 30
+    # Allow dragging/resizing panels in the UI and saving them (stored in
+    # Grafana's DB, not overwritten on reload). The JSON file stays the durable,
+    # rebuild-proof source of truth: after finalising a layout in the UI, export
+    # the JSON Model back into roles/monitoring/files/dashboards/ so a fresh host
+    # gets the same layout. A file with a higher dashboard "version" re-wins.
+    allowUiUpdates: true
     options:
       path: /etc/grafana/provisioning/dashboards/json

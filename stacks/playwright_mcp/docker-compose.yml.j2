@@ -19,6 +19,14 @@ services:
     image: {{ playwright_mcp_image }}
     container_name: playwright-mcp
     restart: unless-stopped
+    # Two networks on purpose:
+    #   backend        -> n8n and other backend services drive it (existing).
+    #   playground-mcp  -> the isolated net the claude-ctl AI runtime joins, so
+    #                      it can use the MCP endpoint WITHOUT gaining access to
+    #                      the rest of backend (postgres/n8n/...).
+    networks:
+      - backend
+      - playground-mcp
     ports:
       - "127.0.0.1:{{ playwright_mcp_port }}:3000"
       - "127.0.0.1:{{ playwright_mcp_novnc_port }}:6080"
@@ -37,6 +45,7 @@ services:
       start_period: 40s
 
 networks:
-  default:
-    name: backend
+  backend:
+    external: true
+  playground-mcp:
     external: true

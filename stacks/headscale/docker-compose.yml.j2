@@ -1,0 +1,24 @@
+services:
+  headscale:
+    container_name: headscale
+    image: {{ headscale_image }}
+    restart: unless-stopped
+    command: serve
+    volumes:
+      # Config (config.yaml deployed by compose_stack `configs:`) -> /etc/headscale
+      - {{ headscale_data_dir }}/config:/etc/headscale
+      # State: sqlite db + noise/derp private keys -> /var/lib/headscale
+      - {{ headscale_data_dir }}/data:/var/lib/headscale
+    ports:
+      # Loopback only; the HOST Caddy fronts it publicly at
+      # headscale.{{ global_host }} (443, real cert). The container listens on 8080.
+      - "127.0.0.1:{{ headscale_port }}:8080"
+    networks:
+      - backend        # so headplane can reach the API by name (http://headscale:8080)
+    # NOTE: no container healthcheck — the headscale image is distroless (no shell,
+    # no wget), so an in-container probe can't run. Readiness is polled host-side by
+    # the compose_stack `health_url` in stack.yml (curl http://127.0.0.1:<port>/health).
+
+networks:
+  backend:
+    external: true

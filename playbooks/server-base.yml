@@ -3,9 +3,12 @@
 # Base Server Setup: Hardening + Users + Docker + Tailscale
 #
 # Usage:
-#   ansible-playbook -i inventory.ini playbooks/server-base.yml \
+#   ansible-playbook playbooks/server-base.yml \
 #     --limit myserver
 # =============================================================================
+
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
 
 - name: Base Server Setup
   hosts: all
@@ -16,3 +19,9 @@
     - { role: docker, tags: [docker] }
     - { role: tailscale, tags: [tailscale] }
     - { role: caddy, tags: [caddy] }
+  post_tasks:
+    # hardening stops apt-daily(-upgrade) for the play — bring automatic updates back.
+    - name: Re-start apt background timers
+      # import (static), not include: only then do the inner tasks inherit 'always'
+      ansible.builtin.import_tasks: tasks/apt_timers_restore.yml
+      tags: [always]

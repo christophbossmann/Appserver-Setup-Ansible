@@ -1,0 +1,10 @@
+# Managed by Ansible (roles/hardening). Refresh the Spamhaus DROP ipsets (atomic swap).
+[Unit]
+Description=Refresh Spamhaus DROP lists
+After=network-online.target spamhaus-ipset.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=SPAMHAUS_MIN_V4={{ hardening_spamhaus_drop_min_v4 }}
+ExecStart=/usr/local/sbin/spamhaus-drop update

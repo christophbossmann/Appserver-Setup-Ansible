@@ -52,7 +52,9 @@ playground_ctl_user: "playground"                 # (policy) PLAYGROUND_USER
 playground_ctl_socket_group: "playgroundctl"      # (policy) SOCKET_GROUP
 playground_ctl_home: "/home/{{ playground_ctl_user }}"
 playground_ctl_workspace: "{{ playground_ctl_home }}/workspace"   # (policy) PLAYGROUND_WORKSPACE
-playground_ctl_socket: "/run/playground-ctl.sock"                # (policy) SOCKET_PATH
+# Socket lives in its own dir; the container mounts the DIR (reboot-race-safe).
+playground_ctl_socket_dir: "/run/playground-ctl"
+playground_ctl_socket: "{{ playground_ctl_socket_dir }}/playground-ctl.sock"  # (policy) SOCKET_PATH
 
 # --- subuid / subgid range (task.md example) ---------------------------------
 playground_ctl_subid_start: 231072
@@ -62,15 +64,50 @@ playground_ctl_subid_count: 65536
 playground_ctl_install_dir: "/opt/playground-ctl"
 playground_ctl_bin: "/usr/local/bin/playgroundctl"
 
-# === Default playground app (backs the playground.<host> route) ===
-# The playground.<host> Caddy route proxies to 127.0.0.1:<playground_public_port>.
-# A tiny default app publishes there so the route works out of the box; the AI
-# (or you) can replace the workspace docker-compose.yml with any stack, as long
-# as it keeps publishing on this port.
+# =============================================================================
+# === Multi-environment playground ============================================
+# =============================================================================
+# The playground supports N independent deploy targets ("environments"). One
+# claude-ctl AI runtime + one broker manage all of them; the session picks the
+# target per action with `playgroundctl playground compose up --env <name>`.
+#
+# Each environment gets:
+#   - its own workspace subdir  {{ playground_ctl_workspace }}/<name>
+#   - its own loopback port     playground_env_base_port + <list index>
+#   - its own Caddy route       <name>.<global_host>  (see defaults/caddy_route.yml)
+#
+# Adding an environment later is list-driven and low-friction:
+#   1. append a name here (e.g. pg4)
+#   2. add a caddy_route_pg4 block in defaults/caddy_route.yml (copy the last,
+#      bump the port offset)
+#   3. add `pg4: external` to the host's caddy_services
+# then re-run the playbook. Names must be plain slugs [a-z0-9_-]; they double as
+# the Caddy hostname label, so keep them DNS-safe.
+playground_environments:
+  - pg1
+  - pg2
+  - pg3
+  - pg4
+  - pg5
+
+# First env's loopback port; env at list index i publishes on base + i
+# (pg1 -> 8100, pg2 -> 8101, pg3 -> 8102). Kept clear of 8090/8091 (legacy
+# playground port / webdav).
+playground_env_base_port: 8100
+
+# Root-owned allowlist the broker reads to map an env name -> (workspace, port).
+# The sandboxed AI only ever sends the env KEY; it can never inject a path or a
+# port. Rendered by broker.yml from playground_environments above.
+playground_ctl_environments_file: "{{ playground_ctl_install_dir }}/environments.json"
+
+# === Default playground app (seeds every environment's route) ===
+# Each environment's <name>.<host> Caddy route proxies to its loopback port. A
+# tiny default app publishes there so every route works out of the box; the AI
+# (or you) can replace <workspace>/<env>/docker-compose.yml with any stack, as
+# long as it keeps publishing on that env's port.
 # Landing page container image (default app).
 nginx_image: "nginx:1.30-alpine"
 
-playground_public_port: 8090
 playground_default_app_enabled: true
 
 # Caddy route(s) for this role live in defaults/caddy_route.yml (loaded
@@ -88,7 +125,7 @@ playground_default_app_enabled: true
 #                    memory files); .credentials.json is EXCLUDED from serving.
 playground_webdav_enabled: false
 playground_webdav_port: 8091          # host: 127.0.0.1:<port> -> container :8888
-playground_webdav_user: "christoph"
+playground_webdav_user: "{{ admin_user | default('admin') }}"
 playground_webdav_password: "changeme"
 playground_webdav_cachetime: "5s"
 playground_webdav_readonly: false     # true -> serve everything read-only

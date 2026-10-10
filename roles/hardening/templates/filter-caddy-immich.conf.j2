@@ -1,0 +1,17 @@
+# fail2ban filter — managed by Ansible (roles/hardening).
+# Matches a failed HTTP Basic Auth (status 401) in Caddy's JSON access log for the
+# public Immich share route. Caddy logs to stderr -> journald, so this jail uses
+# backend=systemd and reads the caddy unit (journalmatch below). One JSON object
+# per log line; client_ip (inside request{}) precedes the uri and the top-level status.
+#
+# IMPORTANT: match ONLY 401s on the share ENTRY path (/share/...), NOT on every
+# request. The Immich share page is a SvelteKit SPA: one legitimate page load fires
+# the /share/<token> navigation PLUS ~30-50 static assets (/_app/*.js, /custom.css)
+# and API calls — all behind the same Basic-Auth gate, so all return 401 until the
+# browser sends credentials. Counting each asset 401 as a "failed login" banned a
+# real visitor after a single reload. Gating on /share/ keeps the brute-force signal
+# (guessing tokens / hammering the gate at the entry) while ignoring the asset burst.
+[Definition]
+failregex = "client_ip":"<HOST>".*"uri":"/share/[^"]*".*"status":401
+journalmatch = _SYSTEMD_UNIT=caddy.service
+ignoreregex =

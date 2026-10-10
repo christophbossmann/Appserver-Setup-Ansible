@@ -11,11 +11,14 @@
 # WAIT until each record is visible on that fast resolver, to avoid checking
 # before DNS has propagated. The actual HTTP check still uses the system resolver.
 
+# ignore_errors in check mode: a NEW route's DNS record is only created by the
+# (skipped) cloudflared/cloudflare_dns tasks, so it cannot resolve yet there.
 - name: Wait for proxy route DNS to appear (preferred resolver)
   ansible.builtin.command: "dig +short {{ item.hostname }} @{{ check_public_routes_dns_server }}"
   register: _caddy_pc_dns
   changed_when: false
   check_mode: false   # read-only probe; must also resolve in --check runs
+  ignore_errors: "{{ ansible_check_mode }}"
   until: (_caddy_pc_dns.stdout | trim) | length > 0
   retries: "{{ caddy_post_check_dns_retries }}"
   delay: "{{ caddy_post_check_dns_delay }}"
@@ -30,6 +33,66 @@
     - item.caddy_enabled | default(false) | bool
     - not (item.healthcheck_skip | default(false) | bool)
     - not (item.hostname.startswith('*'))
+    # Degrade-aware: skip routes whose bind interface has no IPv4 yet (e.g. .int over
+    # tailscale0 before the VPN client joined) — Caddy isn't serving them, so a check
+    # would fail on a deliberately-absent site. caddy_missing_bind_ifaces is set by the
+    # caddy role earlier in this play (both share the 'caddy' tag).
+    - (item.caddy_bind_interfaces | default([]) | intersect(caddy_missing_bind_ifaces | default([])) | length) == 0
+    # Intent-aware: skip routes whose backing service was not deployed in THIS run (its
+    # role never registered in deployed_services). A crashed-but-deployed backend still
+    # registered, so it is NOT skipped here and fails below. See caddy_post_check_require_deployed.
+    - (not (caddy_post_check_require_deployed | bool)) or ((item.depends_service | default(item.name | default(item.hostname))) in (deployed_services | default([])))
+
+# --- Internal (.int) DNS integrity --------------------------------------------------
+# The HTTP checks above run FROM THIS HOST and can FALSE-GREEN on internal names: with the
+# headscale .int extra_records missing (e.g. fresh-install ordering), the name resolves to
+# 127.0.0.1 and the host's OWN Caddy answers 200 on loopback — while real clients (their own
+# 127.0.0.1) get connection-refused. So additionally assert each internal name resolves to
+# THIS host's tailscale IP (served via headscale MagicDNS), not loopback/public. Retries to
+# let MagicDNS sync after headscale (re)starts. This is the only signal that catches missing
+# extra_records; without it the .int breakage passes silently.
+- name: Internal .int names must resolve to the host's tailscale IP (MagicDNS)
+  ansible.builtin.shell: |
+    set -o pipefail
+    ip=$(getent ahostsv4 "{{ item.hostname }}" | awk '{print $1; exit}')
+    want="{{ caddy_bind_interface_ipv4_map['tailscale0'] | default('') }}"
+    if [ "$ip" != "$want" ]; then
+      echo "INT_DNS_MISMATCH {{ item.hostname }} -> ${ip:-<none>} (want $want): headscale .int extra_records missing/stale — re-run --tags headscale"
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+  register: _pc_int_dns
+  changed_when: false
+  retries: "{{ caddy_post_check_retries }}"
+  delay: "{{ caddy_post_check_delay }}"
+  until: _pc_int_dns.rc == 0
+  loop: "{{ proxy_routes | default([]) }}"
+  loop_control:
+    label: "{{ item.name | default(item.hostname) }}"
+  when:
+    - caddy_post_check_enabled | bool
+    - caddy_post_check_internal_dns | bool
+    - item.caddy_enabled | default(false) | bool
+    - not (item.healthcheck_skip | default(false) | bool)
+    - not (item.hostname.startswith('*'))
+    # Only INTERNAL routes (bound to tailscale0) and only once tailscale0 actually has an IP
+    # (else the routes are deliberately not served — handled by the degrade skip above).
+    - "'tailscale0' in (item.caddy_bind_interfaces | default([]))"
+    - "'tailscale0' in (caddy_bind_interface_ipv4_map | default({}))"
+    # Same intent-gating as the HTTP check: only assert deployed services.
+    - (not (caddy_post_check_require_deployed | bool)) or ((item.depends_service | default(item.name | default(item.hostname))) in (deployed_services | default([])))
+
+- name: Show intent-aware post-check status (deployed services this run)
+  ansible.builtin.debug:
+    msg: >-
+      Intent-aware post-check ON. Services deployed this run:
+      {{ deployed_services | default([]) | sort }}.
+      Enabled routes whose service is NOT in that list are SKIPPED (not deployed this run);
+      routes whose service IS in it are checked (a down backend there still fails).
+  when:
+    - caddy_post_check_enabled | bool
+    - caddy_post_check_require_deployed | bool
 
 - name: Check proxy routes (via DNS)
   ansible.builtin.uri:
@@ -53,3 +116,11 @@
     - not (item.healthcheck_skip | default(false) | bool)
     # Skip wildcard cert directives (e.g. *.int...) — they are not services.
     - not (item.hostname.startswith('*'))
+    # Degrade-aware: skip routes whose bind interface has no IPv4 yet (e.g. .int over
+    # tailscale0 before the VPN client joined) — the site is deliberately not served.
+    - (item.caddy_bind_interfaces | default([]) | intersect(caddy_missing_bind_ifaces | default([])) | length) == 0
+    # Intent-aware: only check a route whose backing service was deployed in THIS run. A
+    # service not deployed -> its role never registered in deployed_services -> skipped.
+    # A deployed-but-crashed backend DID register -> checked here -> fails (caught). Route
+    # -> service via depends_service (default: route name). Toggle: caddy_post_check_require_deployed.
+    - (not (caddy_post_check_require_deployed | bool)) or ((item.depends_service | default(item.name | default(item.hostname))) in (deployed_services | default([])))

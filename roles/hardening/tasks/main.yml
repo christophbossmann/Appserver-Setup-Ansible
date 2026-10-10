@@ -1,4 +1,8 @@
 ---
+- name: Hostname
+  ansible.builtin.import_tasks: hostname.yml
+  tags: [hostname]
+
 # ==========================================================
 # Phase 0: Time Sync (must run before apt to avoid "not valid yet" errors)
 # Handles all cases: chrony already installed, timesyncd available, or neither.
@@ -85,7 +89,11 @@
 # catches up a backlog) and hold /var/lib/dpkg/lock-frontend, breaking later
 # apt operations (tailscale install.sh, docker, ...) with a cryptic rc=100.
 # We stop the TIMERS (no new runs this play) and WAIT for any in-flight run to
-# finish gracefully -- we do NOT kill it mid-dpkg. Timers return on next boot.
+# finish gracefully -- we do NOT kill it mid-dpkg.
+# They MUST come back: a stopped timer stays stopped until reboot, i.e. no automatic
+# (security) updates. The playbooks restart them in post_tasks
+# (playbooks/tasks/apt_timers_restore.yml, after every role); the transient systemd
+# timer below is the safety net for a play that aborts before reaching post_tasks.
 # ----------------------------------------------------------
 - name: Stop apt background timers for the duration of this play
   ansible.builtin.systemd:
@@ -95,6 +103,14 @@
     - apt-daily.timer
     - apt-daily-upgrade.timer
   failed_when: false
+
+- name: Safety net — re-start the apt timers in 3h even if this play aborts
+  ansible.builtin.shell: |
+    systemctl stop apt-timers-restore.timer apt-timers-restore.service 2>/dev/null || true
+    systemctl reset-failed apt-timers-restore.service 2>/dev/null || true
+    systemd-run --unit=apt-timers-restore --on-active=3h \
+      /bin/systemctl start apt-daily.timer apt-daily-upgrade.timer
+  changed_when: false
 
 - name: Wait for any in-flight apt/dpkg lock to be released
   ansible.builtin.shell: |
@@ -108,6 +124,13 @@
       if [ "$(date +%s)" -ge "$deadline" ]; then
         echo "apt/dpkg lock still held after {{ apt_lock_wait_seconds | default(300) }}s by:" >&2
         fuser -v /var/lib/dpkg/lock-frontend >&2 2>&1 || true
+        echo "" >&2
+        echo "Usually unattended-upgrades clearing a backlog (e.g. right after a clock fix)." >&2
+        echo "Do NOT kill it mid-dpkg. Watch it, wait for the lock to free, then re-run this play:" >&2
+        echo "  sudo journalctl -u apt-daily-upgrade.service -f" >&2
+        echo "  sudo tail -f /var/log/unattended-upgrades/unattended-upgrades.log" >&2
+        echo "  sudo fuser /var/lib/dpkg/lock-frontend   # empty output = lock free -> safe to re-run" >&2
+        echo "Or give it more time on the next run:  -e apt_lock_wait_seconds=1200" >&2
         exit 1
       fi
       sleep 5
@@ -156,37 +179,81 @@
 - name: Configure swap
   when: hardening_swap_enabled
   block:
-    - name: Check if swapfile exists
-      ansible.builtin.stat:
-        path: "{{ hardening_swap_path }}"
-      register: _swap_file
+    # How much swap is already active EXCLUDING our own managed file? (e.g. the Ubuntu
+    # btrfs installer creates /swap.img). If that's already >= what we'd provide, we
+    # don't add a redundant swapfile — and we remove ours if a past run made one.
+    - name: Measure active swap that is NOT our managed swapfile (MB)
+      ansible.builtin.shell: >-
+        swapon --show=NAME,SIZE --bytes --noheadings
+        | awk -v me='{{ hardening_swap_path }}' '$1 != me {s += $2} END {print int(s/1048576)}'
+      register: _swap_other_mb
+      changed_when: false
+      check_mode: false
 
-    - name: Create swapfile
-      ansible.builtin.command: fallocate -l {{ hardening_swap_size_mb }}M {{ hardening_swap_path }}
-      when: not _swap_file.stat.exists
-      register: _swap_created
+    - name: Existing swap is sufficient — skip + remove our managed swapfile
+      when: (_swap_other_mb.stdout | trim | int) >= (hardening_swap_size_mb | int)
+      block:
+        - name: Disable + delete the managed swapfile (if present)
+          ansible.builtin.shell: |
+            set -e
+            P="{{ hardening_swap_path }}"
+            swapon --show=NAME --noheadings | grep -Fxq "$P" && swapoff "$P" || true
+            rm -f "$P"
+          args:
+            executable: /bin/bash
+          changed_when: true
 
-    - name: Set swapfile permissions
-      ansible.builtin.file:
-        path: "{{ hardening_swap_path }}"
-        owner: root
-        group: root
-        mode: "0600"
-      when: not _swap_file.stat.exists
+        - name: Drop the managed swapfile from fstab
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: '^{{ hardening_swap_path | regex_escape }}\s'
+            state: absent
 
-    - name: Format swapfile
-      ansible.builtin.command: mkswap {{ hardening_swap_path }}
-      when: not _swap_file.stat.exists
+        - name: Note — existing swap covers it
+          ansible.builtin.debug:
+            msg: >-
+              {{ _swap_other_mb.stdout | trim }} MB of swap already active
+              (>= {{ hardening_swap_size_mb }} MB) — not adding {{ hardening_swap_path }}.
 
-    - name: Enable swapfile
-      ansible.builtin.command: swapon {{ hardening_swap_path }}
-      when: not _swap_file.stat.exists
+    - name: Not enough swap — create our managed swapfile
+      when: (_swap_other_mb.stdout | trim | int) < (hardening_swap_size_mb | int)
+      block:
+        - name: Is our swapfile already active?
+          ansible.builtin.shell: "swapon --show=NAME --noheadings | grep -Fxq '{{ hardening_swap_path }}'"
+          register: _swap_active
+          changed_when: false
+          failed_when: false
+          check_mode: false
 
-    - name: Persist swapfile in fstab
-      ansible.builtin.lineinfile:
-        path: /etc/fstab
-        line: "{{ hardening_swap_path }} none swap sw 0 0"
-        state: present
+        - name: Create + enable the swapfile (btrfs-aware) when not active
+          # btrfs rejects a plain fallocate'd swapfile ("swapon: Invalid argument") — it
+          # requires NODATACOW (chattr +C on the empty file) + written with dd, not
+          # fallocate. Detect the fs and branch. Self-heals a stale/half-made file too.
+          ansible.builtin.shell: |
+            set -e
+            P="{{ hardening_swap_path }}"
+            [ -e "$P" ] && rm -f "$P"
+            FSTYPE=$(findmnt -no FSTYPE --target "$(dirname "$P")")
+            if [ "$FSTYPE" = "btrfs" ]; then
+              truncate -s 0 "$P"
+              chattr +C "$P"               # nodatacow — MUST be set while the file is empty
+              dd if=/dev/zero of="$P" bs=1M count={{ hardening_swap_size_mb }} status=none
+            else
+              fallocate -l {{ hardening_swap_size_mb }}M "$P"
+            fi
+            chmod 600 "$P"
+            mkswap "$P"
+            swapon "$P"
+          args:
+            executable: /bin/bash
+          when: _swap_active.rc != 0
+          changed_when: true
+
+        - name: Persist swapfile in fstab
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            line: "{{ hardening_swap_path }} none swap sw 0 0"
+            state: present
 
     - name: Set vm.swappiness
       ansible.posix.sysctl:
@@ -210,6 +277,16 @@
     name: fail2ban
     state: present
 
+- name: Deploy Caddy/Immich share basic-auth fail2ban filter
+  ansible.builtin.template:
+    src: filter-caddy-immich.conf.j2
+    dest: /etc/fail2ban/filter.d/caddy-immich.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: hardening_fail2ban_caddy_immich_enabled | default(false)
+  notify: Restart Fail2Ban
+
 - name: Configure Fail2Ban jail
   ansible.builtin.template:
     src: jail.local.j2
@@ -217,6 +294,19 @@
     owner: root
     group: root
     mode: "0644"
+  notify: Restart Fail2Ban
+
+# How long fail2ban remembers past bans — the window in which bans escalate.
+- name: Configure Fail2Ban ban history (dbpurgeage)
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/fail2ban.local
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/hardening). Ban history window for escalating bans.
+      [Definition]
+      dbpurgeage = {{ hardening_fail2ban_dbpurgeage }}
   notify: Restart Fail2Ban
 
 - name: Enable and start Fail2Ban
@@ -253,13 +343,45 @@
   register: ssh_password_auth
   notify: Restart SSH
 
+# The lines above alone are NOT enough: sshd_config `Include`s sshd_config.d/*.conf near
+# its TOP, and for sshd the FIRST value of a keyword wins. Ubuntu/cloud-init ships
+# sshd_config.d/50-cloud-init.conf with `PasswordAuthentication yes`, which therefore
+# silently overrode the `no` further down (seen on PROD: effective passwordauthentication
+# yes, ~1700 password brute-force attempts/day). A 00- drop-in sorts before any other, so
+# it wins regardless of what cloud-init or packages drop in later.
+- name: Enforce SSH auth policy via an early drop-in (wins over 50-cloud-init.conf)
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/00-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/hardening). Sorts first -> these values win.
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+    validate: '/usr/sbin/sshd -t -f %s'
+  register: ssh_dropin
+  notify: Restart SSH
+
 - name: Check if critical settings changed
   ansible.builtin.set_fact:
-    hardening_changed: "{{ ssh_root_login.changed or ssh_password_auth.changed }}"
+    hardening_changed: "{{ ssh_root_login.changed or ssh_password_auth.changed or ssh_dropin.changed }}"
 
 # Flush handlers so SSH restarts BEFORE UFW is enabled
 - name: Apply SSH changes before enabling firewall
   ansible.builtin.meta: flush_handlers
+
+# Check what sshd ACTUALLY uses (config files can override each other) — fail loudly
+# instead of trusting the file edits above.
+- name: Verify effective sshd auth policy
+  ansible.builtin.command: /usr/sbin/sshd -T
+  register: _sshd_effective
+  changed_when: false
+  check_mode: false
+  failed_when: >-
+    ('passwordauthentication no' not in _sshd_effective.stdout_lines) or
+    ('permitrootlogin no' not in _sshd_effective.stdout_lines)
 
 # ==========================================================
 # Phase 5: UFW Firewall
@@ -315,6 +437,68 @@
     msg: "Rollback job {{ rollback_job_id }} scheduled. Will auto-restore in {{ hardening_rollback_delay_minutes }} min if smoke test fails."
   when: hardening_changed
 
+# --- Spamhaus DROP (see defaults): ipsets first, then the UFW rules that use them -------
+- name: Spamhaus DROP ipsets
+  when: hardening_spamhaus_drop_enabled | default(false) | bool
+  block:
+    - name: Install ipset
+      ansible.builtin.apt:
+        name: ipset
+        state: present
+
+    - name: Install the spamhaus-drop script
+      ansible.builtin.copy:
+        src: spamhaus-drop
+        dest: /usr/local/sbin/spamhaus-drop
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install Spamhaus systemd units
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: "0644"
+      loop: [spamhaus-ipset.service, spamhaus-drop-update.service, spamhaus-drop-update.timer]
+      register: _spamhaus_units
+
+    # Sets must exist BEFORE ufw (re)loads rules referencing them.
+    - name: Create/restore the ipsets now and at every boot (before ufw)
+      ansible.builtin.systemd:
+        name: spamhaus-ipset.service
+        enabled: true
+        state: started
+        daemon_reload: "{{ _spamhaus_units.changed }}"
+
+    - name: Enable the daily list refresh
+      ansible.builtin.systemd:
+        name: spamhaus-drop-update.timer
+        enabled: true
+        state: started
+
+    - name: Fill the sets right away if they are still empty (first run)
+      ansible.builtin.shell: |
+        set -o pipefail
+        n=$(ipset list -t spamhaus-drop4 | awk '/Number of entries/ {print $NF}')
+        if [ "${n:-0}" -eq 0 ]; then systemctl start spamhaus-drop-update.service && echo FILLED; fi
+      register: _spamhaus_fill
+      changed_when: "'FILLED' in _spamhaus_fill.stdout"
+
+- name: Drop Spamhaus DROP sources at the start of UFW's input chains (v4 + v6)
+  ansible.builtin.blockinfile:
+    path: "/etc/ufw/{{ item.file }}"
+    marker: "# {mark} SPAMHAUS DROP"
+    insertafter: "^# End required lines"
+    block: |
+      -A {{ item.chain }} -m set --match-set {{ item.set }} src -j DROP
+  loop:
+    # NB: the IPv6 file names its chains ufw6-*, not ufw-*
+    - { file: before.rules, chain: ufw-before-input, set: spamhaus-drop4 }
+    - { file: before6.rules, chain: ufw6-before-input, set: spamhaus-drop6 }
+  loop_control: { label: "{{ item.file }}" }
+  when: hardening_spamhaus_drop_enabled | default(false) | bool
+  notify: Reload UFW
+
 - name: Configure Docker-UFW compatibility (DOCKER-USER chain)
   ansible.builtin.blockinfile:
     path: /etc/ufw/after.rules
@@ -322,6 +506,9 @@
     block: |
       *filter
       :DOCKER-USER - [0:0]
+      {% if hardening_spamhaus_drop_enabled | default(false) | bool %}
+      -A DOCKER-USER -m set --match-set spamhaus-drop4 src -j DROP
+      {% endif %}
       -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
       {% for item in hardening_ufw_full_access_ranges | default([]) %}
       {% if item.interface is defined %}
@@ -330,6 +517,9 @@
       -A DOCKER-USER -s {{ item.from_ip | default('any') }} -j RETURN
       {% endfor %}
       -A DOCKER-USER -s 172.16.0.0/12 -j RETURN
+      {% for p in hardening_docker_public_ports | default([]) %}
+      -A DOCKER-USER -p {{ p.proto | default('tcp') }} --dport {{ p.port }} -j RETURN
+      {% endfor %}
       -A DOCKER-USER -j DROP
       COMMIT
   when: hardening_docker_ufw_compat | default(true) | bool
@@ -377,3 +567,32 @@
   ansible.builtin.debug:
     msg: "Server already hardened. No changes applied."
   when: not hardening_changed
+
+# ==========================================================
+# Remove harmful provider-image cron hacks
+# Some VPS images (e.g. Contabo) ship hourly cron jobs that actively hurt
+# performance: dropping the page cache ("free") forces every service to
+# re-read everything from disk each hour (minutes of iowait spikes at :17),
+# and hourly fstrim is pointless — the weekly fstrim.timer covers TRIM.
+# ==========================================================
+- name: Remove harmful provider-image cron.hourly hacks
+  ansible.builtin.file:
+    path: "/etc/cron.hourly/{{ item }}"
+    state: absent
+  loop:
+    - free
+    - fstrim
+
+# ==========================================================
+# Remove a leftover installer 'scratchuser' account. The Ubuntu installer forces
+# creating an initial sudo user that we replace with admin_user/ansible later, so
+# the throwaway account should not linger. state=absent is idempotent (never
+# creates it; no-op when already gone). remove=true also drops its home dir;
+# force=true removes it even if it still owns processes / is logged in.
+# ==========================================================
+- name: Remove the leftover installer 'scratchuser' account
+  ansible.builtin.user:
+    name: "{{ hardening_scratchuser | default('scratchuser') }}"
+    state: absent
+    remove: true
+    force: true

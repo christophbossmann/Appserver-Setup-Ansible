@@ -1,0 +1,29 @@
+{
+  "oauth": {
+    "enabled": true,
+    "issuerUrl": "{{ authentik_oidc_issuer_base }}/immich/",
+    "clientId": "{{ immich_oidc_client_id }}",
+    "clientSecret": "{{ immich_oidc_client_secret }}",
+    "scope": "openid email profile",
+    "signingAlgorithm": "RS256",
+    "profileSigningAlgorithm": "none",
+    "storageLabelClaim": "preferred_username",
+    "roleClaim": "{{ immich_oidc_role_claim | default('immich_role') }}",
+    "buttonText": "{{ immich_oidc_button_text }}",
+    "autoRegister": {{ immich_oidc_auto_register | default(true) | lower }},
+    "autoLaunch": false,
+    "mobileOverrideEnabled": true,
+    "mobileRedirectUri": "https://{{ svc_edge_host['immich_int'] }}/api/oauth/mobile-redirect"
+  },
+  "storageTemplate": {
+    "enabled": {{ immich_storage_template_enabled | default(false) | lower }},
+    "hashVerificationEnabled": true,
+    "template": "{{ immich_storage_template }}"
+  },
+  "server": {
+    "externalDomain": "{{ immich_external_domain | default('') }}"
+  },
+  "ffmpeg": {
+    "acceptedVideoCodecs": {{ immich_accepted_video_codecs | default(['h264']) | to_json }}
+  }
+}

@@ -1,0 +1,40 @@
+# acme-dns config — managed by Ansible (stacks/acme_dns/configs/config.cfg.j2).
+[general]
+# DNS listener INSIDE the container (0.0.0.0:53); docker publishes it on the host's
+# PUBLIC IP only (see docker-compose ports).
+listen = "0.0.0.0:53"
+protocol = "both"
+# The zone this server is authoritative for (NS-delegated to us at the registrar).
+domain = "{{ acme_dns_domain }}"
+nsname = "{{ acme_dns_ns_hostname }}"
+nsadmin = "{{ acme_dns_ns_admin }}"
+# Static NS record for the delegated zone (points at THIS nameserver's hostname).
+# The A record for that hostname lives at the registrar (root zone). LE follows the
+# _acme-challenge CNAME here, then reads the per-account TXT (set via the API).
+records = [
+    "{{ acme_dns_domain }}. NS {{ acme_dns_ns_hostname }}.",
+]
+debug = false
+
+[database]
+engine = "sqlite3"
+connection = "/var/lib/acme-dns/acme-dns.db"
+
+[api]
+# API listens on 0.0.0.0 INSIDE the container; docker publishes it on 127.0.0.1 ONLY,
+# so the register/update (write) path is reachable only from the host (Caddy).
+ip = "0.0.0.0"
+port = "{{ acme_dns_api_port }}"
+# HTTP (no TLS): it is loopback-only, and Caddy talks to it via http://127.0.0.1.
+tls = "none"
+# Open registration stays on until our accounts are created, then flip to true
+# (acme_dns_disable_registration) to close the register endpoint.
+disable_registration = {{ acme_dns_disable_registration | default(false) | bool | lower }}
+corsorigins = ["*"]
+use_header = false
+header_name = "X-Forwarded-For"
+
+[logconfig]
+loglevel = "info"
+logtype = "stdout"
+logformat = "text"

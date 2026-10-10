@@ -1,0 +1,17 @@
+# Per-stack settings for compose_stack (see roles/compose_stack/defaults/main.yml).
+networks:
+  - backend          # shared net so headplane can reach the headscale API by name
+dirs:
+  - config          # -> /opt/headscale/config  (mounted /etc/headscale)
+  - data            # -> /opt/headscale/data     (mounted /var/lib/headscale: sqlite + keys)
+configs:
+  - { src: configs/config.yaml.j2, dest: config/config.yaml, mode: "0644" }
+pull: true
+# /health is an unauthenticated liveness endpoint; poll it from the host after up.
+health_url: "http://127.0.0.1:{{ headscale_port }}/health"
+health_status: [200]
+health_retries: 20
+health_delay: 3
+status_msg: >-
+  Headscale control server up at {{ headscale_server_url }} —
+  enrol a client with: tailscale up --login-server {{ headscale_server_url }} --authkey <preauthkey>

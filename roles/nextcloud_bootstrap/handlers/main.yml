@@ -1,0 +1,10 @@
+---
+# Restart the Nextcloud container to flush the mod_php OPcache. Needed after we
+# edit an app's PHP in place (e.g. the Maps CSP patch): OPcache serves the old
+# bytecode until revalidation, so a code change to the CSP would otherwise only
+# take effect after opcache.revalidate_freq (or a restart). Fires only when a
+# notifying task actually changed PHP, so steady-state deploys don't restart.
+- name: Restart Nextcloud to flush OPcache
+  ansible.builtin.command:
+    argv: [docker, restart, nextcloud]
+  when: not ansible_check_mode

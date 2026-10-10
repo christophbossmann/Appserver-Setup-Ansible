@@ -1,0 +1,13 @@
+# Managed by Ansible (roles/monitoring) — textfile collector: {{ item.name }}
+[Unit]
+Description=Run {{ item.name }} ({{ item.oncalendar }})
+
+[Timer]
+OnCalendar={{ item.oncalendar }}
+{% if item.onboot | default(true) %}
+OnBootSec=2min
+{% endif %}
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

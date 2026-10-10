@@ -83,17 +83,40 @@ docker ps                       # host containers
 playgroundctl playground ps     # separate rootless daemon
 ```
 
-## Public route + default app (fixed port)
+## Environments (multiple deploy targets)
 
-The host serves `playground.<host>` → `127.0.0.1:{{ playground_public_port }}`
-(route `caddy_route_playground` in `roles/claude_playground/defaults/caddy_route.yml`, targeting
-`localhost:8090`). On a fresh workspace the role seeds a tiny default
-`docker-compose.yml` — an `http-echo` container printing **"Welcome to
-Playground"** on that port — and brings it up via the broker, so the route works
-out of the box.
+The playground provides **N independent environments** (default `pg1`, `pg2`,
+`pg3`, set via `playground_environments`). **One** claude-ctl AI runtime + **one**
+broker manage all of them; the session picks the target per action with
+`--env <name>`. Each environment gets:
 
-Swap it freely: the AI (or you) can replace
-`/home/playground/workspace/docker-compose.yml` with any stack. The only contract
-is to keep one service published on `127.0.0.1:{{ playground_public_port }}` if
-the public page should keep working. Toggle with `playground_default_app_enabled`;
-change the port with `playground_public_port` (keep the Caddy route in sync).
+- its own workspace subdir `/home/playground/workspace/<env>`
+- its own loopback port `playground_env_base_port + <index>` (pg1→8100, pg2→8101, …)
+- its own Caddy route `<env>.<host>` (route `caddy_route_<env>`, external + basic_auth)
+
+The broker resolves `--env` against a **root-owned allowlist**
+(`environments.json`, rendered by Ansible from `playground_environments`). The
+sandbox only ever sends the env *key* — never a path or a port — so the lock-down
+model is preserved (no path traversal, broker provisions nothing).
+
+```bash
+playgroundctl playground envs                      # list envs + ports
+playgroundctl playground compose up   --env pg2    # deploy to pg2
+playgroundctl playground http get /   --env pg2    # verify pg2's app
+```
+
+On a fresh host the role seeds each env's subdir with a tiny **"Welcome to
+Playground"** default app on that env's port and brings it up via the broker, so
+every `<env>.<host>` route works out of the box. Replace
+`/home/playground/workspace/<env>/docker-compose.yml` with any stack — keep one
+service on that env's `127.0.0.1:<port>` if the public page should keep working.
+
+### Adding an environment (e.g. `pg4`)
+
+1. append `pg4` to `playground_environments`
+2. copy the `caddy_route_pg3` block to `caddy_route_pg4` in
+   `defaults/caddy_route.yml` and bump the port offset (+3)
+3. add `pg4: external` to the host's `caddy_services`
+
+then re-run the playbook. Toggle the default apps with
+`playground_default_app_enabled`.

@@ -27,6 +27,14 @@
 #                   {path, owner, group, mode}
 #   networks:       external Docker networks to create if missing (e.g. the
 #                   shared `backend` net that cross-stack compose files join)
+#   git_repo:       clone/update this repo to <dir>/<git_dest> before deploying
+#                   (private app repos: embed a read-only token in the URL from
+#                   the vault — the task runs with no_log). The compose template
+#                   references build contexts inside it (e.g. ./src/backend).
+#   git_version:    branch/tag/sha to check out (default: main)
+#   git_dest:       checkout dir relative to the stack dir (default: src)
+#   build:          run `docker compose up -d --build` so build:-based services
+#                   are (re)built from the checkout (default: false)
 #   configs:        files to deploy next to the compose file; dict
 #                   {src, dest, owner, group, mode} — src is relative to
 #                   stacks/<stack>/; *.j2 sources are templated, others copied
@@ -44,7 +52,7 @@
 stack: ""
 
 # Controller-side location of the stack definitions.
-compose_stack_src_root: "{{ inventory_dir }}/stacks"
+compose_stack_src_root: "{{ role_path }}/../../stacks"   # repo-relative: the inventory may live in a separate (private) repo
 compose_stack_src_dir: "{{ compose_stack_src_root }}/{{ stack }}"
 
 # Host-side base directory; the stack lives in <base>/<stack> unless

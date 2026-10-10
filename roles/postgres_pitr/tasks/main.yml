@@ -1,0 +1,176 @@
+---
+# PITR via WAL archiving + periodic base backups, per instance in
+# postgres_pitr_instances. Runs ONLY where postgres_pitr_enabled is true (host_vars).
+# The archive dir is bind-mounted into each container at /archive by the stack's
+# compose (guarded by the same flag), so this role must run AFTER those stacks.
+- name: PostgreSQL PITR
+  when: postgres_pitr_enabled | default(false) | bool
+  block:
+    # Fail-soft: only set up PITR for instances whose container is actually deployed on
+    # this host. postgres_pitr_instances lists every possible instance (e.g. the dev
+    # `postgres`), but a partial profile (business host) may not run all of them — a
+    # `docker exec <missing>` would abort the whole play. Filter to running containers.
+    - name: List running docker containers
+      ansible.builtin.command: docker ps --format '{{ "{{.Names}}" }}'
+      register: _pitr_running
+      changed_when: false
+
+    - name: Restrict PITR to instances whose container is deployed
+      ansible.builtin.set_fact:
+        postgres_pitr_instances: "{{ postgres_pitr_instances | default([]) | selectattr('container', 'in', _pitr_running.stdout_lines) | list }}"
+
+    - name: Show which instances PITR will configure
+      ansible.builtin.debug:
+        msg: "PITR configures: {{ (postgres_pitr_instances | map(attribute='container') | list) or ['(none deployed here)'] }}"
+
+    - name: Ensure the host archive directory exists
+      ansible.builtin.file:
+        path: "{{ item.host_archive }}"
+        state: directory
+        mode: "0700"
+      loop: "{{ postgres_pitr_instances }}"
+      loop_control: { label: "{{ item.name }}" }
+
+    # One-time move from the old /opt location (inside @, pinned by every root snapshot) to
+    # the @pg_archive subvolume. Only once the container ALREADY mounts the new path (its
+    # stack was recreated earlier in the play): copy without clobbering what postgres
+    # archived there meanwhile, then delete the old dir. Idempotent: no legacy dir -> no-op.
+    - name: Migrate the archive from its legacy location (one-time)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        OLD='{{ item.legacy_archive | default("") }}'; NEW='{{ item.host_archive }}'
+        [ -n "$OLD" ] && [ "$OLD" != "$NEW" ] && [ -d "$OLD" ] || { echo "OK nothing to migrate"; exit 0; }
+        SRC=$(docker inspect -f '{{ "{{range .Mounts}}{{.Destination}}={{.Source}} {{end}}" }}' '{{ item.container }}' | tr ' ' '\n' | sed -n 's#^/archive=##p')
+        [ "$SRC" = "$NEW" ] || { echo "SKIP container still mounts '$SRC' — redeploy its stack first"; exit 0; }
+        cp -a --no-clobber "$OLD"/. "$NEW"/
+        rm -rf "$OLD"
+        echo "CHANGED migrated $OLD -> $NEW"
+      args:
+        executable: /bin/bash
+      register: _pitr_migrate
+      changed_when: "'CHANGED' in _pitr_migrate.stdout"
+      loop: "{{ postgres_pitr_instances }}"
+      loop_control: { label: "{{ item.name }}" }
+
+    - name: Create + own the in-container archive subdirs (wal/ base/)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ item.container }}", sh, -c,
+               "mkdir -p /archive/wal /archive/base && chown -R postgres:postgres /archive && chmod -R 700 /archive"]
+      changed_when: false
+      loop: "{{ postgres_pitr_instances }}"
+      loop_control: { label: "{{ item.container }}" }
+
+    - name: Configure archiving (ALTER SYSTEM — persisted, applied on next restart)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ item.0.container }}", psql, -U, "{{ item.0.user }}",
+               -v, "ON_ERROR_STOP=1", -c, "ALTER SYSTEM SET {{ item.1 }}"]
+      changed_when: false
+      loop: "{{ postgres_pitr_instances | product(_pitr_settings) | list }}"
+      loop_control:
+        label: "{{ item.0.container }}: {{ item.1 }}"
+      vars:
+        _pitr_settings:
+          - "archive_mode = 'on'"
+          - "wal_level = 'replica'"
+          # gzip on archive: every segment is a FULL 16 MB file even when nearly empty
+          # (forced switches via archive_timeout) — the unused tail is zeros, so a mostly
+          # idle segment packs to a few KB. Written to .tmp + mv = never a half file under
+          # the final name. restore_command (playbooks/tasks/pitr_restore.yml) reads .gz
+          # AND plain files, so archives from before this change stay restorable.
+          - "archive_command = 'test ! -f /archive/wal/%f.gz && gzip -c %p > /archive/wal/%f.gz.tmp && mv /archive/wal/%f.gz.tmp /archive/wal/%f.gz'"
+          - "archive_timeout = '{{ postgres_pitr_archive_timeout }}'"
+
+    # archive_timeout / archive_command are reloadable (SIGHUP) — apply changes to them
+    # without a restart. (archive_mode / wal_level still need the one-time restart below.)
+    - name: Reload config so reloadable archiving settings take effect
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ item.container }}", psql, -U, "{{ item.user }}", -tAc, "SELECT pg_reload_conf()"]
+      changed_when: false
+      loop: "{{ postgres_pitr_instances }}"
+      loop_control: { label: "{{ item.container }}" }
+
+    - name: Check whether archiving is already active (avoid needless restarts)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ item.container }}", psql, -U, "{{ item.user }}", -tAc, "SHOW archive_mode"]
+      register: _pitr_amode
+      changed_when: false
+      loop: "{{ postgres_pitr_instances }}"
+      loop_control: { label: "{{ item.container }}" }
+
+    - name: Restart instances whose archive_mode isn't active yet (ONE-TIME)
+      ansible.builtin.command: "docker restart {{ item.0.container }}"
+      changed_when: true
+      loop: "{{ postgres_pitr_instances | zip(_pitr_amode.results) | list }}"
+      loop_control: { label: "{{ item.0.container }}" }
+      when: (item.1.stdout | default('') | trim) != 'on'
+
+    - name: Wait until each instance accepts connections again
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ item.container }}", pg_isready, -U, "{{ item.user }}"]
+      register: _pitr_ready
+      until: _pitr_ready.rc == 0
+      retries: 20
+      delay: 3
+      changed_when: false
+      loop: "{{ postgres_pitr_instances }}"
+      loop_control: { label: "{{ item.container }}" }
+
+    - name: Verify archiving is now on
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ item.container }}", psql, -U, "{{ item.user }}", -tAc, "SHOW archive_mode"]
+      register: _pitr_verify
+      changed_when: false
+      failed_when: (_pitr_verify.stdout | trim) != 'on'
+      loop: "{{ postgres_pitr_instances }}"
+      loop_control: { label: "{{ item.container }}" }
+
+    - name: Deploy the base-backup + retention script
+      ansible.builtin.template:
+        src: pg-pitr-backup.sh.j2
+        dest: /usr/local/bin/pg-pitr-backup
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy systemd service + timer (daily base backup)
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "/etc/systemd/system/{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - { src: pg-pitr-backup.service.j2, dest: pg-pitr-backup.service }
+        - { src: pg-pitr-backup.timer.j2, dest: pg-pitr-backup.timer }
+      register: _pitr_units
+
+    - name: systemd daemon-reload when units changed
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: _pitr_units.changed
+
+    - name: Enable + start the base-backup timer
+      ansible.builtin.systemd:
+        name: pg-pitr-backup.timer
+        enabled: true
+        state: started
+
+    - name: Does each instance already have a base backup?
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ item.container }}", sh, -c, "ls -1 /archive/base 2>/dev/null | wc -l"]
+      register: _pitr_basecount
+      changed_when: false
+      loop: "{{ postgres_pitr_instances }}"
+      loop_control: { label: "{{ item.container }}" }
+
+    - name: Take an initial base backup where none exists yet (PITR anchor)
+      ansible.builtin.command: "/usr/local/bin/pg-pitr-backup {{ item.0.name }}"
+      changed_when: true
+      loop: "{{ postgres_pitr_instances | zip(_pitr_basecount.results) | list }}"
+      loop_control: { label: "{{ item.0.name }}" }
+      when: (item.1.stdout | default('0') | trim | int) == 0
+
+    - name: PITR ready
+      ansible.builtin.debug:
+        msg: >-
+          PITR active for: {{ postgres_pitr_instances | map(attribute='name') | join(', ') }}.
+          WAL -> <host_archive>/wal, base backups -> /base (daily via pg-pitr-backup.timer),
+          retention {{ postgres_pitr_retention_days }}d. Restore: playbooks/postgres-pitr-restore.yml.

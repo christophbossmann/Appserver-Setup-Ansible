@@ -46,10 +46,25 @@ services:
       KOMODO_PASSKEY: "{{ komodo_passkey }}"
       KOMODO_HOST: "{{ komodo_host }}"
       KOMODO_LOCAL_AUTH: "{{ komodo_local_auth | lower }}"
+      # First user to log in becomes admin. With init_admin OFF, that's the first
+      # OIDC login (akadmin). Enable to seed a local break-glass admin instead.
+      KOMODO_ENABLE_NEW_USERS: "{{ komodo_enable_new_users | default(false) | lower }}"
+{% if komodo_init_admin_enabled | default(false) %}
       KOMODO_INIT_ADMIN_USERNAME: "{{ komodo_init_admin_username }}"
       KOMODO_INIT_ADMIN_PASSWORD: "{{ komodo_init_admin_password }}"
+{% endif %}
       KOMODO_FIRST_SERVER_NAME: "{{ komodo_first_server_name }}"
       KOMODO_FIRST_SERVER_ADDRESS: "{{ komodo_first_server_address }}"
+      # Default is 15-sec; the constant stats polling into ferretdb/postgres
+      # was a measurable share of idle CPU. 60s is plenty for a homelab.
+      KOMODO_MONITORING_INTERVAL: "{{ komodo_monitoring_interval }}"
+{% if komodo_oidc_enabled | default(false) %}
+      # === Native OIDC (Authentik SSO) — local auth above stays as break-glass ===
+      KOMODO_OIDC_ENABLED: "true"
+      KOMODO_OIDC_PROVIDER: "{{ komodo_oidc_provider }}"
+      KOMODO_OIDC_CLIENT_ID: "{{ komodo_oidc_client_id }}"
+      KOMODO_OIDC_CLIENT_SECRET: "{{ komodo_oidc_client_secret }}"
+{% endif %}
 
   periphery:
     image: {{ komodo_periphery_image }}

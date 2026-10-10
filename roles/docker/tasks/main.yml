@@ -45,3 +45,53 @@
     append: true
   loop: "{{ docker_users }}"
   when: docker_users | length > 0
+
+# --- no-swap containers: survive systemd daemon-reloads (see defaults) ---------------
+- name: Keep no-swap containers swap-free (docker-swap-sync)
+  when: docker_swap_sync_enabled | bool
+  block:
+    - name: Install docker-swap-sync
+      ansible.builtin.copy:
+        src: docker-swap-sync
+        dest: /usr/local/bin/docker-swap-sync
+        owner: root
+        group: root
+        mode: "0755"
+      register: _dss_bin
+
+    - name: Install docker-swap-sync.service
+      ansible.builtin.template:
+        src: docker-swap-sync.service.j2
+        dest: /etc/systemd/system/docker-swap-sync.service
+        owner: root
+        group: root
+        mode: "0644"
+      register: _dss_unit
+
+    - name: Enable + (re)start docker-swap-sync
+      ansible.builtin.systemd:
+        name: docker-swap-sync.service
+        enabled: true
+        state: "{{ 'restarted' if (_dss_bin.changed or _dss_unit.changed) else 'started' }}"
+        daemon_reload: "{{ _dss_unit.changed }}"
+
+# --- weekly prune of unused images + build cache (see defaults) -----------------------
+- name: Weekly docker prune
+  when: docker_prune_enabled | bool
+  block:
+    - name: Install docker-prune service + timer
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: [docker-prune.service, docker-prune.timer]
+      register: _dprune_units
+
+    - name: Enable docker-prune.timer
+      ansible.builtin.systemd:
+        name: docker-prune.timer
+        enabled: true
+        state: started
+        daemon_reload: "{{ _dprune_units.changed }}"

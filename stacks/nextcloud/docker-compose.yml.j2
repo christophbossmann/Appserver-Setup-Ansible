@@ -1,0 +1,130 @@
+services:
+  # One-shot init against the business postgres instance (same pattern as immich):
+  # least-privilege role + database; password re-synced from the vault on every
+  # recreate. Nextcloud's installer creates the schema itself.
+  nextcloud-db-init:
+    image: {{ postgres_image }}
+    container_name: nextcloud-db-init
+    restart: "no"
+    environment:
+      PGPASSWORD: "{{ nextcloud_db_admin_password | default(postgres_password) }}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until pg_isready -h {{ nextcloud_db_host | default('postgres') }} -U {{ nextcloud_db_admin_user | default(postgres_user) }}; do sleep 2; done
+        PSQL="psql -h {{ nextcloud_db_host | default('postgres') }} -U {{ nextcloud_db_admin_user | default(postgres_user) }} -v ON_ERROR_STOP=1"
+        $$PSQL -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ nextcloud_db_user }}'" | grep -q 1 \
+          || $$PSQL -d postgres -c "CREATE ROLE {{ nextcloud_db_user }} LOGIN"
+        $$PSQL -d postgres -c "ALTER ROLE {{ nextcloud_db_user }} WITH LOGIN PASSWORD '{{ nextcloud_db_password }}'"
+        $$PSQL -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='{{ nextcloud_db_name }}'" | grep -q 1 \
+          || createdb -h {{ nextcloud_db_host | default('postgres') }} -U {{ nextcloud_db_admin_user | default(postgres_user) }} -O {{ nextcloud_db_user }} {{ nextcloud_db_name }}
+        $$PSQL -d postgres -c "ALTER DATABASE {{ nextcloud_db_name }} OWNER TO {{ nextcloud_db_user }}"
+
+  nextcloud-redis:
+    image: {{ nextcloud_redis_image }}
+    container_name: nextcloud-redis
+    restart: unless-stopped
+
+  nextcloud:
+    image: {{ nextcloud_image }}
+    container_name: nextcloud
+    restart: unless-stopped
+    depends_on:
+      nextcloud-db-init:
+        condition: service_completed_successfully
+      nextcloud-redis:
+        condition: service_started
+    environment:
+      POSTGRES_HOST: {{ nextcloud_db_host | default('postgres') }}
+      POSTGRES_DB: "{{ nextcloud_db_name }}"
+      POSTGRES_USER: "{{ nextcloud_db_user }}"
+      POSTGRES_PASSWORD: "{{ nextcloud_db_password }}"
+      REDIS_HOST: nextcloud-redis
+      # First-install bootstrap only (ignored once installed):
+      NEXTCLOUD_ADMIN_USER: "{{ nextcloud_admin_user }}"
+      NEXTCLOUD_ADMIN_PASSWORD: "{{ nextcloud_admin_password }}"
+      NEXTCLOUD_TRUSTED_DOMAINS: "{{ nextcloud_hostname }}"
+      # Separate data dir -> precise backup target ({{ nextcloud_data_dir }}).
+      NEXTCLOUD_DATA_DIR: /var/www/data
+      # Caddy (host process) terminates TLS in front of us:
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: "{{ nextcloud_hostname }}"
+      OVERWRITECLIURL: "https://{{ nextcloud_hostname }}"
+      TRUSTED_PROXIES: "172.16.0.0/12"
+    volumes:
+      - {{ nextcloud_html_dir }}:/var/www/html
+      - {{ nextcloud_data_dir }}:/var/www/data
+    ports:
+      # Loopback only; Caddy fronts it at {{ nextcloud_hostname }}.
+      - "127.0.0.1:{{ nextcloud_port }}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost/status.php | grep -q installed"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # Background jobs every 5 min (official image cron entrypoint). Same volumes/
+  # env as the app so occ + jobs see the identical instance.
+  nextcloud-cron:
+    image: {{ nextcloud_image }}
+    container_name: nextcloud-cron
+    restart: unless-stopped
+    entrypoint: /cron.sh
+    depends_on:
+      nextcloud:
+        condition: service_started
+    environment:
+      POSTGRES_HOST: {{ nextcloud_db_host | default('postgres') }}
+      POSTGRES_DB: "{{ nextcloud_db_name }}"
+      POSTGRES_USER: "{{ nextcloud_db_user }}"
+      POSTGRES_PASSWORD: "{{ nextcloud_db_password }}"
+      REDIS_HOST: nextcloud-redis
+      NEXTCLOUD_DATA_DIR: /var/www/data
+    volumes:
+      - {{ nextcloud_html_dir }}:/var/www/html
+      - {{ nextcloud_data_dir }}:/var/www/data
+{% if nextcloud_webdav_enabled | default(false) %}
+
+  # Read-only RAW WebDAV over the data dir — inspection/spot-recovery ONLY. For
+  # normal file access use Nextcloud's own WebDAV (/remote.php/dav) which keeps the
+  # DB file cache consistent; writing through this raw view would desync oc_filecache
+  # (files look missing until `occ files:scan`) — the :ro bind AND --read-only block
+  # it anyway. Loopback-only; reach via the INTERNAL Caddy route
+  # webdav-nextcloud.int.<host> (Tailscale) with an Authentik login
+  # (webdav-nextcloud-users, LDAP bind). Runs as root only to READ files of any owner.
+  nextcloud-webdav:
+    image: "{{ 'rclone-ldap:local' if nextcloud_webdav_ldap | default(false) else 'rclone/rclone:latest' }}"
+{% if nextcloud_webdav_ldap | default(false) %}
+    pull_policy: never   # rclone-ldap:local is built locally (roles/rclone_ldap_image)
+{% endif %}
+    container_name: nextcloud-webdav
+    restart: unless-stopped
+    user: "0:0"
+    command: >
+      serve webdav {{ '' if nextcloud_webdav_ldap | default(false) else '/data' }}
+      --addr :8888
+      --read-only
+{% if nextcloud_webdav_ldap | default(false) %}
+      --auth-proxy /usr/local/bin/auth-proxy.sh
+{% else %}
+      --user {{ nextcloud_webdav_user }}
+      --pass {{ nextcloud_webdav_password }}
+{% endif %}
+      --dir-cache-time {{ nextcloud_webdav_cachetime }}
+{% if nextcloud_webdav_ldap | default(false) %}
+    environment:
+      # WebDAV login = an Authentik user in webdav-nextcloud-users (LDAP bind).
+      LDAP_BASE_DN: "{{ nextcloud_webdav_ldap_base_dn }}"
+{% endif %}
+    volumes:
+      - {{ nextcloud_data_dir }}:/data:ro
+    ports:
+      # Loopback only — reach via the internal Caddy route or an SSH tunnel.
+      - "127.0.0.1:{{ nextcloud_webdav_port }}:8888"
+{% endif %}
+
+networks:
+  default:
+    name: backend
+    external: true

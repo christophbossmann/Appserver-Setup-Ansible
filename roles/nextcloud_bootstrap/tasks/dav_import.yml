@@ -1,0 +1,163 @@
+---
+# Generic DAV importer — included once per manifest entry (item = the entry).
+# Handles CONTACTS (CardDAV / vCard) and CALENDARS + TASKS (CalDAV / iCal), driven
+# by vars passed from the include in main.yml:
+#   _nc_mode    : 'carddav' | 'caldav'
+#   _nc_colldef : default collection slug when the item omits `slug`
+#                 ('contacts' = the built-in book for carddav, '' else)
+# The collection slug is the item's `slug` (uniform across all three categories).
+#
+# Mechanism (proven live): there is no `occ` import, so objects go in over Dav.
+# A staged file is `docker cp`-ed into the container, split per object, and each
+# object PUT to <collection>/<UID>.<ext> -> idempotent by UID (re-import updates
+# in place, never duplicates). Guarded by a content-hash marker in appconfig, so a
+# normal deploy does nothing. The target account is auto-created if missing
+# (nextcloud_imports_create_users) so imports work before a user's first login.
+
+- name: "Resolve import target for {{ item.user }} <- {{ item.file }}"
+  ansible.builtin.set_fact:
+    _ci_user: "{{ item.user }}"
+    _ci_coll: "{{ item.slug | default(_nc_colldef) }}"
+    _ci_hash: "{{ lookup('file', role_path ~ '/files/imports/' ~ item.file) | hash('sha256') }}"
+
+- name: "Require a collection slug for CalDAV import ({{ item.file }})"
+  ansible.builtin.assert:
+    that: (_ci_coll | default('')) | length > 0
+    fail_msg: "calendars/tasks entries need a 'slug' (item: {{ item }})"
+  when: _nc_mode == 'caldav'
+
+- name: "Read last-import marker ({{ _ci_user }}/{{ _nc_mode }}/{{ _ci_coll }})"
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, config:app:get, nextcloud_bootstrap, "import_{{ _ci_user }}_{{ _nc_mode }}_{{ _ci_coll }}"]
+  register: _ci_marker
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Only stage + import when the file content differs from the last import.
+- name: "Stage import file on the host: {{ item.file }}"
+  ansible.builtin.copy:
+    src: "imports/{{ item.file }}"
+    dest: /tmp/ans_import_stage
+    mode: "0600"
+  when:
+    - not ansible_check_mode
+    - (_ci_marker.stdout | default('') | trim) != _ci_hash
+
+- name: "Import {{ _nc_mode }} '{{ _ci_coll }}' into '{{ _ci_user }}'"
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -euo pipefail
+      docker cp /tmp/ans_import_stage nextcloud:/tmp/ansible_import
+      docker exec -u root nextcloud chown www-data:www-data /tmp/ansible_import
+      rm -f /tmp/ans_import_stage
+      docker exec -i -u www-data \
+        -e IMP_USER='{{ _ci_user }}' \
+        -e IMP_COLL='{{ _ci_coll }}' \
+        -e IMP_MODE='{{ _nc_mode }}' \
+        -e IMP_HOST='{{ nextcloud_hostname }}' \
+        -e IMP_HASH='{{ _ci_hash }}' \
+        -e IMP_NAME='{{ item.name | default("") }}' \
+        -e IMP_CREATE='{{ (nextcloud_imports_create_users | default(true)) | ternary("true", "false") }}' \
+        nextcloud sh -s <<'INNER'
+      MARK="import_${IMP_USER}_${IMP_MODE}_${IMP_COLL}"
+      # NOTE the DAV path asymmetry in Nextcloud: address books live under
+      # /addressbooks/users/<user>/, calendars under /calendars/<user>/ (no 'users').
+      if [ "$IMP_MODE" = carddav ]; then
+        DAVBASE=addressbooks/users; EXT=vcf; CTYPE='text/vcard; charset=utf-8'
+        LISTCMD=dav:list-addressbooks; CREATECMD=dav:create-addressbook; DEFAULT_COLL=contacts
+      else
+        DAVBASE=calendars; EXT=ics; CTYPE='text/calendar; charset=utf-8'
+        LISTCMD=dav:list-calendars; CREATECMD=dav:create-calendar; DEFAULT_COLL=
+      fi
+      # 1) pre-provision the account if missing (works before first SSO login)
+      if ! php occ user:info "$IMP_USER" >/dev/null 2>&1; then
+        if [ "$IMP_CREATE" != true ]; then echo "IMPORT_FAILED user-missing:$IMP_USER"; rm -f /tmp/ansible_import; exit 1; fi
+        NP=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
+        if ! OC_PASS="$NP" php occ user:add --password-from-env "$IMP_USER" >/dev/null 2>&1; then
+          echo "IMPORT_FAILED user-create:$IMP_USER"; rm -f /tmp/ansible_import; exit 1
+        fi
+        echo "CREATED_USER $IMP_USER"
+      fi
+      # 2) ensure the target collection exists (default carddav 'contacts' always does).
+      #    NEWCOLL=1 marks a freshly created collection (gets its pretty display name).
+      NEWCOLL=0
+      if [ "$IMP_MODE" = carddav ] && [ "$IMP_COLL" = "$DEFAULT_COLL" ]; then
+        :
+      elif ! php occ "$LISTCMD" "$IMP_USER" 2>/dev/null | awk -F'|' 'NR>3{for(i=2;i<=3;i++){v=$i;gsub(/^ +| +$/,"",v);if(v!="")print v}}' | grep -Fxq "$IMP_COLL"; then
+        php occ "$CREATECMD" "$IMP_USER" "$IMP_COLL" >/dev/null 2>&1 || true
+        NEWCOLL=1
+      fi
+      # 3) ephemeral app-password for Dav Basic auth
+      RAW=$(php occ user:add-app-password "$IMP_USER" -n 2>&1)
+      TOKEN=$(printf '%s\n' "$RAW" | grep -oE '[A-Za-z0-9]{40,}' | tail -1)
+      if [ -z "$TOKEN" ]; then echo "IMPORT_FAILED no-token"; rm -f /tmp/ansible_import; exit 1; fi
+      TID=$(php occ user:auth-tokens:list "$IMP_USER" 2>/dev/null | awk -F'|' '$2 ~ /[0-9]/ {gsub(/ /,"",$2); id=$2} END{print id}')
+      # 3b) on a NEWLY created collection, set the pretty display name (PROPPATCH).
+      #     Only on create -> a later rename in the UI is never overwritten.
+      if [ "$NEWCOLL" = 1 ] && [ -n "$IMP_NAME" ]; then
+        ESC=$(printf '%s' "$IMP_NAME" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+        curl -s -o /dev/null -u "$IMP_USER:$TOKEN" -H "Host: $IMP_HOST" -H 'Content-Type: text/xml; charset=utf-8' -X PROPPATCH \
+          --data "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propertyupdate xmlns:d=\"DAV:\"><d:set><d:prop><d:displayname>$ESC</d:displayname></d:prop></d:set></d:propertyupdate>" \
+          "http://localhost/remote.php/dav/$DAVBASE/$IMP_USER/$IMP_COLL/"
+      fi
+      # 4) split the file into individual objects
+      rm -f /tmp/impobj_*
+      if [ "$IMP_MODE" = carddav ]; then
+        awk '/BEGIN:VCARD/{c++} c>0 {print > ("/tmp/impobj_" c "." "vcf")}' /tmp/ansible_import
+      else
+        awk '
+        function strip(s){ sub(/\r$/,"",s); return s }
+        {
+          l=strip($0)
+          if(l=="BEGIN:VCALENDAR"||l=="END:VCALENDAR") next
+          if(l ~ /^BEGIN:(VEVENT|VTODO|VJOURNAL|VFREEBUSY)/){ inc=1; cur=l "\n"; uid=""; next }
+          if(inc && l ~ /^END:(VEVENT|VTODO|VJOURNAL|VFREEBUSY)/){ cur=cur l "\n"; inc=0; if(uid=="") uid="nouid-" (++nn); bucket[uid]=bucket[uid] cur; next }
+          if(inc){ cur=cur l "\n"; if(l ~ /^UID:/) uid=substr(l,5); next }
+          if(l ~ /^BEGIN:VTIMEZONE/){ intz=1; tz=tz l "\n"; next }
+          if(intz){ tz=tz l "\n"; if(l ~ /^END:VTIMEZONE/) intz=0; next }
+          if(l ~ /^(VERSION|PRODID|CALSCALE|METHOD|X-)/) hdr=hdr l "\n"
+        }
+        END{
+          if(hdr=="") hdr="VERSION:2.0\nPRODID:-//ansible//import//EN\n"
+          n=0
+          for(u in bucket){ n++; f="/tmp/impobj_" n ".ics"; printf "BEGIN:VCALENDAR\n%s%s%sEND:VCALENDAR\n", hdr, tz, bucket[u] > f }
+        }' /tmp/ansible_import
+      fi
+      # 5) PUT each object, keyed by its UID
+      ok=0; fail=0; total=0
+      for f in /tmp/impobj_*; do
+        [ -f "$f" ] || continue
+        total=$((total+1))
+        U=$(grep -iE '^UID:' "$f" | head -1 | sed 's/\r$//; s/^[Uu][Ii][Dd]://')
+        if [ -z "$U" ]; then
+          U=$(cat /proc/sys/kernel/random/uuid)
+          if [ "$IMP_MODE" = carddav ]; then
+            sed -i "0,/BEGIN:VCARD/s//BEGIN:VCARD\nUID:$U/" "$f"
+          else
+            sed -i "0,/^BEGIN:\(VEVENT\|VTODO\|VJOURNAL\)/s//&\nUID:$U/" "$f"
+          fi
+        fi
+        SAFE=$(printf '%s' "$U" | tr ' /#?%' '_____')
+        code=$(curl -s -o /dev/null -w '%{http_code}' -u "$IMP_USER:$TOKEN" -H "Host: $IMP_HOST" \
+          -H "Content-Type: $CTYPE" -X PUT --data-binary @"$f" \
+          "http://localhost/remote.php/dav/$DAVBASE/$IMP_USER/$IMP_COLL/$SAFE.$EXT")
+        case "$code" in 201|204) ok=$((ok+1)) ;; *) fail=$((fail+1)) ;; esac
+      done
+      [ -n "$TID" ] && php occ user:auth-tokens:delete "$IMP_USER" "$TID" >/dev/null 2>&1
+      rm -f /tmp/ansible_import /tmp/impobj_*
+      if [ "$total" -eq 0 ]; then echo "IMPORT_FAILED no-objects-in-file"; exit 1; fi
+      if [ "$fail" -eq 0 ]; then
+        php occ config:app:set nextcloud_bootstrap "$MARK" --value "$IMP_HASH" >/dev/null 2>&1
+        echo "IMPORT_CHANGED ok=$ok/$total"
+      else
+        echo "IMPORT_FAILED ok=$ok fail=$fail total=$total"; exit 1
+      fi
+      INNER
+  register: _nc_import
+  changed_when: "'IMPORT_CHANGED' in (_nc_import.stdout | default(''))"
+  failed_when: _nc_import.rc != 0 or ('IMPORT_FAILED' in (_nc_import.stdout | default('')))
+  when:
+    - not ansible_check_mode
+    - (_ci_marker.stdout | default('') | trim) != _ci_hash

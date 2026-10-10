@@ -1,15 +1,74 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/postgres.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
 ---
 # Postgres stack defaults (was roles/postgres/defaults/main.yml).
 # Credentials are overridden per play via vars/postgres.yml.
 # Image convention (repo-wide): templates reference ONLY <name>_image;
 # <service>_version is the bump knob the _image default is composed from.
 # Override _image entirely for registry mirrors or @sha256 digest pins.
+#
+# Immich's postgres build: standard upstream postgres 16 + the VectorChord
+# extension Immich requires. Drop-in compatible (same major version, same data
+# dir) — n8n and other consumers are unaffected. Tags:
+# https://github.com/immich-app/base-images/pkgs/container/postgres
 postgres_version: "16"
-postgres_image: "postgres:{{ postgres_version }}"
-postgres_data_dir: /opt/postgres/data
+postgres_vectorchord_version: "0.4.3"
+postgres_image: "ghcr.io/immich-app/postgres:{{ postgres_version }}-vectorchord{{ postgres_vectorchord_version }}"
+postgres_data_dir: "{{ data_root_dev }}/db"           # dev domain (n8n DB instance)
 postgres_port: 5432
 
-# Credentials — override in vars
+# Credentials — secret values live in group_vars/all/vault.yml.
 postgres_user: "n8n"
-postgres_password: "changeme"
+postgres_password: "{{ vault_postgres_password }}"
 postgres_db: "n8n"
+
+# === Business Postgres instance (nextcloud + immich) =========================
+# A SECOND instance so the important business apps (Nextcloud + Immich) can be
+# PITR-rolled-back / upgraded independently of the shared n8n/experimental one.
+# Needs the vectorchord image (Immich). n8n stays on the `postgres` instance above.
+postgres_business_image: "{{ postgres_image }}"        # vectorchord (immich needs it)
+postgres_business_container: postgres-business
+postgres_business_user: "business"                    # instance superuser (bootstrap only)
+postgres_business_password: "{{ vault_postgres_business_password }}"
+postgres_business_db: "business"
+postgres_business_data_dir: "{{ data_root_business }}/db/data"   # business DB subvolume (@business_db); PGDATA in data/ so .snapshots stays out of PGDATA
+postgres_business_port: 5434                           # host loopback (5432=shared, 5433=supabase-pooler)
+# App DB host + admin creds: nextcloud & immich point here (default was `postgres`).
+nextcloud_db_host: "{{ postgres_business_container }}"
+nextcloud_db_admin_user: "{{ postgres_business_user }}"
+nextcloud_db_admin_password: "{{ postgres_business_password }}"
+immich_db_host: "{{ postgres_business_container }}"
+immich_db_admin_user: "{{ postgres_business_user }}"
+immich_db_admin_password: "{{ postgres_business_password }}"
+
+# === PITR (Point-in-Time Recovery) via WAL archiving =========================
+# Continuous WAL archiving + periodic base backups let you restore the WHOLE
+# postgres cluster (all its DBs together) to any second within the retention
+# window. Complements the logical pg_dumps (which only capture the dump instant).
+#
+# SAFE DEFAULT = OFF everywhere. Turn it on PER HOST in host_vars (so a host that
+# doesn't run these instances — e.g. Contabo — never gets it by accident):
+#   host_vars/<host>.yml:  postgres_pitr_enabled: true
+#
+# NOTE: enabling archive_mode needs a ONE-TIME restart of each instance (brief
+# downtime for all DBs on it). The WAL archive grows with write activity — Immich
+# imports produce a lot of WAL, so watch disk on the archive dirs.
+postgres_pitr_enabled: false
+postgres_pitr_retention_days: 7           # keep WAL + base backups this many days
+postgres_pitr_basebackup_oncalendar: "*-*-* 02:15:00"   # daily base backup (systemd)
+# Force a WAL switch at least every N s. Every switch archives a FULL 16 MB segment, even
+# when nearly empty: 300 s = 288/day = ~4.6 GB/day PER INSTANCE while idle (~32 GB per
+# instance over the 7-day window). 3600 s = ~384 MB/day. Only matters for TOTAL host loss
+# (archive lives on the same box): up to 1 h of DB changes. A normal PITR restore still
+# reaches any target — pitr_restore.yml carries over the not-yet-archived WAL.
+postgres_pitr_archive_timeout: 3600
+# Each instance = one postgres container. `user` is its SUPERUSER (for pg_basebackup);
+# `host_archive` is the host dir bind-mounted to /archive inside that container (the
+# matching mount is added to the stack's compose, guarded by postgres_pitr_enabled) —
+# under pg_archive_root, the dedicated no-snapshot subvolume (group_vars/all/storage.yml).
+# `legacy_archive` = the pre-subvolume location under /opt (inside @, so pinned by every
+# root snapshot); roles/postgres_pitr migrates its content once and removes it.
+postgres_pitr_instances:
+  - { name: postgres,          container: postgres,           user: "{{ postgres_user }}",          host_archive: "{{ pg_archive_root }}/postgres",          legacy_archive: /opt/postgres/archive }
+  - { name: authentik,         container: authentik-postgres, user: authentik,                      host_archive: "{{ pg_archive_root }}/authentik",         legacy_archive: /opt/authentik/pg-archive }
+  - { name: postgres-business, container: postgres-business,  user: "{{ postgres_business_user }}",  host_archive: "{{ pg_archive_root }}/postgres-business", legacy_archive: /opt/postgres-business/archive }

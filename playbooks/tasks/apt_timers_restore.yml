@@ -1,0 +1,15 @@
+---
+# Counterpart of roles/hardening "Stop apt background timers" (Phase 0c): start
+# apt-daily + apt-daily-upgrade again at the very END of the play — post_tasks run after
+# every role, so background apt can't grab the dpkg lock mid-play, yet automatic
+# (security) updates are back right after. (A handler would not do: roles that run
+# `meta: flush_handlers` mid-play, e.g. storagebox, would fire it far too early.)
+# Also cancels the 3h safety-net timer the hardening role armed for aborted plays.
+- name: Re-start apt background timers (automatic updates)
+  ansible.builtin.shell: |
+    systemctl start apt-daily.timer apt-daily-upgrade.timer
+    systemctl stop apt-timers-restore.timer 2>/dev/null || true
+    systemctl is-active apt-daily.timer apt-daily-upgrade.timer
+  register: _apt_timers
+  changed_when: false
+  failed_when: _apt_timers.rc != 0

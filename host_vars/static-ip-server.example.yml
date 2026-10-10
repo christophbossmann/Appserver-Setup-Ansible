@@ -14,7 +14,7 @@ users:
     sudo: true
     password: "{{ 'CHANGEME' | password_hash('sha512', 'YOURSALT') }}"
     ssh_keys:
-      - "{{ lookup('file', '~/.ssh/deploy_key.pub') }}"
+      - "{{ lookup('file', ssh_pubkey_dir ~ '/deploy_key.pub') }}"
 
 docker_users:
   - ansible
@@ -77,12 +77,9 @@ caddy_tls_mode: acme_dns
 #caddy_acme_dns_verify_ns: "ns1.desec.io" #Optional override for faster CNAME verification with set dns nameserver
 caddy_manage_ufw: false
 # caddy_cloudflare_api_token not needed for acme_dns mode
-
-# acme-dns registration backup on the controller (~/.ansible/acmedns/<host>.json).
-# The caddy role fetches it after every run AND automatically re-seeds a fresh
-# server from it (see caddy_acme_dns_seed_credentials default) — a wiped
-# /etc/caddy keeps its registration and the existing CNAME stays valid.
-caddy_acme_dns_credentials_backup_path: "~/.ansible/acmedns/{{ inventory_hostname }}.json"
+# acme-dns credentials are seeded DECLARATIVELY by the acme_dns_bootstrap role from
+# acme_dns_accounts (group_vars/all/acme_dns.yml) — fixed UUIDs re-created from git on every
+# rebuild, so the registrar CNAMEs never change. No controller-side backup/seed needed.
 
 # Optional: custom root CAs for caddy_tls_mode=internal.
 # Caddy uses these instead of auto-generating its own CA.
@@ -153,7 +150,13 @@ caddy_services:
   n8n: external
   webdav_n8n: internal
   playwright_mcp: internal
-  playground: external
+  # Playground deploy environments (one route each). Keep in sync with
+  # playground_environments in the claude_playground role.
+  pg1: external
+  pg2: external
+  pg3: external
+  pg4: external
+  pg5: external
 
 route_int:
   caddy_tls_mode: inherit

@@ -1,0 +1,16 @@
+# Managed by Ansible (roles/hardening). Creates/restores the Spamhaus DROP ipsets BEFORE
+# ufw starts — ufw's rule files reference them and would fail to load without them.
+[Unit]
+Description=Spamhaus DROP ipsets (restore before ufw)
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target ufw.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/spamhaus-drop restore
+
+[Install]
+WantedBy=multi-user.target ufw.service

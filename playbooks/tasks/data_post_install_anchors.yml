@@ -1,0 +1,26 @@
+---
+# Post-install anchor snapshots for the DATA subvolumes (ans_post_install).
+#
+# Runs from server-all.yml's post_tasks — AFTER the whole deploy finished. The @-anchors
+# in the play cover the SYSTEM; these give each data domain a clean post-install baseline,
+# the one the daily timeline snapshots never provide (their history only starts once real
+# data exists). A future DR can then roll a data volume back to this fresh baseline and
+# restore its dump on top.
+#
+# Created ONCE per snapper config (skip if present, so re-runs don't capture later user
+# data) and never auto-pruned. No-op on non-btrfs hosts (the snapper config won't exist).
+- name: Permanent post-install anchor snapshot per data subvolume (ans_post_install)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    CFG='{{ item.name }}'
+    snapper list-configs 2>/dev/null | awk 'NR>2{print $1}' | grep -qx "$CFG" || { echo "SKIP-no-config"; exit 0; }
+    if snapper -c "$CFG" list 2>/dev/null | grep -q 'ans_post_install'; then echo "SKIP-exists"; exit 0; fi
+    snapper -c "$CFG" create -d "ans_post_install"
+    echo "CREATED"
+  args: { executable: /bin/bash }
+  loop: "{{ data_domains }}"
+  loop_control: { label: "{{ item.name }}" }
+  register: _dv_anchor
+  changed_when: "'CREATED' in (_dv_anchor.stdout | default(''))"
+  when: data_domains is defined
+  tags: [btrfs, anchors]

@@ -1,23 +1,51 @@
 #Claude
 .claude/*
 
-# Real hosts/IPs — keep inventory.ini.example tracked instead.
-inventory.ini
-
-# Operational notes containing live tokens — never commit.
-RUN.txt
-
-# Secrets live ONLY in group_vars/all/vault.yml (vault_* convention).
-# It is currently PLAINTEXT. After `ansible-vault encrypt group_vars/all/vault.yml`
-# you can (and should) relax the broad ignores below to just:
-#     group_vars/all/vault.yml   <- drop too, once encrypted (commit the vault)
-# so the non-secret config in group_vars/ and host_vars/ gets versioned.
+# Site configuration lives in the PRIVATE repo ../ansible-private (see QUICKSTART §2).
+# Safety net in case real files land here anyway — only sanitized templates are tracked.
+/inventory.ini
+/RUN.txt
+/.test-extravars.json
+/ssh_pubkeys/
 group_vars/**/*.yml
-!group_vars/**/*.example.yml
-
+# Templates are named *.yml.example on purpose: Ansible loads EVERY *.yml in group_vars/
+# (an *.example.yml would silently override the real config for ad-hoc `ansible` runs).
 host_vars/**/*.yml
 !host_vars/**/*.example.yml
+
+# Secrets / keys / leftovers — never commit.
+*.old
+*.bak
+*_key
+id_*
+!*.pub
+*.pem
+.env
 
 *:Zone.Identifier
 
 private/*
+
+# Local backup pulls (playbooks/backup-pull.yml) — user data, never commit.
+backups/
+
+# Python build artifacts (e.g. playground-ctl / monitoring helper scripts) — never
+# commit compiled bytecode; it gets baked fresh in the containers/hosts anyway.
+__pycache__/
+*.pyc
+
+# Nextcloud wallpaper pool: stock photos (Pixabay etc.) — kept LOCALLY so Ansible
+# can deploy them, but NOT committed (redistributing them in the repo is a
+# licensing grey area). Curate the folder by hand; a fresh clone just starts empty.
+roles/nextcloud_bootstrap/files/wallpapers/
+
+# Nextcloud import manifest data (nextcloud_imports): vCards/calendars/tasks =
+# personal data — kept LOCALLY for Ansible to deploy, NEVER committed. The dir's
+# README is tracked so a fresh clone knows what goes here.
+roles/nextcloud_bootstrap/files/imports/*.vcf
+roles/nextcloud_bootstrap/files/imports/*.ics
+
+# Profile photos (authentik avatars) are personal data -> private config (avatars/), never here.
+roles/authentik_bootstrap/files/*.jpg
+roles/authentik_bootstrap/files/*.jpeg
+roles/authentik_bootstrap/files/*.png

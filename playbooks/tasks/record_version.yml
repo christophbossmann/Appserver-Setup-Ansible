@@ -1,0 +1,29 @@
+---
+# Record on the HOST which version an upgrade playbook just deployed (one small JSON file per
+# version variable). This is what lets an upgrade triggered ON the host — without the
+# laptop and without write access to the config repo — survive the next normal Ansible run:
+# tasks/adopt_host_versions.yml reads these records first and takes a host-side upgrade
+# over into the private config instead of silently deploying the older version again.
+#
+# source: "host" when the playbook ran on the host itself (upgrade_local_run), else
+# "controller" (then the playbook already wrote the version to the config repo itself).
+# Expects: rec_service, rec_var, rec_file, rec_value, rec_previous.
+- name: Ensure the version record dir exists
+  ansible.builtin.file:
+    path: /var/lib/app-upgrade/versions
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Record {{ rec_var }} = {{ rec_value }}
+  ansible.builtin.copy:
+    dest: "/var/lib/app-upgrade/versions/{{ rec_var }}.json"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {{ {'service': rec_service, 'var': rec_var, 'file': rec_file, 'value': rec_value,
+          'previous': rec_previous,
+          'source': ('host' if (upgrade_local_run | default(false) | bool) else 'controller'),
+          'time': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')} | to_nice_json }}

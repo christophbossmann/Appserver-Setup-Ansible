@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily PostgreSQL PITR base backup
+
+[Timer]
+OnCalendar={{ postgres_pitr_basebackup_oncalendar }}
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

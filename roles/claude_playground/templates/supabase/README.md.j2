@@ -1,0 +1,101 @@
+# Supabase (dev) — Playground agent guide
+
+This workspace is wired to the **playground/dev Supabase** — a scratch instance,
+**not production**. You can build apps end-to-end here: schema migrations, seed
+data, and querying via the API.
+
+## Environment variables (already set in your container)
+
+| Var | Use | Put in a browser bundle? |
+|-----|-----|--------------------------|
+| `SUPABASE_URL` | REST/Auth/Storage base (`{{ playground_supabase_url }}`) | ✅ yes (frontend) |
+| `SUPABASE_ANON_KEY` | public client key; RLS protects the rows | ✅ yes (frontend) |
+| `SUPABASE_SERVICE_ROLE_KEY` | **bypasses RLS** (full data access) | ❌ NEVER — server/CLI only |
+| `SUPABASE_DB_URL` | direct Postgres, DDL-capable (migrations) | ❌ NEVER — server/CLI only |
+| `SUPABASE_JWT_SECRET` | sign/verify tokens locally (debug) | ❌ NEVER |
+| `SUPABASE_STUDIO_URL` | Studio UI ({{ playground_supabase_studio_url | default('n/a') }}, behind SSO) | n/a |
+
+> ⚠️ `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL` and `SUPABASE_JWT_SECRET` grant
+> full, RLS-bypassing access. They must NEVER land in a frontend bundle, a `pgN`
+> app's client code, or a public repo. Client apps use ONLY `SUPABASE_URL` +
+> `SUPABASE_ANON_KEY` and rely on Row-Level Security.
+
+## Migrations
+
+Create a new migration (timestamped SQL file):
+
+```bash
+f="supabase/migrations/$(date +%Y%m%d%H%M%S)_my_change.sql"
+$EDITOR "$f"      # write your CREATE TABLE / ALTER ... / policies
+```
+
+Apply all migrations to the dev DB, open a psql shell, or smoke-test everything:
+
+```bash
+./scripts/db-migrate    # apply pending migrations
+./scripts/db-psql       # psql "$SUPABASE_DB_URL"  (interactive, or -c 'select 1')
+./scripts/check         # tooling + env + DB + anon-REST smoke test
+```
+
+`db-migrate` applies each **new** migration file with `psql`, in one transaction
+together with a `public.schema_migrations` ledger entry, so re-runs only apply files
+that haven't run yet. (The `supabase` CLI is installed for other uses, but is NOT
+used to push migrations here: it forces a TLS connection that the internal
+self-hosted DB doesn't offer — `psql` with `sslmode=disable` works instead.)
+
+## Using Supabase from a `pgN` app (browser)
+
+**Preferred — same-origin, no CORS.** Every `pgN.{{ global_host }}` proxies
+`{{ playground_supabase_same_origin_path }}/*` to Supabase on the app's **own**
+origin, so the browser never makes a cross-origin request (no CORS preflight at all):
+
+```js
+import { createClient } from '@supabase/supabase-js'
+// Base = this app's own origin + the mount prefix. supabase-js appends /rest/v1 etc.
+const supabase = createClient(location.origin + '{{ playground_supabase_same_origin_path }}', SUPABASE_ANON_KEY)
+// e.g. a query hits  <origin>{{ playground_supabase_same_origin_path }}/rest/v1/notes
+```
+
+Caddy strips the `{{ playground_supabase_same_origin_path }}` prefix and forwards to
+the Supabase gateway (Kong key-auth + RLS enforce access); this prefix bypasses the
+SSO gate, so the anon key alone is enough. Supabase already versions its endpoints
+(`/rest/v1`, `/auth/v1`, …), so `{{ playground_supabase_same_origin_path }}` is just a
+mount point, not an API version.
+
+**Alternative — cross-origin absolute URL** (also works; Kong sends `Allow-Origin: *`):
+
+```js
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)   // https://supabase-api.{{ global_host }}
+```
+
+Both paths use ONLY the anon key; RLS protects the rows. Prefer the same-origin path
+for browser apps — it needs no CORS and keeps everything on one host.
+
+## Edge functions (self-hosted deploy path)
+
+`supabase functions deploy` does NOT work here (it only targets the hosted cloud).
+Instead, functions are plain files:
+
+```bash
+mkdir -p functions/myapp_task && $EDITOR functions/myapp_task/index.ts   # Deno.serve(...)
+# NEW function: available immediately at $SUPABASE_URL/functions/v1/myapp_task
+# EDITED function: shed the cached worker first:
+playgroundctl functions reload
+curl -sS "$SUPABASE_URL/functions/v1/myapp_task" \
+  -H "Authorization: Bearer $SUPABASE_ANON_KEY" -d '{"name":"test"}'
+```
+
+See `functions/hello/index.ts` for the minimal shape. Calls require a valid JWT
+(anon key works). The runtime sees this directory read-only; app-prefix your
+function names like every other shared object. Same-origin from a pgN app:
+`<origin>{{ playground_supabase_same_origin_path }}/functions/v1/<name>`.
+
+## Security do / don't
+
+- ✅ RLS **on** for every table; anon sees only what a policy explicitly allows.
+- ✅ `service_role` / `SUPABASE_DB_URL` only in server code or these CLI scripts.
+- ❌ never ship `service_role` or the DB URL to the client.
+- ❌ don't operate production data here — this is a throwaway instance.
+
+See `migrations/20260101000000_example_notes.sql` for the reference RLS pattern
+(per-user rows: anon denied, each authenticated user sees only `owner = auth.uid()`).

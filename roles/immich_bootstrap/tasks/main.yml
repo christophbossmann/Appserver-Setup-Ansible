@@ -1,0 +1,53 @@
+---
+# Bootstrap the initial Immich admin via the API — the one thing Immich can't do
+# via OIDC (it requires a local first admin). We create it with the SAME email as
+# the Authentik user (immich_admin_email = authentik_bootstrap_email) so the first
+# "Login with Authentik" auto-links to this account: your Authentik identity IS
+# the Immich admin. The password is a random break-glass value you never use.
+#
+# Idempotent: once an admin exists, admin-sign-up returns 400 and we treat that as
+# a no-op. Runs on the target host against Immich's loopback port.
+
+- name: Wait for the Immich API to be ready
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ immich_port }}/api/server/ping"
+    status_code: [200]
+  register: _immich_ping
+  retries: 30
+  delay: 5
+  until: _immich_ping is not failed
+  when:
+    - immich_admin_bootstrap | default(true) | bool
+    - not ansible_check_mode
+
+- name: Bootstrap the Immich admin (email aligned with Authentik for OAuth match)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ immich_port }}/api/auth/admin-sign-up"
+    method: POST
+    body_format: json
+    body:
+      email: "{{ immich_admin_email }}"
+      password: "{{ vault_immich_admin_password }}"
+      name: "{{ immich_admin_name }}"
+    # 201 = admin created; 400 = an admin already exists -> idempotent no-op.
+    status_code: [201, 400]
+  register: _immich_signup
+  changed_when: _immich_signup.status == 201
+  no_log: true          # request body carries the admin password
+  when:
+    - immich_admin_bootstrap | default(true) | bool
+    - not ansible_check_mode
+
+- name: Immich admin bootstrap result
+  ansible.builtin.debug:
+    msg: >-
+      {% if _immich_signup.status | default(0) == 201 %}
+      Immich admin created: {{ immich_admin_email }} (log in via "Login with
+      Authentik" — it links to this account by email; the local password is
+      break-glass only, in vault_immich_admin_password).
+      {% else %}
+      Immich admin already existed — nothing to do.
+      {% endif %}
+  when:
+    - immich_admin_bootstrap | default(true) | bool
+    - not ansible_check_mode

@@ -1,0 +1,98 @@
+---
+# Included per backup_jobs entry (loop_var: job) by backup-pull.yml. Runs the job's
+# pre-dumps on the server, rsyncs its paths to the controller, and ALWAYS runs post
+# (e.g. `occ maintenance:mode --off`) even if a step fails — so a failed pull never
+# leaves Nextcloud stuck in maintenance mode.
+#
+# rsync runs DIRECTLY on the controller over SSH (delegate_to localhost) instead of
+# ansible.posix.synchronize, which breaks on this WSL controller ("Could not find the
+# shell plugin required (bash)"). `--rsync-path=sudo rsync` lets the remote side read
+# the root-owned dumps/data; auth reuses the same SSH key Ansible connects with.
+- name: "[{{ job.name }}] pull to controller"
+  vars:
+    _tgt_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+    _tgt_user: "{{ hostvars[inventory_hostname].ansible_user | default('ansible') }}"
+  block:
+    # Local-pull-only pre steps (e.g. DAV .ics/.vcf export). Run BEFORE job.pre so
+    # anything needing the app live (DAV = 503 under maintenance) works. Not part of
+    # the server/cloud backup — these are controller-local extras.
+    - name: "[{{ job.name }}] pull_pre (local-only, before maintenance)"
+      ansible.builtin.shell: "{{ item }}"
+      args:
+        executable: /bin/bash
+      loop: "{{ job.pull_pre | default([]) }}"
+      changed_when: true
+
+    - name: "[{{ job.name }}] pre (dumps / maintenance on)"
+      ansible.builtin.shell: "{{ item }}"
+      args:
+        executable: /bin/bash
+      loop: "{{ job.pre | default([]) }}"
+      changed_when: true
+
+    - name: "[{{ job.name }}] ensure local destination dir"
+      ansible.builtin.file:
+        path: "{{ backup_pull_dest }}/{{ job.name }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    # Skip decision: by default size+mtime (fast; --modify-window tolerates coarse
+    # Windows/DrvFs timestamps so a re-pull doesn't re-transfer unchanged files).
+    # Set backup_pull_checksum=true for content HASH comparison (--checksum): never
+    # re-transfers identical content even if mtime differs, but reads every file on
+    # BOTH ends each run (slow). rsync compares per PATH either way — files already
+    # present are skipped, so nothing is ever backed up twice.
+    - name: "[{{ job.name }}] rsync paths down (incremental, --delete, sudo on remote)"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['rsync', '-az', '--delete',
+              '--modify-window=' ~ (backup_pull_modify_window | default(1))]
+             + (['--copy-unsafe-links'] if (backup_pull_originals | default(true) | bool) else [])
+             + (['--checksum'] if (backup_pull_checksum | default(false) | bool) else [])
+             + (job.excludes | default([]) | map('regex_replace', '^', '--exclude=') | list)
+             + ['-e', 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new',
+                '--rsync-path=sudo rsync',
+                _tgt_user ~ '@' ~ _tgt_host ~ ':' ~ item,
+                backup_pull_dest ~ '/' ~ job.name ~ '/'] }}
+      delegate_to: localhost
+      become: false
+      loop: "{{ job.paths }}"
+      changed_when: true
+
+    # Local-pull-only EXTRA paths (e.g. the Nextcloud DAV .ics/.vcf export). Same
+    # incremental rsync as job.paths, but NOT part of the server/cloud backup (which
+    # only iterates job.paths) — so controller-only artefacts land beside the app's
+    # other dirs (e.g. nextcloud/dav-export/) instead of nested inside a dump dir.
+    - name: "[{{ job.name }}] pull_paths (local-only) rsync down (incremental, --delete)"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['rsync', '-az', '--delete',
+              '--modify-window=' ~ (backup_pull_modify_window | default(1))]
+             + (['--copy-unsafe-links'] if (backup_pull_originals | default(true) | bool) else [])
+             + (['--checksum'] if (backup_pull_checksum | default(false) | bool) else [])
+             + ['-e', 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new',
+                '--rsync-path=sudo rsync',
+                _tgt_user ~ '@' ~ _tgt_host ~ ':' ~ item,
+                backup_pull_dest ~ '/' ~ job.name ~ '/'] }}
+      delegate_to: localhost
+      become: false
+      loop: "{{ job.pull_paths | default([]) }}"
+      changed_when: true
+  always:
+    - name: "[{{ job.name }}] post (maintenance off, etc.) — always runs"
+      ansible.builtin.shell: "{{ item }}"
+      args:
+        executable: /bin/bash
+      loop: "{{ job.post | default([]) }}"
+      changed_when: true
+
+    # Local-pull-only cleanup: wipe the server-side export staging so nothing the
+    # pull generated is left on the server (the copy now lives on the controller).
+    - name: "[{{ job.name }}] pull_post (local-only cleanup) — always runs"
+      ansible.builtin.shell: "{{ item }}"
+      args:
+        executable: /bin/bash
+      loop: "{{ job.pull_post | default([]) }}"
+      changed_when: true

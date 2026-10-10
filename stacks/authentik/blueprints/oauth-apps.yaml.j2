@@ -1,0 +1,169 @@
+# Managed by Ansible — declarative OIDC (OAuth2) apps for Authentik.
+# Rendered from authentik_oauth_apps (group_vars/all/authentik.yml). Each app
+# gets an OAuth2 provider (openid/email/profile scopes, signed by the default
+# self-signed key) + an Application + an admin-only access binding.
+#
+# The app's own OIDC config uses the SAME client_id/secret and points at
+# https://authentik.<host>/application/o/<slug>/ for discovery.
+version: 1
+metadata:
+  name: "ansible-oauth-apps"
+entries:
+{# Create extra access-control groups first so the per-app bindings below can
+   !Find them within this same blueprint (entries apply top-to-bottom). #}
+{% for grp in authentik_groups | default([]) %}
+  - model: authentik_core.group
+    id: group-{{ grp }}
+    identifiers:
+      name: "{{ grp }}"
+{% endfor %}
+{# Declaratively remove obsolete groups (+ their bindings cascade). #}
+{% for grp in authentik_groups_absent | default([]) %}
+  - model: authentik_core.group
+    state: absent
+    identifiers:
+      name: "{{ grp }}"
+{% endfor %}
+{# Extended-profile scope mapping: emits phone/birthdate/address claims from the
+   user's Authentik `attributes` (the profile master lives in Authentik). Reuses
+   scope_name "profile" so no extra scope is needed — claims flow wherever this
+   mapping is attached (per-app opt-in via `profile_attributes: true`). Emits a
+   key only when the attribute is set, so users without the data are unaffected. #}
+  - model: authentik_providers_oauth2.scopemapping
+    id: scope-profile-extended
+    identifiers:
+      name: "ansible-profile-extended"
+    attrs:
+      scope_name: profile
+      description: "Extra profile fields (phone, birthdate, address, locale) from user attributes"
+      expression: |
+        claims = {}
+        a = user.attributes or {}
+        if a.get("phone"):     claims["phone_number"] = a["phone"]
+        if a.get("birthdate"): claims["birthdate"] = a["birthdate"]
+        if a.get("website"):   claims["website"] = a["website"]
+        # locale -> Nextcloud language (user_oidc --mapping-language=locale). e.g. "de".
+        if a.get("locale"):    claims["locale"] = a["locale"]
+        # Address as TOP-LEVEL claims (street_address/locality=Ort/postal_code/country).
+        # Nextcloud's user_oidc composes its single address field from these top-level
+        # claims (just like phone_number). A nested OIDC `address` OBJECT does NOT come
+        # through reliably from Authentik (reserved claim), so we flatten it. A plain
+        # `address` string (legacy) is put into street_address so it still lands in NC.
+        if a.get("street"):      claims["street_address"] = a["street"]
+        elif a.get("address"):   claims["street_address"] = a["address"]
+        if a.get("locality"):    claims["locality"] = a["locality"]
+        if a.get("region"):      claims["region"] = a["region"]
+        if a.get("postal_code"): claims["postal_code"] = a["postal_code"]
+        if a.get("country"):     claims["country"] = a["country"]
+        # The default profile scope does NOT emit `picture` — add it so the avatar
+        # (data URI in attributes.picture, set by roles/authentik_bootstrap) reaches
+        # Nextcloud (user_oidc --mapping-avatar=picture). Only when set.
+        if a.get("picture"):   claims["picture"] = a["picture"]
+        return claims
+{% for app in authentik_oauth_apps | default([]) if app.name in (caddy_services | default({})) %}
+{% if app.group_map is defined %}
+  # Per-app group claim: emit a `groups` claim that TRANSLATES the user's Authentik
+  # group memberships to what THIS app expects (e.g. nextcloud-admins -> admin, the
+  # literal Nextcloud admin group). Reuses scope_name "profile" so no extra scope
+  # must be requested. This only shapes the assertion — the app maps the claim to
+  # real permissions on its side (Nextcloud user_oidc: --mapping-groups=groups +
+  # group provisioning). group_map is {authentik_group: emitted_claim_value}.
+  - model: authentik_providers_oauth2.scopemapping
+    id: scope-groups-{{ app.name }}
+    identifiers:
+      name: "ansible-groups-{{ app.name }}"
+    attrs:
+      scope_name: profile
+      description: "Translated group memberships for {{ app.name }}"
+      expression: |
+        mapping = {{ app.group_map | tojson }}
+        user_groups = {g.name for g in user.ak_groups.all()}
+        out = []
+        for src, dst in mapping.items():
+            if src in user_groups and dst not in out:
+                out.append(dst)
+        return {"groups": out}
+{% endif %}
+{% if app.role_claim is defined %}
+  # Per-app ROLE claim: emit a single claim (scalar) = admin_value if the user is in
+  # the admin_group, else member_value. For apps that read a role claim to grant a
+  # role on login (Immich roleClaim: isAdmin = claim=="admin"; Headplane role_claim:
+  # maps the claim to a Headplane role, re-evaluated every login).
+  # role_claim: { claim, admin_group, admin_value=admin, member_value=user }.
+  - model: authentik_providers_oauth2.scopemapping
+    id: scope-role-{{ app.name }}
+    identifiers:
+      name: "ansible-role-{{ app.name }}"
+    attrs:
+      scope_name: profile
+      description: "Role claim ({{ app.role_claim.claim }}) for {{ app.name }}"
+      expression: |
+        groups = {g.name for g in user.ak_groups.all()}
+        return {"{{ app.role_claim.claim }}": ("{{ app.role_claim.admin_value | default('admin') }}" if "{{ app.role_claim.admin_group }}" in groups else "{{ app.role_claim.member_value | default('user') }}")}
+{% endif %}
+  - model: authentik_providers_oauth2.oauth2provider
+    id: oauthprov-{{ app.name }}
+    identifiers:
+      name: "{{ app.name }}"
+    attrs:
+      client_type: confidential
+      client_id: "{{ app.client_id }}"
+      client_secret: "{{ app.client_secret }}"
+      # Authentik 2026.x requires the allowed grant types explicitly; empty = all
+      # rejected ("Invalid grant_type"). Standard OIDC web app: code + refresh.
+      grant_types:
+        - authorization_code
+        - refresh_token
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+      redirect_uris:
+{% for uri in app.redirect_uris %}
+        - { matching_mode: strict, url: "{{ uri }}" }
+{% endfor %}
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, "goauthentik.io/providers/oauth2/scope-openid"]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, "goauthentik.io/providers/oauth2/scope-email"]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, "goauthentik.io/providers/oauth2/scope-profile"]]
+{% if app.profile_attributes | default(false) %}
+        - !KeyOf scope-profile-extended
+{% endif %}
+{% if app.group_map is defined %}
+        - !KeyOf scope-groups-{{ app.name }}
+{% endif %}
+{% if app.role_claim is defined %}
+        - !KeyOf scope-role-{{ app.name }}
+{% endif %}
+  - model: authentik_core.application
+    id: oauthapp-{{ app.name }}
+    identifiers:
+      slug: "{{ app.name }}"
+    attrs:
+      name: "{{ app.display_name | default(app.name) }}"
+      provider: !KeyOf oauthprov-{{ app.name }}
+{% if app.launch_url is defined %}
+      # Explicit portal tile / launch target. Needed when the app lives somewhere
+      # other than its first redirect URI's origin (e.g. Immich: the private app is
+      # the INTERNAL host, the public host only serves shares).
+      meta_launch_url: "{{ app.launch_url }}"
+{% endif %}
+{% if app.admins_only | default(true) %}
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf oauthapp-{{ app.name }}
+      group: !Find [authentik_core.group, [name, "authentik Admins"]]
+      order: 0
+    attrs:
+      enabled: true
+{% endif %}
+{% for grp in app.access_groups | default([]) %}
+  # Additional group granted access to THIS app (members are not admins).
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf oauthapp-{{ app.name }}
+      group: !Find [authentik_core.group, [name, "{{ grp }}"]]
+      order: {{ loop.index }}
+    attrs:
+      enabled: true
+{% endfor %}
+{% endfor %}

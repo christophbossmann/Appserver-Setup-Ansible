@@ -1,0 +1,126 @@
+---
+# OPTION "restore backup only" — independent, explicit, DESTRUCTIVE.
+# Restores Nextcloud DATA (files + config + DB) from a restic snapshot. Does NOT
+# touch the image version or the app set — run `--tags nextcloud` / `nc_apps`
+# afterwards to re-converge those (this playbook reminds you at the end).
+#
+#   ansible-playbook playbooks/nextcloud-restore.yml \
+#     --limit <host> -e nc_restore_confirm=YES [-e nc_restore_snapshot=<id>] \
+#     [-e nc_restore_db=false] [-e nc_restore_files=false]
+#
+# Guard: refuses to run without nc_restore_confirm=YES. Requires the restic repo
+# (roles/backup_restic, backup_cloud_enabled=true) to hold snapshots.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+
+- name: Restore Nextcloud from a backup snapshot
+  hosts: servers
+  become: true
+  vars:
+    nc_restore_snapshot: latest
+    nc_restore_files: true
+    nc_restore_db: true
+    _stage: /opt/backups/restore/nextcloud
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that: [nc_restore_confirm | default('') == 'YES']
+        fail_msg: "Refusing to restore. Re-run with -e nc_restore_confirm=YES (this OVERWRITES live data)."
+
+    - name: Enable maintenance mode (consistent restore)
+      ansible.builtin.command:
+        argv: [docker, exec, -u, www-data, nextcloud, php, occ, maintenance:mode, --on]
+
+    - name: Restore the snapshot's files into staging
+      ansible.builtin.shell: |
+        set -a; . /etc/restic/env; set +a
+        rm -rf {{ _stage }}; mkdir -p {{ _stage }}
+        restic restore {{ nc_restore_snapshot }} --tag nextcloud --target {{ _stage }}
+      args: { executable: /bin/bash }
+
+    - name: Restore data/ over live (rsync --delete = live matches backup exactly)
+      ansible.posix.synchronize:
+        src: "{{ _stage }}{{ nextcloud_data_dir }}/"
+        dest: "{{ nextcloud_data_dir }}/"
+        archive: true
+        delete: true
+      delegate_to: "{{ inventory_hostname }}"
+      when: nc_restore_files | bool
+
+    - name: Restore config/ over live
+      ansible.posix.synchronize:
+        src: "{{ _stage }}{{ nextcloud_html_dir }}/config/"
+        dest: "{{ nextcloud_html_dir }}/config/"
+        archive: true
+      delegate_to: "{{ inventory_hostname }}"
+      when: nc_restore_files | bool
+
+    - name: Re-point config.php dbhost at the CURRENT DB instance
+      # A pre-migration backup carries the old dbhost; rewrite it at the file level so
+      # Nextcloud connects to wherever the DB lives now (occ can't start on a wrong host).
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - nextcloud
+          - sed
+          - -i
+          - "s/'dbhost' => '[^']*'/'dbhost' => '{{ nextcloud_db_host | default('postgres') }}'/"
+          - /var/www/html/config/config.php
+      when: nc_restore_files | bool
+
+    - name: Restore the database (pg_restore --clean, DESTRUCTIVE)
+      # NO --no-owner: the dump records owner=nextcloud; restoring as the superuser
+      # re-applies it so the least-privilege `nextcloud` app role keeps access.
+      # --no-owner would leave every object owned by the superuser -> "permission denied".
+      ansible.builtin.shell: >-
+        cat {{ _stage }}{{ backup_dump_dir }}/nextcloud-db/db.dump |
+        docker exec -i {{ nextcloud_db_host | default('postgres') }}
+        pg_restore -U {{ nextcloud_db_admin_user | default(postgres_user) }}
+        -d {{ nextcloud_db_name }} --clean --if-exists
+      args: { executable: /bin/bash }
+      when: nc_restore_db | bool
+
+    - name: Ensure every restored object is owned by the Nextcloud DB role
+      # Belt-and-suspenders against an old --no-owner dump (objects owned by the
+      # restoring superuser -> app gets "permission denied"). Idempotent.
+      ansible.builtin.shell: |
+        docker exec -i {{ nextcloud_db_host | default('postgres') }} psql -U {{ nextcloud_db_admin_user | default(postgres_user) }} -d {{ nextcloud_db_name }} <<'SQL'
+        DO $$
+        DECLARE r record; dbowner text;
+        BEGIN
+          SELECT datdba::regrole::text INTO dbowner FROM pg_database WHERE datname = current_database();
+          FOR r IN SELECT tablename AS n FROM pg_tables WHERE schemaname='public' AND tableowner <> dbowner LOOP
+            EXECUTE format('ALTER TABLE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+          FOR r IN SELECT sequencename AS n FROM pg_sequences WHERE schemaname='public' AND sequenceowner <> dbowner LOOP
+            EXECUTE format('ALTER SEQUENCE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+          FOR r IN SELECT viewname AS n FROM pg_views WHERE schemaname='public' AND viewowner <> dbowner LOOP
+            EXECUTE format('ALTER VIEW public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+        END $$;
+        SQL
+      args: { executable: /bin/bash }
+      changed_when: true
+      when: nc_restore_db | bool
+
+    - name: Fix ownership of restored files (www-data uid 33)
+      ansible.builtin.command:
+        argv: [docker, exec, nextcloud, chown, -R, "33:33", /var/www/data, /var/www/html/config]
+      when: nc_restore_files | bool
+
+    - name: Disable maintenance mode
+      ansible.builtin.command:
+        argv: [docker, exec, -u, www-data, nextcloud, php, occ, maintenance:mode, --off]
+
+    - name: Rescan files into the DB filecache
+      ansible.builtin.command:
+        argv: [docker, exec, -u, www-data, nextcloud, php, occ, files:scan, --all]
+      when: nc_restore_files | bool
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Restore complete (snapshot {{ nc_restore_snapshot }},
+          files={{ nc_restore_files }}, db={{ nc_restore_db }}). App-enabled state
+          is now the backup era — run
+          `ansible-playbook … playbooks/server-all.yml --tags nc_apps --limit {{ inventory_hostname }}`
+          to re-converge the declared apps, and --tags nextcloud for version/config.

@@ -1,0 +1,15 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/immich_uploader.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# Immich Uploader (private repo bossbachcraftroom/uploader-for-immich) —
+# stacks/immich_uploader/. The SERVER clones the repo at deploy time (read-only
+# PAT from the vault) and builds both images locally with `docker compose
+# build`; no application code lives in this ansible repo.
+# Repo location WITHOUT scheme/credentials — the stack.yml composes the
+# authenticated clone URL from this + the vault token.
+immich_uploader_git_repo: "github.com/bossbachcraftroom/uploader-for-immich.git"
+immich_uploader_git_version: "main"
+immich_uploader_port: 8092
+
+immich_uploader_jwt_secret: "{{ vault_immich_uploader_jwt_secret }}"
+immich_uploader_jwt_expiration_hours: 24

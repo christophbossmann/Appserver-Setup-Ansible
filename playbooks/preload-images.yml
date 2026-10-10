@@ -1,0 +1,119 @@
+---
+# =============================================================================
+# preload-images.yml — build a reusable "base snapshot" host
+# =============================================================================
+# Installs ONLY Docker (the `docker` role) and pre-pulls every stack image into
+# the local image store. Take a VM snapshot afterwards: test VMs cloned from it
+# boot with Docker already present and all images cached, so a full
+# `server-all.yml` run starts containers in seconds instead of re-pulling
+# gigabytes of layers each time.
+#
+# The image list is collected AUTOMATICALLY from every *_image variable in scope
+# (repo convention: each image is a <name>_image var), so it stays in sync when
+# versions bump or new services are added — nothing to maintain here.
+#
+# Usage:
+#   ansible-playbook playbooks/preload-images.yml --limit <host>
+#   # then take a snapshot of the VM in the provider panel
+#
+# Add extra images ad hoc:
+#   -e '{"preload_images_extra":["redis:7","busybox:latest"]}'
+#
+# NOT covered (by design): images BUILT on the host — caddy (xcaddy), claude-ctl,
+# immich-uploader. Those have no *_image var and are built, not pulled.
+
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+
+- name: Preload Docker + stack images (base snapshot)
+  hosts: all
+  become: true
+  vars:
+    # Minimal: the docker role only adds these to the docker group. Overridable.
+    docker_users: [ansible]
+    # Optional additional images to bake in, via -e.
+    preload_images_extra: []
+  pre_tasks:
+    # compose_stack service images (immich, postgres, komodo, pgadmin,
+    # playwright) live in group_vars/all and are AUTO-loaded — nothing to do.
+    # Role-based images (monitoring, n8n, claude_playground, and any role added
+    # later) live in roles/<role>/defaults/main.yml, which only load when the
+    # role runs — this playbook only runs `docker`. So discover + load exactly
+    # those default files that define a *_image var. Nothing to update when a new
+    # role appears. (Mirrors the caddy role's resolve_routes.yml discovery.)
+    - name: Discover role defaults that define a *_image var (on the controller)
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/../roles"
+        patterns: "main.yml"
+        contains: "^[a-z0-9_]+_image:"
+        recurse: true
+      delegate_to: localhost
+      run_once: true
+      become: false
+      register: _image_default_files
+      tags: [always]
+
+    - name: Load those role defaults so their *_image vars are in scope
+      ansible.builtin.include_vars: "{{ item }}"
+      loop: "{{ _image_default_files.files | map(attribute='path') | sort }}"
+      loop_control:
+        label: "{{ item | regex_replace('^.*/roles/', 'roles/') }}"
+      tags: [always]
+
+  roles:
+    # The only thing installed: Docker CE + compose plugin + service.
+    - { role: docker, tags: [docker] }
+
+  tasks:
+    - name: Collect every *_image variable in scope into a list
+      ansible.builtin.set_fact:
+        preload_images: "{{ (preload_images | default([])) + [ lookup('vars', item) ] }}"
+      loop: "{{ query('varnames', '_image$') | sort }}"
+      loop_control:
+        label: "{{ item }}"
+      tags: [preload]
+
+    - name: Normalise (add extras, dedupe, drop empty + locally-built tags)
+      ansible.builtin.set_fact:
+        preload_images: >-
+          {{ (preload_images + preload_images_extra)
+             | reject('equalto', '')
+             | reject('search', ':local$')
+             | unique | sort }}
+      tags: [preload]
+
+    - name: Images that will be pulled
+      ansible.builtin.debug:
+        var: preload_images
+      tags: [preload]
+
+    - name: Pre-pull each image into the local store
+      ansible.builtin.command:
+        cmd: "docker pull {{ item }}"
+      register: _pull
+      changed_when: "'Downloaded newer image' in _pull.stdout"
+      failed_when: false          # collect all, report failures at the end
+      retries: 2
+      delay: 5
+      until: _pull.rc == 0
+      loop: "{{ preload_images }}"
+      loop_control:
+        label: "{{ item }}"
+      tags: [preload]
+
+    - name: Report images that failed to pull (if any)
+      ansible.builtin.fail:
+        msg: |
+          {{ _pull.results | selectattr('rc', 'ne', 0) | list | length }} image(s) failed to pull:
+          {{ _pull.results | selectattr('rc', 'ne', 0) | map(attribute='item') | list | to_nice_yaml }}
+          Re-run to retry — pulls are idempotent.
+      when: _pull.results | selectattr('rc', 'ne', 0) | list | length > 0
+      tags: [preload]
+
+    - name: Preloaded — ready to snapshot
+      ansible.builtin.debug:
+        msg: >-
+          {{ preload_images | length }} images cached + Docker installed.
+          Take a VM snapshot NOW; clones will start the full stack without
+          re-pulling. Verify with: docker image ls
+      tags: [preload]

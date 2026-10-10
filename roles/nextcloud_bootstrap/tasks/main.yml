@@ -1,0 +1,559 @@
+---
+# Post-stack bootstrap: wire Nextcloud to Authentik (OIDC via the user_oidc app)
+# using occ — fully declarative, no UI clicking. Idempotent: app install and the
+# provider entry are guarded by lookups; provider settings are re-applied (occ
+# user_oidc:provider updates in place), so a changed secret/issuer converges.
+
+- name: Wait until Nextcloud is installed (first boot runs the installer)
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, status, --output=json]
+  register: _nc_status
+  changed_when: false
+  failed_when: false
+  until: _nc_status.rc == 0 and (_nc_status.stdout | from_json).installed | default(false)
+  retries: 30
+  delay: 10
+  when: not ansible_check_mode
+
+# === OPTION: newest version ===========================================
+# Bump nextcloud_version in group_vars -> compose recreates with the new image,
+# whose entrypoint auto-runs the DB upgrade. This explicit occ upgrade is an
+# idempotent safety net that surfaces any upgrade problem (no-op when current).
+# NOTE: Nextcloud only upgrades ONE major version at a time (30->31->32); do not
+# jump majors. Take a backup first.
+- name: Upgrade Nextcloud DB schema if the image version changed (idempotent)
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, upgrade, --no-interaction]
+  register: _nc_upgrade
+  changed_when: "'Update successful' in _nc_upgrade.stdout"
+  failed_when:
+    - _nc_upgrade.rc != 0
+    - "'already latest version' not in (_nc_upgrade.stdout + _nc_upgrade.stderr)"
+    - "'Nothing to do' not in (_nc_upgrade.stdout + _nc_upgrade.stderr)"
+  when: not ansible_check_mode
+  tags: [nc_upgrade]
+
+# === Declarative apps =================================================
+# Ansible owns the app SET (idempotent, re-applied every run). This is separate
+# from DATA (files/users/shares/DB), which is the backup's job — so after a
+# restore (which reverts app-enabled STATE to the backup era), the next deploy
+# re-converges to the declared set: apps you added in Ansible but that predate
+# the backup get (re)installed; nothing you didn't declare gets removed unless it
+# is in nextcloud_apps_disabled.
+- name: Read installed app list
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, app:list, --output=json]
+  register: _nc_apps
+  changed_when: false
+  when: not ansible_check_mode
+  tags: [nc_apps, nc_wallpapers]
+
+- name: Install + enable declared apps (from the appstore; idempotent)
+  ansible.builtin.command:
+    # app:install downloads AND enables. If already downloaded but disabled, just
+    # enable. If already enabled, do nothing.
+    argv: >-
+      {{ ['docker','exec','-u','www-data','nextcloud','php','occ']
+         + (['app:enable', item] if item in (_nc_apps.stdout | from_json).disabled
+            else ['app:install', item]) }}
+  register: _nc_app_install
+  changed_when: "_nc_app_install.rc == 0"
+  # Don't abort the whole run when a single app is unavailable/incompatible
+  # ('Could not download' = no release for this NC major). Real errors still fail.
+  failed_when:
+    - _nc_app_install.rc != 0
+    - "'already' not in (_nc_app_install.stdout + _nc_app_install.stderr)"
+    - "'Could not download' not in (_nc_app_install.stdout + _nc_app_install.stderr)"
+  loop: "{{ nextcloud_apps_enabled | default([]) }}"
+  when:
+    - not ansible_check_mode
+    - nextcloud_manage_apps | default(true)
+    - item not in (_nc_apps.stdout | from_json).enabled
+  tags: [nc_apps]
+
+# Re-read the app list AFTER installing — otherwise the wallpaper seed below gates
+# on the pre-install snapshot and skips on a FRESH deploy (app enabled this run but
+# the stale list still says disabled), only seeding on the 2nd run. This refresh
+# makes the first deploy seed correctly.
+- name: Re-read installed app list (post-install, for the wallpaper seed gate)
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, app:list, --output=json]
+  register: _nc_apps
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - nextcloud_manage_apps | default(true)
+  tags: [nc_apps, nc_wallpapers]
+
+# --- Maps: repoint the "Street map" layer off the blocked OSM tiles -------
+# The Maps app hardcodes tile.openstreetmap.org for its "Street map" layer (no config
+# option in 1.6.0), which OSM now 403-blocks (tile usage policy). When a MapTiler key is
+# set, patch the app JS to MapTiler's "OpenStreetMap" style (same look, legal). Idempotent
+# + re-applied each deploy (survives Maps app updates that overwrite the JS). Browsers with
+# a cached bundle need a hard refresh (Ctrl+Shift+R) to pick it up.
+- name: Repoint Nextcloud Maps "Street map" layer to MapTiler (OSM tiles are 403-blocked)
+  ansible.builtin.shell: |
+    OLD='https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+    NEW='https://api.maptiler.com/maps/openstreetmap/{z}/{x}/{y}.png?key={{ nextcloud_maps_maptiler_key }}'
+    docker exec -u www-data -e OLD="$OLD" -e NEW="$NEW" nextcloud sh -c '
+      JS=$(ls /var/www/html/custom_apps/maps/js/maps-main.js /var/www/html/apps/maps/js/maps-main.js 2>/dev/null | head -1)
+      [ -n "$JS" ] || { echo NOJS; exit 0; }
+      grep -qF "$OLD" "$JS" || { echo NOCHANGE; exit 0; }
+      sed -i "s#$OLD#$NEW#g" "$JS"
+      echo CHANGED
+    '
+  register: _nc_maps_patch
+  changed_when: "'CHANGED' in (_nc_maps_patch.stdout | default(''))"
+  no_log: true            # the URL carries the MapTiler key
+  # No _nc_apps gate here: the shell self-guards (maps not installed -> no JS -> NOJS,
+  # exit 0), so this task also runs standalone with `--tags nc_maps` (where the app-list
+  # read tasks, tagged nc_apps/nc_wallpapers, don't run).
+  when:
+    - not ansible_check_mode
+    - (nextcloud_maps_maptiler_key | default('')) | length > 0
+  tags: [nc_apps, nc_maps]
+
+# The Maps app also pins a Content-Security-Policy that only whitelists its known
+# tile domains as image sources; api.maptiler.com is NOT among them, so the browser
+# blocks the (now MapTiler) tiles -> BLANK white map, even though the JS is correct.
+# Add MapTiler as an allowed image domain in every controller that lists the OSM
+# tile domain (authenticated + public pages). Idempotent (skips files already
+# carrying the line) + re-applied each deploy (survives Maps app updates that
+# overwrite the PHP). Editing PHP needs an OPcache flush -> notifies a restart.
+- name: Allow MapTiler tiles in the Nextcloud Maps CSP (else the browser blocks them -> blank map)
+  ansible.builtin.shell: |
+    docker exec -i -u www-data nextcloud sh -s <<'INNER'
+    CH=0
+    for f in $(grep -rl "addAllowedImageDomain('https://tile.openstreetmap.org');" /var/www/html/custom_apps/maps/lib 2>/dev/null); do
+      grep -qF 'api.maptiler.com' "$f" && continue
+      sed -i 's#\(->addAllowedImageDomain('"'"'https://tile.openstreetmap.org'"'"');\)#\1\n\t\t\t$csp->addAllowedImageDomain('"'"'https://api.maptiler.com'"'"');#' "$f"
+      CH=1
+    done
+    [ "$CH" = 1 ] && echo CSPCHANGED || echo CSPNOCHANGE
+    INNER
+  register: _nc_maps_csp
+  changed_when: "'CSPCHANGED' in (_nc_maps_csp.stdout | default(''))"
+  notify: Restart Nextcloud to flush OPcache
+  when:
+    - not ansible_check_mode
+    - (nextcloud_maps_maptiler_key | default('')) | length > 0
+  tags: [nc_apps, nc_maps]
+
+# --- Rotating-Wallpapers starter pool -------------------------------------
+- name: Resolve the app's appdata wallpapers dir
+  ansible.builtin.shell: |
+    APPDATA=$(ls -d {{ nextcloud_data_dir }}/appdata_* 2>/dev/null | head -1)
+    [ -z "$APPDATA" ] && exit 0
+    echo "$APPDATA/rotatingwallpapers/wallpapers"
+  register: _nc_wpdir
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - nextcloud_wallpapers_seed | default(false)
+    - "'rotatingwallpapers' in (_nc_apps.stdout | from_json).enabled"
+  tags: [nc_apps, nc_wallpapers]
+
+# Mirror the repo folder → app so the app shows EXACTLY
+# roles/nextcloud_bootstrap/files/wallpapers/. Curate that folder by hand;
+# additions AND deletions propagate. UI-uploaded images are replaced too — the
+# repo folder is the single source of truth. Idempotent: only re-mirrors when the
+# filename set differs (tar pack + replace + chown).
+- name: List local wallpaper files (controller)
+  ansible.builtin.find:
+    paths: "{{ role_path }}/files/wallpapers"
+    patterns: "*.jpg"
+  delegate_to: localhost
+  become: false
+  register: _wp_local
+  when:
+    - nextcloud_wallpapers_seed | default(false)
+    - nextcloud_wallpapers_source | default('repo') == 'repo'
+  tags: [nc_apps, nc_wallpapers]
+
+- name: List app wallpaper files
+  ansible.builtin.shell: "ls -1 {{ _nc_wpdir.stdout | trim }}/*.jpg 2>/dev/null | xargs -r -n1 basename | sort || true"
+  register: _wp_remote
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - nextcloud_wallpapers_seed | default(false)
+    - nextcloud_wallpapers_source | default('repo') == 'repo'
+    - _nc_wpdir.stdout | default('') | trim | length > 0
+  tags: [nc_apps, nc_wallpapers]
+
+- name: Mirror the wallpaper set into the app (only when it differs)
+  when:
+    - not ansible_check_mode
+    - nextcloud_wallpapers_seed | default(false)
+    - nextcloud_wallpapers_source | default('repo') == 'repo'
+    - _nc_wpdir.stdout | default('') | trim | length > 0
+    - (_wp_local.files | map(attribute='path') | map('basename') | sort) != (_wp_remote.stdout_lines | default([]) | sort)
+  tags: [nc_apps, nc_wallpapers]
+  block:
+    - name: Pack the local wallpaper set (controller)
+      ansible.builtin.command:
+        cmd: tar cf /tmp/_nc_wp.tar -C "{{ role_path }}/files/wallpapers" .
+      delegate_to: localhost
+      become: false
+      changed_when: false
+    - name: Ship the tarball to the host
+      ansible.builtin.copy:
+        src: /tmp/_nc_wp.tar
+        dest: /tmp/_nc_wp.tar
+        mode: "0644"
+    - name: Replace the app wallpapers with the repo set + fix ownership
+      ansible.builtin.shell: |
+        WP="{{ _nc_wpdir.stdout | trim }}"
+        mkdir -p "$WP"
+        find "$WP" -maxdepth 1 -type f -name '*.jpg' -delete
+        tar xf /tmp/_nc_wp.tar -C "$WP"
+        chown -R 33:33 "$WP"
+        rm -f /tmp/_nc_wp.tar
+        echo "mirrored:$(ls -1 "$WP"/*.jpg 2>/dev/null | wc -l)"
+      register: _nc_wp_mirror
+      changed_when: true
+
+- name: Seed a random pool from Picsum instead (source=picsum; idempotent)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    WP="{{ _nc_wpdir.stdout | trim }}"
+    mkdir -p "$WP"
+    have=$(find "$WP" -maxdepth 1 -type f | wc -l)
+    if [ "$have" -ge {{ nextcloud_wallpapers_count }} ]; then echo "already:$have"; exit 0; fi
+    ids=$(curl -sf "https://picsum.photos/v2/list?page=1&limit={{ nextcloud_wallpapers_count }}" \
+          | python3 -c "import sys,json;[print(i['id']) for i in json.load(sys.stdin)]")
+    n=0
+    for id in $ids; do
+      if curl -sfL "https://picsum.photos/id/$id/{{ nextcloud_wallpapers_size }}" -o "$WP/picsum_${id}.jpg"; then n=$((n+1)); fi
+    done
+    chown -R 33:33 "$WP"
+    echo "seeded:$n"
+  register: _nc_wp_picsum
+  changed_when: "'seeded:' in _nc_wp_picsum.stdout"
+  failed_when: "'seeded:0' in _nc_wp_picsum.stdout"
+  when:
+    - not ansible_check_mode
+    - nextcloud_wallpapers_seed | default(false)
+    - nextcloud_wallpapers_source | default('repo') == 'picsum'
+    - _nc_wpdir.stdout | default('') | trim | length > 0
+  tags: [nc_apps, nc_wallpapers]
+
+- name: Set the wallpaper rotation interval (config.json)
+  ansible.builtin.shell:
+    cmd: |
+      docker exec nextcloud sh -c '
+        D=$(ls -d /var/www/data/appdata_*/rotatingwallpapers 2>/dev/null | head -1)
+        [ -z "$D" ] && exit 0
+        F="$D/config.json"
+        want="{{ nextcloud_wallpapers_rotation }}"
+        cur=$(sed -n "s/.*\"rotationMode\": *\"\([^\"]*\)\".*/\1/p" "$F" 2>/dev/null)
+        if [ "$cur" != "$want" ]; then
+          printf "{\"rotationMode\":\"%s\",\"currentImage\":\"\",\"validUntil\":0}" "$want" > "$F"
+          chown 33:33 "$F"
+          echo CHANGED
+        fi
+      '
+  register: _nc_wp_rot
+  changed_when: "'CHANGED' in _nc_wp_rot.stdout"
+  when:
+    - not ansible_check_mode
+    - nextcloud_wallpapers_seed | default(false)
+    - _nc_wpdir.stdout | default('') | trim | length > 0
+  tags: [nc_apps, nc_wallpapers]
+
+# --- Declarative default settings (idempotent) ----------------------------
+- name: Apply declarative app settings
+  ansible.builtin.shell: |
+    cur=$(docker exec -u www-data nextcloud php occ config:app:get {{ item.app | quote }} {{ item.key | quote }} 2>/dev/null || true)
+    if [ "$cur" != {{ item.value | string | quote }} ]; then
+      docker exec -u www-data nextcloud php occ config:app:set {{ item.app | quote }} {{ item.key | quote }} --value={{ item.value | string | quote }} >/dev/null
+      echo CHANGED
+    fi
+  register: _nc_set_app
+  changed_when: "'CHANGED' in _nc_set_app.stdout"
+  loop: "{{ nextcloud_settings.app | default([]) }}"
+  loop_control:
+    label: "{{ item.app }}.{{ item.key }}"
+  when: not ansible_check_mode
+  tags: [nc_apps, nc_settings]
+
+- name: Apply declarative system settings
+  ansible.builtin.shell: |
+    cur=$(docker exec -u www-data nextcloud php occ config:system:get {{ item.key | quote }} 2>/dev/null || true)
+    if [ "$cur" != {{ item.value | string | quote }} ]; then
+      docker exec -u www-data nextcloud php occ config:system:set {{ item.key | quote }} --value={{ item.value | string | quote }}{{ ' --type=' ~ item.type if item.type is defined else '' }} >/dev/null
+      echo CHANGED
+    fi
+  register: _nc_set_sys
+  changed_when: "'CHANGED' in _nc_set_sys.stdout"
+  loop: "{{ nextcloud_settings.system | default([]) }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: not ansible_check_mode
+  tags: [nc_apps, nc_settings]
+
+# --- Maintenance the admin overview nags about ----------------------------------
+# db:add-missing-indices is fast + idempotent -> run every deploy (clears the
+# "missing indices" warning). maintenance:repair --include-expensive (MIME-type
+# migrations) can be slow on big instances, so it's opt-in: -e nextcloud_run_repair=true.
+- name: Add missing DB indices (idempotent)
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, db:add-missing-indices]
+  register: _nc_idx
+  changed_when: "'dded index' in _nc_idx.stdout"     # "Adding/Added index ..." on change
+  when: not ansible_check_mode
+  tags: [nc_repair]
+
+- name: Run expensive repair steps (MIME-type migrations) — opt-in
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, maintenance:repair, --include-expensive]
+  register: _nc_repair
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - nextcloud_run_repair | default(false) | bool
+  tags: [nc_repair]
+
+- name: Warn about apps that could not be installed (unavailable/incompatible)
+  ansible.builtin.debug:
+    msg: "⚠ could not install '{{ item.item }}': {{ (item.stdout | default('')) | trim }}"
+  loop: "{{ _nc_app_install.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  when:
+    - not ansible_check_mode
+    - item.rc | default(0) != 0
+  tags: [nc_apps]
+
+- name: Disable declared-off apps (e.g. default bloat) — idempotent
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, app:disable, "{{ item }}"]
+  register: _nc_app_disable
+  changed_when: "'already disabled' not in (_nc_app_disable.stdout + _nc_app_disable.stderr)"
+  loop: "{{ nextcloud_apps_disabled | default([]) }}"
+  when:
+    - not ansible_check_mode
+    - nextcloud_manage_apps | default(true)
+    - item in (_nc_apps.stdout | from_json).enabled
+  tags: [nc_apps]
+
+- name: Install the user_oidc app
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, app:install, user_oidc]
+  register: _nc_oidc_install
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - nextcloud_oidc_enabled | default(false)
+    - "'user_oidc' not in (_nc_apps.stdout | from_json).enabled"
+    - "'user_oidc' not in (_nc_apps.stdout | from_json).disabled"
+
+- name: Enable user_oidc if present but disabled
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, app:enable, user_oidc]
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - nextcloud_oidc_enabled | default(false)
+    - "'user_oidc' in (_nc_apps.stdout | from_json).disabled | default([])"
+
+# occ user_oidc:provider <name> --... creates OR updates the named provider ->
+# convergent by design. no_log: the client secret is on the command line.
+- name: Configure the Authentik provider (create/update)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - www-data
+      - nextcloud
+      - php
+      - occ
+      - user_oidc:provider
+      - authentik
+      - "--clientid={{ nextcloud_oidc_client_id }}"
+      - "--clientsecret={{ nextcloud_oidc_client_secret }}"
+      - "--discoveryuri={{ authentik_oidc_issuer_base }}/nextcloud/.well-known/openid-configuration"
+      - "--scope=openid email profile"
+      - "--unique-uid=0"
+      # Readable NC user ids (= the Authentik username) instead of the default
+      # hashed sub claim. With unique-uid=0 + a matching existing NC account,
+      # the SSO login ATTACHES to that account — which lets us pre-provision
+      # admins below. Changing this after users logged in orphans their old
+      # hashed accounts (was cleaned up once on dev, 2026-09).
+      - "--mapping-uid=preferred_username"
+      - "--mapping-display-name=name"
+      # Extended profile: pulled from Authentik user attributes via the
+      # profile-extended scope mapping (blueprint). Emitted only when set, so
+      # users without the data keep their manual profile values.
+      - "--mapping-phone=phone_number"
+      - "--mapping-birthdate=birthdate"
+      - "--mapping-address=address"
+      # user_oidc composes NC's single address field from the STRUCTURED address
+      # claim's sub-keys — these must be mapped or they default to empty and the
+      # address (incl. the city) stays blank even though the claim has the data.
+      - "--mapping-street_address=street_address"
+      - "--mapping-postal_code=postal_code"
+      - "--mapping-locality=locality"
+      - "--mapping-region=region"
+      - "--mapping-country=country"
+      - "--mapping-website=website"
+      - "--mapping-avatar=picture"
+      - "--mapping-language=locale"     # Authentik attribute `locale` (e.g. de) -> NC language
+      # Group provisioning: read the `groups` claim (emitted by the Authentik
+      # nextcloud provider's group_map — nextcloud-admins -> `admin`) and sync it
+      # into Nextcloud groups on login. Grants NC admin by Authentik group
+      # membership WITHOUT Authentik superuser. The whitelist keeps unrelated
+      # groups out and (restrict-login) gates access to exactly these groups.
+      - "--mapping-groups=groups"
+      - "--group-provisioning={{ (nextcloud_oidc_group_provisioning | default(true)) | ternary('1', '0') }}"
+      - "--group-whitelist-regex={{ nextcloud_oidc_group_whitelist_regex | default('^(admin|nextcloud-users)$') }}"
+      - "--group-restrict-login-to-whitelist={{ (nextcloud_oidc_group_restrict_login | default(true)) | ternary('1', '0') }}"
+  register: _nc_provider
+  changed_when: true
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - nextcloud_oidc_enabled | default(false)
+
+# --- SSO admins: pre-provision the NC account (uid = Authentik username) and
+# put it into the admin group. The SSO login then attaches to this account
+# (unique-uid=0 + uid match), so the user is admin from their first login.
+- name: Check which SSO admin accounts already exist
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, user:info, "{{ item }}", --output=json]
+  register: _nc_ssoadmin_info
+  changed_when: false
+  failed_when: false
+  loop: "{{ nextcloud_sso_admins | default([]) }}"
+  when: not ansible_check_mode
+
+- name: Pre-create missing SSO admin accounts (random local password — login is SSO)
+  ansible.builtin.command:
+    argv: [docker, exec, -e, "OC_PASS={{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}", -u, www-data, nextcloud, php, occ, user:add, --password-from-env, "{{ item.item }}"]
+  changed_when: true
+  no_log: true
+  loop: "{{ _nc_ssoadmin_info.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - not ansible_check_mode
+    - item.rc != 0
+
+- name: Ensure SSO admins are in the admin group
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, group:adduser, admin, "{{ item.item }}"]
+  register: _nc_grpadd
+  changed_when: _nc_grpadd.rc == 0
+  failed_when: false   # already-member exits non-zero on some versions — verified below
+  loop: "{{ _nc_ssoadmin_info.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+
+- name: Verify SSO admins ended up in the admin group
+  ansible.builtin.command:
+    argv: [docker, exec, -u, www-data, nextcloud, php, occ, user:info, "{{ item }}", --output=json]
+  register: _nc_verify
+  changed_when: false
+  failed_when: "'admin' not in (_nc_verify.stdout | from_json).groups"
+  loop: "{{ nextcloud_sso_admins | default([]) }}"
+  when: not ansible_check_mode
+
+- name: Nextcloud OIDC ready
+  ansible.builtin.debug:
+    msg: >-
+      user_oidc wired to Authentik ({{ authentik_oidc_issuer_base }}/nextcloud).
+      Browser login shows "Log in with authentik"; local admin stays as
+      break-glass. Sync clients use app passwords (Settings -> Security).
+  when: nextcloud_oidc_enabled | default(false)
+
+# === Declarative imports: contacts / calendars / tasks ========================
+# The manifest lives in group_vars/all/nextcloud_imports.yml (nextcloud_imports),
+# grouped by TYPE. One generic engine (dav_import.yml) handles all three, included
+# once per entry, told the DAV mode + which item key holds the collection slug.
+# SHARING is an ATTRIBUTE, not a separate category: any entry may carry a
+# `share_with: [{user, access}, ...]` — those are imported for the owner here and
+# then shared by the per-type share passes below (dav_share.yml).
+- name: Import declared address books (vCard / CardDAV)
+  ansible.builtin.include_tasks:
+    file: dav_import.yml
+    apply:
+      tags: [nc_imports, nc_contacts]
+  vars: { _nc_mode: carddav, _nc_colldef: contacts }
+  loop: "{{ nextcloud_imports.contacts | default([]) }}"
+  loop_control:
+    label: "{{ item.user }} <- {{ item.file }}"
+  tags: [nc_imports, nc_contacts]
+
+- name: Import declared calendars (iCal events / CalDAV)
+  ansible.builtin.include_tasks:
+    file: dav_import.yml
+    apply:
+      tags: [nc_imports, nc_calendars]
+  vars: { _nc_mode: caldav, _nc_colldef: '' }
+  loop: "{{ nextcloud_imports.calendars | default([]) }}"
+  loop_control:
+    label: "{{ item.user }} <- {{ item.file }}"
+  tags: [nc_imports, nc_calendars]
+
+- name: Import declared task lists (iCal VTODO / CalDAV)
+  ansible.builtin.include_tasks:
+    file: dav_import.yml
+    apply:
+      tags: [nc_imports, nc_tasks]
+  vars: { _nc_mode: caldav, _nc_colldef: '' }
+  loop: "{{ nextcloud_imports.tasks | default([]) }}"
+  loop_control:
+    label: "{{ item.user }} <- {{ item.file }}"
+  tags: [nc_imports, nc_tasks]
+
+# Sharing pass, per type: any entry that declares `share_with` is shared with the
+# listed users (read-write / read-only), after its owner-side import above. The
+# type provides kind + slug field so dav_share resolves the collection. Idempotent.
+- name: Share declared address books
+  ansible.builtin.include_tasks:
+    file: dav_share.yml
+    apply:
+      tags: [nc_imports, nc_shares]
+  vars: { _nc_kind: addressbook }
+  loop: "{{ nextcloud_imports.contacts | default([]) | selectattr('share_with', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.user }}/{{ item.slug }}"
+  tags: [nc_imports, nc_shares]
+
+- name: Share declared calendars
+  ansible.builtin.include_tasks:
+    file: dav_share.yml
+    apply:
+      tags: [nc_imports, nc_shares]
+  vars: { _nc_kind: calendar }
+  loop: "{{ nextcloud_imports.calendars | default([]) | selectattr('share_with', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.user }}/{{ item.slug }}"
+  tags: [nc_imports, nc_shares]
+
+- name: Share declared task lists
+  ansible.builtin.include_tasks:
+    file: dav_share.yml
+    apply:
+      tags: [nc_imports, nc_shares]
+  vars: { _nc_kind: tasklist }
+  loop: "{{ nextcloud_imports.tasks | default([]) | selectattr('share_with', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.user }}/{{ item.slug }}"
+  tags: [nc_imports, nc_shares]
+
+# === DAV export helper (for the backup) =======================================
+# Deploys /usr/local/bin/nc-dav-export, which dumps every user's calendars/address
+# books as standalone .ics/.vcf. The nextcloud backup job runs it as a pre-step so
+# a total-loss restore can just re-import these files.
+- name: Deploy the nc-dav-export helper (calendars/contacts -> .ics/.vcf)
+  ansible.builtin.template:
+    src: nc-dav-export.sh.j2
+    dest: /usr/local/bin/nc-dav-export
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+  tags: [nc_export, backup]

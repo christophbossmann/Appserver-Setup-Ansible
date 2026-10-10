@@ -1,5 +1,5 @@
-# Copy to inventory.ini (git-ignored) and adjust.
-# Host names here must match host_vars/<name>.yml.
+# Copy to ../ansible-private/inventory.ini (private config dir, see QUICKSTART.md §2).
+# Host names here must match ../ansible-private/host_vars/<name>.yml.
 [servers]
 myserver ansible_host=192.168.0.10
 # myvps  ansible_host=203.0.113.10

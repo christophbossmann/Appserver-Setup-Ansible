@@ -1,0 +1,84 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/supabase.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# Supabase self-hosted config (compose_stack). Secrets live in
+# group_vars/all/vault.yml (vault_supabase_*); the compose/.env reference these.
+# Images follow the repo <name>_image convention -> auto-collected by
+# playbooks/preload-images.yml. Pins taken from the upstream supabase/docker
+# compose the stack was derived from; bump deliberately.
+
+# === Data (host binds under the 'dev' data domain, see group_vars/all/storage.yml) ===
+# On btrfs these live in the @dev subvolume -> excluded from system rollback + rolled back
+# together with the rest of dev. Was project-relative ./volumes/{db/data,storage}; the DATA
+# moves to /srv while the config volumes (kong.yml, sql init, functions) stay in the project.
+supabase_pg_data_dir: "{{ data_root_dev }}/supabase/db"        # nodatacow (chattr +C via data_storage)
+supabase_storage_dir: "{{ data_root_dev }}/supabase/storage"
+
+# === Images ===
+supabase_studio_image:    "supabase/studio:2026.07.07-sha-a6a04f2"
+supabase_kong_image:      "kong/kong:3.9.1"
+supabase_auth_image:      "supabase/gotrue:v2.189.0"
+supabase_rest_image:      "postgrest/postgrest:v14.12"
+supabase_realtime_image:  "supabase/realtime:v2.102.3"
+supabase_storage_image:   "supabase/storage-api:v1.60.4"
+supabase_imgproxy_image:  "darthsim/imgproxy:v3.30.1"
+supabase_meta_image:      "supabase/postgres-meta:v0.96.6"
+supabase_functions_image: "supabase/edge-runtime:v1.74.0"
+supabase_db_image:        "supabase/postgres:17.6.1.136"
+supabase_pooler_image:    "supabase/supavisor:2.9.5"
+
+# === URLs (Kong is fronted by Caddy at supabase.<global_host>) ===
+supabase_public_url: "https://supabase.{{ global_host }}"
+supabase_site_url: "{{ supabase_public_url }}"
+supabase_additional_redirect_urls: ""
+
+# === Ports (all bound to 127.0.0.1 by the compose; Caddy fronts Kong) ===
+supabase_kong_http_port: 8000
+# Internal Postgres port (db listen + service-to-db connections). NOT a host bind.
+supabase_postgres_port: 5432
+# Host-side loopback binds for the pooler. Postgres never leaves the host; these
+# are only for host access (SSH tunnel / pgAdmin / psql). 5432 is already taken
+# by the shared postgres stack, so session pooling binds 5433 on the host.
+supabase_pooler_session_host_port: 5433
+supabase_pooler_transaction_host_port: 6543
+
+# === Dashboard (Studio) login — enforced by Kong ===
+supabase_dashboard_username: "admin"
+
+# === Supavisor pooler ===
+supabase_pooler_tenant_id: "{{ inventory_hostname }}"
+supabase_pooler_default_pool_size: 20
+supabase_pooler_max_client_conn: 100
+supabase_pooler_db_pool_size: 5
+
+# === PostgREST ===
+supabase_pgrst_db_schemas: "public,graphql_public"
+supabase_pgrst_db_max_rows: 1000
+
+# === Auth ===
+supabase_jwt_expiry: 3600
+supabase_disable_signup: false             # set true to lock down new signups
+supabase_enable_email_signup: true
+supabase_enable_email_autoconfirm: false
+supabase_enable_anonymous_users: false
+
+# SMTP — fake by default (no outbound mail). Point at a real relay to enable
+# password resets / email confirmations.
+supabase_smtp_admin_email: "admin@example.com"
+supabase_smtp_host: "supabase-mail"
+supabase_smtp_port: 2500
+supabase_smtp_user: "fake_mail_user"
+supabase_smtp_pass: "fake_mail_password"
+supabase_smtp_sender_name: "fake_sender"
+
+# === Studio ===
+supabase_studio_org: "Default Organization"
+supabase_studio_project: "Default Project"
+supabase_openai_api_key: ""                # optional: enables Studio AI assistant
+
+# === Edge Functions ===
+# true REQUIRED here: /functions/v1/* is publicly reachable via supabase-api.<host>
+# (Kong has no key-auth on that route) AND functions are agent-deployable — without
+# JWT verification anyone on the internet could invoke agent code anonymously.
+# true = a valid JWT (the public anon key) must be sent; gates scanners/abuse.
+supabase_functions_verify_jwt: true

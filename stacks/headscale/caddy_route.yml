@@ -1,0 +1,20 @@
+# Caddy route for Headscale — PUBLIC control server.
+#
+# NO forward-auth: this is the VPN control plane; Tailscale clients authenticate
+# to headscale itself (pre-auth keys / OIDC), not via Authentik. Selected on a
+# host with `caddy_services: { headscale: external }` -> external profile =
+# real Let's Encrypt cert (under the *.{{ global_host }} wildcard) + public
+# ingress at headscale.{{ global_host }}. Caddy's reverse_proxy streams and
+# speaks HTTP/2, which is all the headscale control protocol needs.
+caddy_route_headscale:
+  name: headscale
+  hostname_label: headscale
+  caddy_upstream: "127.0.0.1:{{ headscale_port }}"
+  caddy_forward_auth: false
+  # Access log -> journald for the "Access logs" dashboard (roles/monitoring access-metrics):
+  # who registers / polls the control server, from where.
+  caddy_extra: |
+    log {
+      output stderr
+      format json
+    }

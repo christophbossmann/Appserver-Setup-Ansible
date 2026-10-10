@@ -1,2 +1,15 @@
 ---
 docker_users: []
+
+# Weekly cleanup of UNUSED images + build cache older than docker_prune_keep_hours.
+# Images of running AND stopped containers stay; volumes are NEVER pruned. Without this
+# every version bump leaves the previous image behind forever.
+docker_prune_enabled: true
+docker_prune_oncalendar: "Sun *-*-* 04:00:00"
+docker_prune_keep_hours: 168            # 7 days — a fresh rollback target survives a week
+
+# Keep "no swap" containers (compose memswap_limit == mem_limit) swap-free for real.
+# runc sets memory.swap.max=0 only in the cgroup, not on the systemd scope, so every
+# `systemctl daemon-reload` (apt, ansible, ...) resets it to max. docker-swap-sync tells
+# systemd MemorySwapMax=0 for those containers on every start, which survives reloads.
+docker_swap_sync_enabled: true

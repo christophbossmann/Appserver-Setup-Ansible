@@ -1,0 +1,67 @@
+---
+# One owner of tasks/immich_reimport_orphans.yml: upload <staging>/<label>/ as that Immich
+# user with a TEMPORARY API key. Immich stores API keys as sha256(key) in api_key.key and
+# looks incoming keys up the same way, so a row inserted here is a regular key of the user;
+# it is deleted again in `always` (also on failure).
+- name: "Upload staged files of {{ _ri_owner.label }}"
+  block:
+    - name: "Generate a temporary API key ({{ _ri_owner.label }})"
+      ansible.builtin.command: openssl rand -hex 32
+      register: _ri_key
+      changed_when: false
+      no_log: true
+
+    - name: "Register the temporary API key ({{ _ri_owner.label }})"
+      ansible.builtin.shell: |
+        h=$(printf '%s' "$KEY" | sha256sum | cut -d' ' -f1)
+        docker exec -i {{ _ri_db }} psql -U {{ _ri_dbuser }} -d {{ immich_db_name }} -XAt -v ON_ERROR_STOP=1 <<SQL
+        INSERT INTO api_key (id, name, key, "userId", permissions)
+        VALUES (gen_random_uuid(), '{{ _ri_key_name }}', decode('$h', 'hex'), '{{ _ri_owner.uid }}', ARRAY['all']);
+        SQL
+      args: { executable: /bin/bash }
+      environment:
+        KEY: "{{ _ri_key.stdout }}"
+      changed_when: true
+      no_log: true
+
+    # --delete: remove each file from staging once Immich accepted it; --delete-duplicates:
+    # also remove files Immich already has (same checksum) -> staging ends up holding only
+    # what failed. The CLI talks to the loopback-published API (host network).
+    - name: "Upload with the immich CLI ({{ _ri_owner.label }}) — can take a while"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --network=host
+          - -e
+          - "IMMICH_INSTANCE_URL=http://127.0.0.1:{{ immich_port }}/api"
+          - -e
+          - IMMICH_API_KEY
+          - -v
+          - "{{ _ri_staging }}/{{ _ri_owner.label }}:/import"
+          - "{{ _ri_cli_image }}"
+          - upload
+          - --recursive
+          - --delete
+          - --delete-duplicates
+          - --no-progress
+          - --concurrency
+          - "{{ immich_reimport_concurrency | default(2) | string }}"
+          - /import
+      environment:
+        IMMICH_API_KEY: "{{ _ri_key.stdout }}"
+      async: "{{ immich_reimport_timeout | default(43200) }}"
+      poll: 30
+      register: _ri_upload
+      changed_when: true
+
+    - name: "CLI output ({{ _ri_owner.label }})"
+      ansible.builtin.debug:
+        msg: "{{ (_ri_upload.stdout_lines | default([]))[-15:] + (_ri_upload.stderr_lines | default([]))[-10:] }}"
+  always:
+    - name: "Remove the temporary API key ({{ _ri_owner.label }})"
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ _ri_db }}", psql, -U, "{{ _ri_dbuser }}", -d, "{{ immich_db_name }}", -XAt,
+               -c, "DELETE FROM api_key WHERE name = '{{ _ri_key_name }}' AND \"userId\" = '{{ _ri_owner.uid }}'"]
+      changed_when: true

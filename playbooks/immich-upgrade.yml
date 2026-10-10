@@ -1,0 +1,181 @@
+---
+# Immich upgrade with automatic PITR rollback on failure.
+#
+#   ansible-playbook playbooks/immich-upgrade.yml --limit <host> \
+#     -e immich_upgrade_version=v3.1.0 \
+#     -e upgrade_confirm=YES \
+#     [-e upgrade_keep_old=false]
+#
+# Same shared-instance reasoning as nextcloud-upgrade.yml: immich + nextcloud share
+# `postgres-business`, and a PITR rollback restores BOTH DBs. So nextcloud is put into
+# maintenance for the WHOLE window (it isn't being upgraded, so it simply stays frozen),
+# immich gets the new image, runs its own startup migrations, and is verified. On ANY
+# failure we PITR the business instance back to the pre-upgrade anchor and redeploy the
+# old immich image. nextcloud is taken out of maintenance at the end (always:).
+#
+# Immich has no "maintenance mode": we stop server+ML instead (the upload dir is data,
+# untouched by the upgrade). Immich supports multi-step migrations, but still upgrade in
+# sensible increments and read the release notes for breaking changes.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+  when: not (upgrade_local_run | default(false) | bool)
+
+- name: Immich upgrade (PITR auto-rollback)
+  hosts: all
+  become: true
+  vars:
+    upgrade_confirm: ""
+    immich_upgrade_version: ""
+    upgrade_keep_old: true
+    force_rollback: false           # DRILL: roll back at the end even on success
+    upgrade_health_retries: 60      # health poll attempts (x5s); lower for drills
+    _biz: postgres-business
+    _occ: ["docker", "exec", "-u", "www-data", "nextcloud", "php", "occ"]
+    _immadm: ["docker", "exec", "immich-server", "immich-admin"]
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that:
+          - upgrade_confirm | default('') == 'YES'
+          - (immich_upgrade_version | default('')) | length > 0
+          - immich_upgrade_version != immich_version
+        fail_msg: >-
+          Need -e immich_upgrade_version=<tag> (current is {{ immich_version }})
+          and -e upgrade_confirm=YES
+
+    - name: Reconcile versions with the host
+      ansible.builtin.include_tasks: tasks/adopt_host_versions.yml
+
+    - name: Record the current version for rollback
+      ansible.builtin.set_fact:
+        _rollback_version: "{{ immich_version }}"
+
+    # ---- QUIESCE BOTH APPS ------------------------------------------------------------
+    - name: Nextcloud into maintenance mode (frozen for the whole immich window)
+      ansible.builtin.command:
+        argv: "{{ _occ + ['maintenance:mode', '--on'] }}"
+      changed_when: true
+
+    - name: Immich into its native maintenance mode (write-freeze; the new container inherits it from the DB)
+      ansible.builtin.command:
+        argv: "{{ _immadm + ['enable-maintenance-mode'] }}"
+      changed_when: true
+
+    # ---- PITR ANCHOR ------------------------------------------------------------------
+    - name: Capture the PITR anchor time (UTC, from the business instance itself)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ _biz }}", psql, -U, "{{ postgres_business_user }}", -tAc,
+               "select to_char(now() at time zone 'utc','YYYY-MM-DD HH24:MI:SS')"]
+      register: _anchor
+      changed_when: false
+
+    - name: Set the anchor fact (+00)
+      ansible.builtin.set_fact:
+        _pitr_target: "{{ _anchor.stdout | trim }}+00"
+
+    - name: Force a WAL switch (guarantee the anchor segment reaches the archive)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ _biz }}", psql, -U, "{{ postgres_business_user }}", -c, "select pg_switch_wal()"]
+      changed_when: false
+
+    # ---- UPGRADE (block) with automatic PITR ROLLBACK (rescue) -------------------------
+    - name: Upgrade
+      block:
+        # NOTE: group_vars is NOT bumped here. The redeploy uses the -e value via the
+        # var override below, so the file need not change for the run. We persist the
+        # new version to group_vars only AFTER every verify passes (and only when we
+        # keep it, i.e. not a force_rollback drill) — see "Persist ..." further down.
+        # That way a failed/rolled-back upgrade never leaves a stale version, and the
+        # rescue path needs no revert.
+        - name: Redeploy immich with the new image (server runs its startup migrations)
+          ansible.builtin.include_role:
+            name: compose_stack
+          vars:
+            stack: immich
+            immich_version: "{{ immich_upgrade_version }}"
+
+        - name: Wait until immich-server is healthy (healthcheck pings the API)
+          ansible.builtin.command: "docker inspect immich-server -f {{ '{{.State.Health.Status}}' }}"
+          register: _ih
+          until: (_ih.stdout | trim) == 'healthy'
+          retries: "{{ upgrade_health_retries | default(60) }}"
+          delay: 5
+          changed_when: false
+
+        - name: Verify the running image is the new version
+          ansible.builtin.command: "docker inspect immich-server -f {{ '{{.Config.Image}}' }}"
+          register: _iimg
+          changed_when: false
+          failed_when: immich_upgrade_version not in _iimg.stdout
+
+        - name: Verify the business DB is readable through immich's schema
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ _biz }}", psql, -U, "{{ postgres_business_user }}", -d, "{{ immich_db_name }}",
+                   -tAc, "select count(*) from asset"]
+          register: _assets
+          changed_when: false
+          failed_when: _assets.rc != 0
+
+        - name: Upgrade verified
+          ansible.builtin.debug:
+            msg: "Immich upgraded {{ _rollback_version }} -> {{ immich_upgrade_version }}. Healthy, image + DB verified (asset rows: {{ _assets.stdout | trim }})."
+
+        # Persist the new version ONLY now — after every check passed and only if we
+        # are keeping it (a force_rollback drill undoes the upgrade, so it must not).
+        # Nothing to revert on failure/drill: the file was never touched before here.
+        - name: Persist immich_version to group_vars (verified upgrade, kept)
+          ansible.builtin.lineinfile:
+            path: "{{ inventory_dir }}/group_vars/all/immich.yml"   # next to the inventory (private config repo)
+            regexp: '^immich_version:'
+            line: 'immich_version: "{{ immich_upgrade_version }}"'
+          delegate_to: localhost
+          become: false
+          when: not (force_rollback | default(false) | bool)
+
+        - name: Record the deployed version on the host
+          ansible.builtin.include_tasks: tasks/record_version.yml
+          vars:
+            rec_service: immich
+            rec_var: immich_version
+            rec_file: immich.yml
+            rec_value: "{{ immich_upgrade_version }}"
+            rec_previous: "{{ _rollback_version }}"
+          when: not (force_rollback | default(false) | bool)
+
+        # ---- force_rollback DRILL: undo the (successful) upgrade on purpose -----------
+        - name: force_rollback — roll the just-upgraded environment back (drill)
+          ansible.builtin.include_tasks: tasks/immich_rollback.yml
+          when: force_rollback | default(false) | bool
+
+        - name: Drill complete
+          ansible.builtin.debug:
+            msg: "force_rollback drill complete — immich rolled back to {{ _rollback_version }} (business restored to {{ _pitr_target }})."
+          when: force_rollback | default(false) | bool
+
+      rescue:
+        - name: Upgrade FAILED — starting PITR rollback
+          ansible.builtin.debug:
+            msg: "Immich upgrade failed. Rolling the business instance back to {{ _pitr_target }} and redeploying {{ _rollback_version }}."
+
+        - name: Roll back (shared steps — same as the force_rollback drill)
+          ansible.builtin.include_tasks: tasks/immich_rollback.yml
+
+        - name: Roll-back complete — fail the play so the outcome is unmistakable
+          ansible.builtin.fail:
+            msg: >-
+              Immich upgrade to {{ immich_upgrade_version }} FAILED and was rolled back
+              to {{ _rollback_version }} (business instance restored to {{ _pitr_target }}).
+              Investigate before retrying.
+
+      always:
+        - name: Lift immich maintenance mode — runs whatever happened above
+          ansible.builtin.command:
+            argv: "{{ _immadm + ['disable-maintenance-mode'] }}"
+          changed_when: true
+          failed_when: false
+
+        - name: Resume nextcloud (maintenance off) — runs whatever happened above
+          ansible.builtin.command:
+            argv: "{{ _occ + ['maintenance:mode', '--off'] }}"
+          changed_when: true
+          failed_when: false

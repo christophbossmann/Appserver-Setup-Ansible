@@ -1,0 +1,13 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/users.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# The primary human admin account on all hosts. Referenced everywhere the
+# identity is meant (users list, docker_users, webdav users, ssh key file
+# ssh_pubkeys/<admin_user>_key.pub) — change the name HERE, not in the consumers.
+# Password/salt live in group_vars/all/vault.yml (vault_admin_user_*).
+admin_user: "alice"
+
+# PUBLIC ssh keys live IN THE REPO (ssh_pubkeys/<name>_key.pub, safe to commit) — never read
+# them from ~/.ssh: the private keys sit right next to the .pub files there, and one
+# wrong read (by a tool or an AI assistant) would put a private key into a log/context.
+ssh_pubkey_dir: "{{ inventory_dir }}/ssh_pubkeys"

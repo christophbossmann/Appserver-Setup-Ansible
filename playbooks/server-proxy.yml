@@ -4,15 +4,18 @@
 # unless cloudflared_service_install=true is explicitly provided.
 #
 # Usage, install only:
-#   ansible-playbook -i inventory.ini playbooks/server-proxy.yml \
+#   ansible-playbook playbooks/server-proxy.yml \
 #     --limit myserver
 #
 # Usage, install and attach to an existing remotely managed tunnel:
-#   ansible-playbook -i inventory.ini playbooks/server-proxy.yml \
+#   ansible-playbook playbooks/server-proxy.yml \
 #     -e "cloudflared_service_install=true" \
 #     -e "cloudflared_tunnel_connector_token=YOUR_TOKEN" \
 #     --limit myserver
 # =============================================================================
+
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
 
 - name: Proxy Server
   hosts: all

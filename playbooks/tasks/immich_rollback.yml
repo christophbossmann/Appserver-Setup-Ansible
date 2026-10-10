@@ -1,0 +1,32 @@
+---
+# Roll the business instance + immich back to the pre-upgrade anchor. Included by
+# immich-upgrade.yml from BOTH the rescue (on failure) and the force_rollback drill path
+# (after a successful upgrade). Does NOT fail the play — the caller decides that.
+# immich is already in maintenance mode (write-frozen), so no explicit stop is needed —
+# pitr_restore stops the business container itself. Expects play vars: _biz,
+# _pitr_target, _rollback_version, upgrade_keep_old, upgrade_health_retries.
+- name: PITR the business instance back to the pre-upgrade anchor
+  ansible.builtin.include_tasks: pitr_restore.yml
+  vars:
+    pitr_instance: postgres-business
+    pitr_target_time: "{{ _pitr_target }}"
+    pitr_keep_old: "{{ upgrade_keep_old }}"
+
+# NOTE: group_vars needs NO revert here — the upgrade playbook only persists the new
+# version AFTER a fully verified, kept upgrade, so on any rollback the file still holds
+# the pre-upgrade version. We just redeploy the old image via the var override below.
+- name: Redeploy immich with the pre-upgrade image
+  ansible.builtin.include_role:
+    name: compose_stack
+  vars:
+    stack: immich
+    immich_version: "{{ _rollback_version }}"
+
+- name: Wait for the rolled-back immich to be healthy (so maintenance can be lifted)
+  ansible.builtin.command: "docker inspect immich-server -f {{ '{{.State.Health.Status}}' }}"
+  register: _ihrb
+  until: (_ihrb.stdout | trim) == 'healthy'
+  retries: "{{ upgrade_health_retries | default(60) }}"
+  delay: 5
+  changed_when: false
+  failed_when: false

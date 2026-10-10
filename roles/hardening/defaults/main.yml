@@ -43,12 +43,62 @@ hardening_swap_vfs_cache_pressure: 50  # default 100, lower = keep inode cache l
 # Traffic from trusted ranges reaches containers directly; external internet is blocked.
 hardening_docker_ufw_compat: true
 
+# Docker-published ports to allow from the PUBLIC internet through the DOCKER-USER
+# DROP (the docker-ufw-compat blocks all external access to docker ports by default).
+# Use ONLY for ports that genuinely must be public (e.g. self-hosted acme-dns :53).
+# List of { port, proto }, e.g. [{ port: 53, proto: udp }, { port: 53, proto: tcp }].
+hardening_docker_public_ports: []
+
 hardening_fail2ban_maxretry: 10
 hardening_fail2ban_findtime: "10m"
-hardening_fail2ban_bantime: "1h"
+hardening_fail2ban_bantime: "15m"            # FIRST ban; repeat offenders escalate (below)
+
+# Escalating bans for ALL jails (fail2ban bantime.increment): the n-th ban of the same IP
+# lasts bantime x multiplier[n] -> sshd: 15 min, 1 h, 24 h, 7 days, then 30 days for every
+# further ban. Deliberately NOT permanent: attacker IPs are rented cloud servers that get
+# reassigned, and a never-expiring list only grows. Each level needs maxretry failures again
+# (fail2ban has one threshold per jail). fail2ban remembers past bans in its DB for
+# hardening_fail2ban_dbpurgeage, so the escalation spans that window (> the 30-day cap).
+# Never banned by any jail: loopback + the tailnet (Tailscale/Headscale CGNAT range and its
+# IPv6 ULA) — over the VPN you can always get in, whatever fail2ban thinks.
+hardening_fail2ban_ignoreip:
+  - 127.0.0.1/8
+  - ::1
+  - 100.64.0.0/10
+  - fd7a:115c:a1e0::/48
+hardening_fail2ban_bantime_increment: true
+hardening_fail2ban_bantime_multipliers: "1 4 96 672 2880"
+hardening_fail2ban_bantime_maxtime: "30d"
+hardening_fail2ban_dbpurgeage: "60d"
+
+# Spamhaus DROP: drop ALL traffic from networks Spamhaus lists as fully criminal-controlled
+# (~1000 CIDRs, very conservative, free to use). Two ipsets (v4/v6) referenced by UFW's own
+# rule files (so they survive every `ufw reload`); spamhaus-ipset.service creates/restores
+# them BEFORE ufw at boot, spamhaus-drop-update.timer refreshes their content daily (atomic
+# swap; a broken/short download keeps the old list).
+hardening_spamhaus_drop_enabled: true
+hardening_spamhaus_drop_oncalendar: "daily"
+hardening_spamhaus_drop_min_v4: 300      # sanity floor: fewer v4 entries = broken download, keep old list
+
+# --- Optional jail: Caddy public Immich share route (HTTP Basic Auth) ---------
+# Bans IPs that fail the share basic_auth too often (brute force / credential
+# stuffing on the public share gate). Reads Caddy's JSON access log via journald
+# (the immich caddy_route logs to stderr -> journal; backend=systemd + journalmatch).
+# Enable per host (host_vars) where `immich: external` is served.
+hardening_fail2ban_caddy_immich_enabled: false
+hardening_fail2ban_caddy_immich_maxretry: 20     # >20 failed basic-auth ...
+hardening_fail2ban_caddy_immich_findtime: "15m"  # ... within 15 min ...
+hardening_fail2ban_caddy_immich_bantime: "10m"   # ... => 10 min IP ban
 
 # Max tolerated clock skew (seconds) vs online/controller time before hardening hard-fails.
 clock_skew_max_seconds: 120
 
 # Max seconds to wait for a background apt/dpkg lock to clear before aborting.
 apt_lock_wait_seconds: 300
+
+# OS hostname = the inventory name (lower-case, "_" -> "-": underscores are not valid in
+# hostnames), e.g. inventory host srv1_PROD -> srv1-prod.
+# Keeps prompt + logs unambiguous about WHICH machine you are on. Override per host with
+# system_hostname; hardening_set_hostname: false leaves the installer's name alone.
+hardening_set_hostname: true
+system_hostname: "{{ inventory_hostname | lower | replace('_', '-') }}"

@@ -1,3 +1,5 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/playwright_mcp.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
 ---
 # Playwright MCP stack defaults (was roles/playwright_mcp/defaults/main.yml).
 # Digest pin: no <service>_version var here on purpose — @sha256 pins don't fit

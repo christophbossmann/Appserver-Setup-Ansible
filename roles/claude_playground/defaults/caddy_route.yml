@@ -1,24 +1,123 @@
-# Caddy route for this role — loaded explicitly by the caddy role.
-# basic_auth hashes live in group_vars/all/vault.yml (generate a new one with
-# `caddy hash-password`).
-caddy_route_playground:
-  name: playground
-  hostname_label: playground
-  caddy_upstream: "127.0.0.1:8090"
-  caddy_extra: |
-    basic_auth {
-      kunde {{ vault_basicauth_hash_playground }}
-    }
+# Caddy routes for this role — loaded explicitly by the caddy role, selected per
+# host via caddy_services. basic_auth hashes live in group_vars/all/vault.yml
+# (generate one with `caddy hash-password`).
+#
+# One route per playground environment: <env>.<global_host> -> the env's
+# loopback port (playground_env_base_port + list index). All envs share the same
+# basic_auth credential (vault_basicauth_playground, bcrypt at render) — differentiate later
+# if you need per-env logins.
+#
+# TO ADD AN ENVIRONMENT (e.g. pg4):
+#   1. append `pg4` to playground_environments (defaults/main.yml)
+#   2. copy the caddy_route_pg3 block below to caddy_route_pg4 and bump the
+#      port offset (+3) and the labels
+#   3. add `pg4: external` to the host's caddy_services
+# Keep the offset in each block equal to the env's 0-based index in
+# playground_environments so the route port matches what the app publishes.
+
+caddy_route_pg1:
+  name: pg1
+  depends_service: playground   # a playground environment (intent-aware post-check)
+  hostname_label: pg1
+  caddy_upstream: "127.0.0.1:{{ (playground_env_base_port | default(8100)) + 0 }}"
+  # SSO via Authentik forward-auth (see authentik_forward_auth_apps: pgN). Humans
+  # in the playground-access group + admins get in; Playwright logs in as the
+  # playwright-bot service account. Replaces the old shared basic_auth.
+  caddy_forward_auth: true
+  # Same-origin Supabase: a browser app on this pgN origin calls
+  # `<same_origin_path>/rest/v1/...` on ITS OWN origin (no CORS) — Caddy strips the
+  # prefix and proxies to Kong (key-auth + RLS enforce auth), bypassing SSO on that
+  # prefix. App code: createClient(location.origin + '<same_origin_path>', ANON_KEY).
+  caddy_path_proxies:
+    - path: "{{ playground_supabase_same_origin_path | default('/api') }}/*"
+      upstream: "127.0.0.1:{{ supabase_kong_http_port }}"
+
+caddy_route_pg2:
+  name: pg2
+  depends_service: playground   # a playground environment (intent-aware post-check)
+  hostname_label: pg2
+  caddy_upstream: "127.0.0.1:{{ (playground_env_base_port | default(8100)) + 1 }}"
+  # SSO via Authentik forward-auth (see authentik_forward_auth_apps: pgN). Humans
+  # in the playground-access group + admins get in; Playwright logs in as the
+  # playwright-bot service account. Replaces the old shared basic_auth.
+  caddy_forward_auth: true
+  # Same-origin Supabase: a browser app on this pgN origin calls
+  # `<same_origin_path>/rest/v1/...` on ITS OWN origin (no CORS) — Caddy strips the
+  # prefix and proxies to Kong (key-auth + RLS enforce auth), bypassing SSO on that
+  # prefix. App code: createClient(location.origin + '<same_origin_path>', ANON_KEY).
+  caddy_path_proxies:
+    - path: "{{ playground_supabase_same_origin_path | default('/api') }}/*"
+      upstream: "127.0.0.1:{{ supabase_kong_http_port }}"
+
+caddy_route_pg3:
+  name: pg3
+  depends_service: playground   # a playground environment (intent-aware post-check)
+  hostname_label: pg3
+  caddy_upstream: "127.0.0.1:{{ (playground_env_base_port | default(8100)) + 2 }}"
+  # SSO via Authentik forward-auth (see authentik_forward_auth_apps: pgN). Humans
+  # in the playground-access group + admins get in; Playwright logs in as the
+  # playwright-bot service account. Replaces the old shared basic_auth.
+  caddy_forward_auth: true
+  # Same-origin Supabase: a browser app on this pgN origin calls
+  # `<same_origin_path>/rest/v1/...` on ITS OWN origin (no CORS) — Caddy strips the
+  # prefix and proxies to Kong (key-auth + RLS enforce auth), bypassing SSO on that
+  # prefix. App code: createClient(location.origin + '<same_origin_path>', ANON_KEY).
+  caddy_path_proxies:
+    - path: "{{ playground_supabase_same_origin_path | default('/api') }}/*"
+      upstream: "127.0.0.1:{{ supabase_kong_http_port }}"
+
+caddy_route_pg4:
+  name: pg4
+  depends_service: playground   # a playground environment (intent-aware post-check)
+  hostname_label: pg4
+  caddy_upstream: "127.0.0.1:{{ (playground_env_base_port | default(8100)) + 3 }}"
+  # SSO via Authentik forward-auth (see authentik_forward_auth_apps: pgN). Humans
+  # in the playground-access group + admins get in; Playwright logs in as the
+  # playwright-bot service account. Replaces the old shared basic_auth.
+  caddy_forward_auth: true
+  # Same-origin Supabase: a browser app on this pgN origin calls
+  # `<same_origin_path>/rest/v1/...` on ITS OWN origin (no CORS) — Caddy strips the
+  # prefix and proxies to Kong (key-auth + RLS enforce auth), bypassing SSO on that
+  # prefix. App code: createClient(location.origin + '<same_origin_path>', ANON_KEY).
+  caddy_path_proxies:
+    - path: "{{ playground_supabase_same_origin_path | default('/api') }}/*"
+      upstream: "127.0.0.1:{{ supabase_kong_http_port }}"
+
+caddy_route_pg5:
+  name: pg5
+  depends_service: playground   # a playground environment (intent-aware post-check)
+  hostname_label: pg5
+  caddy_upstream: "127.0.0.1:{{ (playground_env_base_port | default(8100)) + 4 }}"
+  # SSO via Authentik forward-auth (see authentik_forward_auth_apps: pgN). Humans
+  # in the playground-access group + admins get in; Playwright logs in as the
+  # playwright-bot service account. Replaces the old shared basic_auth.
+  caddy_forward_auth: true
+  # Same-origin Supabase: a browser app on this pgN origin calls
+  # `<same_origin_path>/rest/v1/...` on ITS OWN origin (no CORS) — Caddy strips the
+  # prefix and proxies to Kong (key-auth + RLS enforce auth), bypassing SSO on that
+  # prefix. App code: createClient(location.origin + '<same_origin_path>', ANON_KEY).
+  caddy_path_proxies:
+    - path: "{{ playground_supabase_same_origin_path | default('/api') }}/*"
+      upstream: "127.0.0.1:{{ supabase_kong_http_port }}"
 
 # WebDAV access to the playground workspace (opt-in via playground_webdav_enabled).
+# Serves the workspace ROOT, so all environments' subdirs are visible under it.
 # Add 'webdav_playground' to the host's caddy_services to expose it.
 # Port must match playground_webdav_port (default 8091).
 caddy_route_webdav_playground:
   name: webdav-playground
+  depends_service: playground   # playground workspace webdav (intent-aware post-check)
   hostname_label: webdav-playground
   caddy_upstream: "127.0.0.1:8091"
+  # In LDAP mode the WebDAV container (rclone --auth-proxy) authenticates against
+  # Authentik itself, so Caddy must NOT run its own basic_auth — it would intercept
+  # the Authorization header and reject the LDAP credentials before they ever reach
+  # the container. Only the fixed-credential fallback (playground_webdav_ldap: false)
+  # gets a Caddy basic_auth gate. (Rendered lazily, so {% if %} sees the toggle.)
   caddy_extra: |
+    {% if not (playground_webdav_ldap | default(false)) %}
     # matches playground_webdav_user / vault_playground_webdav_password
     basic_auth {
-      {{ admin_user }} {{ vault_basicauth_hash_webdav_playground }}
+      {{ admin_user }} {{ vault_basicauth_webdav_playground | password_hash('bcrypt', caddy_basicauth_salt, rounds=caddy_basicauth_rounds) }}
     }
+    {% endif %}

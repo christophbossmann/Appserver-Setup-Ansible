@@ -1,0 +1,25 @@
+services:
+  acme-dns:
+    container_name: acme-dns
+    image: {{ acme_dns_image }}
+    restart: unless-stopped
+    volumes:
+      # config.cfg deployed by compose_stack `configs:` -> /etc/acme-dns
+      - {{ acme_dns_data_dir }}/config:/etc/acme-dns:ro
+      # sqlite db (registered accounts) -> /var/lib/acme-dns
+      - {{ acme_dns_data_dir }}/data:/var/lib/acme-dns
+    ports:
+      # DNS: PUBLIC (Let's Encrypt validates from the internet). Bound to the public
+      # IP only, so it does NOT collide with systemd-resolved on 127.0.0.53:53.
+      # NB: Docker publishes bypass ufw — that is intended here (DNS must be public).
+      - "{{ acme_dns_public_ip }}:53:53/udp"
+      - "{{ acme_dns_public_ip }}:53:53/tcp"
+      # API (register/update = write path): 127.0.0.1 ONLY. Caddy reaches it via
+      # http://127.0.0.1:{{ acme_dns_api_port }}. Never exposed off the host.
+      - "127.0.0.1:{{ acme_dns_api_port }}:{{ acme_dns_api_port }}"
+    networks:
+      - backend
+
+networks:
+  backend:
+    external: true

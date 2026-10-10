@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Managed by Ansible (roles/backup_restic). Runs every backup_jobs entry:
+# pre (dumps/maintenance) -> restic backup of the paths -> post (ALWAYS runs).
+# Ends with retention (forget --prune). Any failure -> exit != 0 (visible in
+# systemctl status backup-restic / journalctl -u backup-restic).
+#
+# App selection via args:  backup-run              -> all jobs (nightly default)
+#                          backup-run full | all   -> all jobs
+#                          backup-run immich        -> only immich
+#                          backup-run nextcloud immich -> just those
+set -uo pipefail
+set -a; . /etc/restic/env; set +a
+
+WANT="${*:-full}"
+want_job() { case " $WANT " in *" full "*|*" all "*) return 0 ;; *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+overall_rc=0
+
+{% for job in backup_jobs if (job.enabled | default(true) | bool) %}
+if want_job {{ job.name }}; then
+echo "=== job: {{ job.name }} ==="
+job_rc=0
+{% for cmd in job.pre | default([]) %}
+if ! {{ cmd }}; then echo "PRE FAILED: {{ cmd }}"; job_rc=1; fi
+{% endfor %}
+if [ "$job_rc" -eq 0 ]; then
+  if ! restic backup --tag {{ job.name }} {% for p in job.paths %}"{{ p }}" {% endfor %}; then
+    echo "RESTIC BACKUP FAILED: {{ job.name }}"; job_rc=1
+  fi
+fi
+{% for cmd in job.post | default([]) %}
+{{ cmd }} || { echo "POST FAILED: {{ cmd }}"; job_rc=1; }
+{% endfor %}
+[ "$job_rc" -ne 0 ] && overall_rc=1
+fi
+{% endfor %}
+
+echo "=== retention ==="
+restic forget --prune \
+  --keep-daily {{ backup_keep_daily }} \
+  --keep-weekly {{ backup_keep_weekly }} \
+  --keep-monthly {{ backup_keep_monthly }} || overall_rc=1
+
+restic snapshots --compact | tail -5
+exit "$overall_rc"

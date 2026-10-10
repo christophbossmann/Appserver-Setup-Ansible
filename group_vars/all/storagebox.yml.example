@@ -1,0 +1,11 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/storagebox.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+# === Hetzner Storage Box (rclone/SFTP) ========================================
+# Big immich ORIGINALS live on the box; thumbs/encoded-video + DB stay local.
+# FILL IN then flip storagebox_enabled -> true. The SSH private key goes in the vault
+# (vault_storagebox_ssh_private_key); its public key must be added in the Hetzner panel.
+storagebox_enabled: true
+storagebox_host: "u123456.your-storagebox.de"
+storagebox_user: "u123456-sub1"                 # sub-account, chrooted to its own dir
+storagebox_remote_subdir: ""  
+# storagebox_vfs_cache_max_size: 5G              # bump if you view many originals

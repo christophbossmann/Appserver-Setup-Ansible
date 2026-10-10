@@ -1,0 +1,34 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/monitoring.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# Monitoring overrides (was vars/monitoring.yml). Non-secret defaults live in
+# roles/monitoring/defaults/main.yml; secrets in group_vars/all/vault.yml.
+
+# NOTE: password is only applied on FIRST START. To change later:
+# docker exec grafana grafana-cli admin reset-admin-password NEW_PASSWORD
+grafana_admin_password: "{{ vault_grafana_admin_password }}"
+
+# === Grafana native OIDC (Authentik SSO) ===
+# Real SSO via Authentik's OAuth2 provider (auto-created by the authentik
+# blueprint, client_id "grafana"). Grafana moves to EXTERNAL — that's fine, OIDC
+# is the gate. The built-in admin login stays as a break-glass fallback.
+grafana_oidc_enabled: true
+grafana_root_url: "https://{{ svc_edge_host['grafana'] }}"   # leitet aus caddy_services-Profil ab (internal -> .int, external -> public); Profil ist die EINE Stelle
+grafana_oidc_name: "Authentik"
+grafana_oidc_client_id: "grafana"
+grafana_oidc_client_secret: "{{ vault_authentik_oauth_grafana_secret }}"
+grafana_oidc_scopes: "openid email profile"
+grafana_oidc_auth_url: "{{ authentik_oidc_issuer_base }}/authorize/"
+grafana_oidc_token_url: "{{ authentik_oidc_issuer_base }}/token/"
+grafana_oidc_api_url: "{{ authentik_oidc_issuer_base }}/userinfo/"
+# Map the built-in "authentik Admins" group -> Grafana Admin, others -> Viewer.
+grafana_oidc_role_path: "contains(groups[*], 'authentik Admins') && 'Admin' || 'Viewer'"
+# Hide the local username/password login + auto-redirect to Authentik. Keep FALSE
+# until SSO is confirmed working (break-glass); flip to true afterwards.
+grafana_oidc_disable_local_login: false
+
+# On logout, send the browser to Authentik's end-session endpoint -> single-logout
+# with the same confirmation window Immich shows. end_session_endpoint is PER-APP
+# slug in Authentik (/application/o/<slug>/end-session/).
+grafana_oidc_sso_logout: true
+grafana_oidc_signout_redirect_url: "{{ authentik_oidc_issuer_base }}/{{ grafana_oidc_client_id }}/end-session/"

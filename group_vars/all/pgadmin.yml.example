@@ -1,9 +1,38 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/pgadmin.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
 ---
 # pgAdmin stack defaults (was roles/pgadmin/defaults/main.yml).
 pgadmin_version: "9.16"
 pgadmin_image: "dpage/pgadmin4:{{ pgadmin_version }}"
 pgadmin_port: 5050
 
-# pgAdmin login credentials
+# pgAdmin login credentials — secret values live in group_vars/all/vault.yml.
+# NOTE: password is only applied on FIRST START; to change later, wipe data
+# and redeploy.
 pgadmin_email: "admin@local.dev"
-pgadmin_password: "changeme"
+pgadmin_password: "{{ vault_pgadmin_password }}"
+
+# === Native OAuth2 / OIDC (Authentik SSO) ===
+# Rendered into configs/config_local.py (mounted at /pgadmin4/config_local.py).
+# 'internal' auth stays on as break-glass; OAuth users auto-create as NON-admin.
+# Access is gated in Authentik (the pgadmin app binds to "authentik Admins" by
+# default — widen via authentik_oauth_apps[].admins_only when you add more users).
+# Callback: https://pgadmin.<internal_host>/oauth2/authorize
+pgadmin_oauth_enabled: true
+pgadmin_oauth_client_id: "pgadmin"
+pgadmin_oauth_client_secret: "{{ vault_authentik_oauth_pgadmin_secret }}"
+pgadmin_oauth_display_name: "Authentik"
+pgadmin_oauth_auto_create_user: true
+pgadmin_oauth_metadata_url: "{{ authentik_oidc_issuer_base }}/pgadmin/.well-known/openid-configuration"
+
+# === Extra docker networks so pgAdmin reaches the OTHER stacks' dedicated
+# Postgres instances (registered in configs/servers.json). Each is a stack's
+# default compose network (<project>_default). Set to [] on hosts that don't run
+# these stacks (else the container fails on a missing external network).
+# NOTE: this bridges the otherwise-isolated DB networks via pgAdmin — acceptable
+# because pgAdmin is internal (tailscale) + OAuth-gated (authentik admins only).
+# Komodo is intentionally omitted (its DB is FerretDB/DocumentDB -> BSON, not
+# meaningfully browsable in pgAdmin).
+pgadmin_extra_networks:
+  - { alias: authentik, name: authentik_default }
+  - { alias: supabase,  name: supabase_default }

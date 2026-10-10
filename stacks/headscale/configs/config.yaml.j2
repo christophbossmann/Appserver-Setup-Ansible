@@ -1,0 +1,88 @@
+# headscale config — managed by Ansible (stacks/headscale/configs/config.yaml.j2).
+# Schema: headscale v0.29.x. TLS is terminated by the HOST Caddy; headscale
+# itself listens plain HTTP on :8080 and trusts the proxy (trusted_proxies).
+
+server_url: {{ headscale_server_url }}
+listen_addr: 0.0.0.0:8080
+# Prometheus metrics. Container-internal port, NOT published: reachable only on the docker
+# `backend` network (Prometheus joins it — roles/monitoring). 127.0.0.1 would hide it.
+metrics_listen_addr: {{ headscale_metrics_listen | default('0.0.0.0:9090') }}
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+
+# Caddy reaches the container via the docker bridge gateway -> trust it for
+# X-Forwarded-* so client IPs / redirects are correct behind the proxy.
+trusted_proxies:
+{% for p in headscale_trusted_proxies %}
+  - {{ p }}
+{% endfor %}
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+# Tailnet IP ranges — DISTINCT from Tailscale (see group_vars/all/headscale.yml).
+prefixes:
+  v4: {{ headscale_ipv4_prefix }}
+  v6: {{ headscale_ipv6_prefix }}
+  allocation: sequential
+
+# Reuse Tailscale's PUBLIC DERP relay map (no self-hosted DERP).
+derp:
+  server:
+    enabled: false
+  urls:
+{% for u in headscale_derp_urls %}
+    - {{ u }}
+{% endfor %}
+  paths: []
+  auto_update_enabled: true
+  update_frequency: 24h
+
+disable_check_updates: false
+ephemeral_node_inactivity_timeout: 30m
+
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+
+log:
+  level: info
+  format: text
+
+dns:
+  magic_dns: {{ headscale_magic_dns | bool | lower }}
+  base_domain: {{ headscale_dns_base_domain }}
+  override_local_dns: {{ headscale_dns_override_local | bool | lower }}
+  nameservers:
+    global:
+{% for ns in headscale_dns_nameservers %}
+      - {{ ns }}
+{% endfor %}
+    split: {}
+  search_domains: []
+  # SELF-HOSTED internal DNS: resolve this host's internal (.int) service names to
+  # its OWN Headscale IP, served by MagicDNS to this net's clients (so internal
+  # names no longer need to live in public DNS). Empty = off (current). Populate at
+  # cutover: each { name, type: A, value: <this host's headscale IP> }.
+  extra_records:
+{% for r in headscale_dns_extra_records | default([]) %}
+    - name: "{{ r.name }}"
+      type: "{{ r.type | default('A') }}"
+      value: "{{ r.value }}"
+{% else %}
+    []
+{% endfor %}
+
+# ACL policy from a file (empty path = allow-all default; tighten later).
+policy:
+  mode: file
+  path: ""
+
+# TLS handled by Caddy -> leave headscale's own TLS OFF.
+tls_cert_path: ""
+tls_key_path: ""
+
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"

@@ -8,5 +8,6 @@ caddy_route_n8n:
 
 caddy_route_webdav_n8n:
   name: webdav-n8n
+  depends_service: n8n   # webdav sidecar of the n8n role (intent-aware post-check)
   hostname_label: webdav-n8n
   caddy_upstream: "127.0.0.1:8888"

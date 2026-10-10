@@ -1,0 +1,73 @@
+---
+# Hetzner Storage Box (or any SFTP target) mounted via rclone as a systemd service.
+# HOST-GATED: only mounts where storagebox_enabled=true (set in host_vars) — not every
+# host uses it. Different hosts can point at different boxes / sub-accounts / subdirs.
+#
+# Security: transit-encrypted over SSH (rclone sftp backend, SSH key auth). NO at-rest
+# crypt on purpose — the data stays directly usable from ANY machine with the credentials,
+# so it survives a total host loss (a crypt key could be lost with the host). crypt can be
+# layered on later without re-architecting if the threat model changes.
+storagebox_enabled: false
+
+# --- Connection (set per host in host_vars; the SSH key in the vault) --------------
+storagebox_host: ""                       # e.g. u123456.your-storagebox.de
+storagebox_user: ""                       # e.g. u123456  (or a restricted sub-account)
+storagebox_port: 23                       # Hetzner Storage Box SSH/SFTP port is 23, not 22
+# Remote base dir on the box. Default = this host's inventory name, so several hosts can
+# share ONE box without colliding (each under its own dir). Override per host when you use
+# a sub-account already scoped to a directory (then usually "").
+storagebox_remote_subdir: "{{ inventory_hostname }}"
+storagebox_mountpoint: /mnt/storagebox
+
+# Host-specific ROOT folder INSIDE the mount, under which all app data on the box lives
+# (e.g. "dev" -> <mount>/dev/immich/...). Keeps several hosts tidy under one account/box and
+# makes the box layout self-documenting. Auto-created if missing. Empty = data sits directly
+# under the mount root. App roots reference it (e.g. immich_storagebox_root).
+storagebox_root_path: ""
+
+# SSH PRIVATE key for the box (PEM text), from the vault. The matching PUBLIC key must be
+# installed on the Storage Box (Hetzner panel: enable SSH support + add the key). Password
+# auth is intentionally not used.
+storagebox_ssh_private_key: "{{ vault_storagebox_ssh_private_key | default('') }}"
+
+# --- rclone binary ------------------------------------------------------------------
+# Pinned upstream release (.deb from downloads.rclone.org). The Ubuntu package lags years
+# behind (v1.60.1 on 26.04) and its VFS cache hung reads under concurrent access — immich's
+# thumbnail workers blocked forever in FUSE (D state) while direct `rclone cat` was instant.
+# "" = use the distro package instead.
+storagebox_rclone_version: "1.75.1"
+
+# --- rclone mount tuning ----------------------------------------------------------
+# VFS cache location. MUST be set explicitly: the systemd unit has no HOME, so rclone
+# falls back to /tmp/rclone — a RAM-backed tmpfs on these hosts (cache competed with the
+# containers for RAM and was wiped on every reboot). Lives in the @cache subvolume (no
+# snapshots, roles/data_storage) when cache_root is defined — inside @ every root snapshot
+# pinned evicted cache files.
+storagebox_cache_dir: "{{ (cache_root ~ '/rclone-storagebox') if cache_root is defined else '/var/cache/rclone-storagebox' }}"
+# Previous location(s): content (incl. files not yet uploaded!) is moved to
+# storagebox_cache_dir once, then the old dir is removed.
+storagebox_cache_legacy_dirs: [/var/cache/rclone-storagebox]
+# VFS cache makes repeated reads of the same original fast (immich full-image view) and
+# lets writes complete locally then flush. 'full' = read+write cache on disk.
+storagebox_vfs_cache_mode: full
+storagebox_vfs_cache_max_size: 5G
+storagebox_vfs_cache_max_age: 168h
+storagebox_dir_cache_time: 24h
+# Appended verbatim to the rclone mount command (e.g. bandwidth limits, extra --sftp-*).
+storagebox_extra_mount_args: []
+
+# --- Paths (rarely overridden) ----------------------------------------------------
+# Separate rclone config file so we never clobber backup_restic's rclone.conf.
+storagebox_config_dir: /root/.config/rclone
+storagebox_config_file: "{{ storagebox_config_dir }}/storagebox.conf"
+storagebox_key_file: "{{ storagebox_config_dir }}/storagebox_key"
+storagebox_remote_name: storagebox
+storagebox_service_name: storagebox-mount
+
+# Directories to ensure exist ON THE BOX after mounting (relative to the mountpoint).
+# App roles add their own (e.g. immich/library) — this is the baseline.
+storagebox_ensure_dirs: []
+
+# Containers that bind the Storage Box mount — stopped while the VFS cache is moved (one-time
+# migration) and started again once the mount is back.
+storagebox_dependent_containers: [immich-server, immich-webdav]

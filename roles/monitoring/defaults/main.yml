@@ -7,16 +7,131 @@ prometheus_version: "v3.12.0"
 prometheus_image: "prom/prometheus:{{ prometheus_version }}"
 prometheus_port: 9090
 prometheus_data_dir: /opt/monitoring/prometheus-data
+# Host metrics (node-exporter) are cheap — 15s is fine. cadvisor scrapes are
+# EXPENSIVE (see comment in prometheus.yml.j2) — 60s.
+prometheus_scrape_interval: "15s"
+cadvisor_scrape_interval: "60s"
 
 # Node Exporter (host metrics)
 node_exporter_version: "v1.11.1"
 node_exporter_image: "prom/node-exporter:{{ node_exporter_version }}"
+# blackbox_exporter: probes every hostname Caddy serves (list published by roles/caddy to
+# /etc/prometheus-file-sd/caddy-probes.json) — up/down, status, latency, TLS expiry.
+blackbox_exporter_version: "v0.28.0"
+blackbox_exporter_image: "prom/blackbox-exporter:{{ blackbox_exporter_version }}"
+blackbox_scrape_interval: 60s
 
-# cAdvisor (container metrics)
-# NOTE: registry moved gcr.io/cadvisor/cadvisor -> ghcr.io/google/cadvisor for v0.53.0+.
-# Versions conflicted across sources at pin time -> left as latest; set a fixed tag
-# (then convert to cadvisor_version + composed image like above).
-cadvisor_image: "gcr.io/cadvisor/cadvisor:latest"
+# postgres_exporter: one per postgres instance RUNNING on this host (taken from
+# postgres_pitr_instances, filtered by `docker ps` like roles/postgres_pitr), attached to
+# that instance's docker network. Connects as a read-only `prom_exporter` role (names starting with pg_ are reserved by postgres) (member of
+# the built-in pg_monitor: statistics only, no table data).
+postgres_exporter_version: "v0.20.1"
+postgres_exporter_image: "quay.io/prometheuscommunity/postgres-exporter:{{ postgres_exporter_version }}"
+# Derived deterministically from an existing vault secret (no extra vault entry needed);
+# re-applied with ALTER ROLE on every run, so a rotated base secret just follows along.
+# Set pg_exporter_password explicitly (e.g. from the vault) to decouple it.
+pg_exporter_password: "{{ (postgres_business_password ~ ':pg_exporter:' ~ inventory_hostname) | hash('sha256') }}"
+
+# Host-side collectors writing .prom files for node_exporter's textfile collector
+# (/var/lib/node_exporter/textfile, mounted read-only into the container).
+#   security-metrics : sshd events, UFW blocks, fail2ban, effective sshd policy — every minute
+#   disk-usage-metrics : du of the dirs below — feeds the "Disk usage" treemap
+monitoring_security_metrics_enabled: true
+#   access-metrics : Caddy access logs per served host (top IPs/paths, status classes) — every minute
+monitoring_access_metrics_enabled: true
+monitoring_disk_usage_enabled: true
+monitoring_disk_usage_oncalendar: "hourly"
+# <root>:<depth> — every directory exactly <depth> levels below <root> is measured.
+# /srv depth 2 = each data subvolume (business/db, business/immich, pg-archive/<inst> ...).
+# The Storage Box is slow over rclone (metadata only, dir cache helps) — depth 4 reaches
+# <host root>/immich/library/<user> (one box per Immich user library).
+monitoring_disk_usage_paths:
+  - /srv:2
+  - /opt:1
+  - /var/lib/docker:1
+  - /var/log:1
+  - /home:1
+  - /mnt/storagebox:4
+
+#   immich-storage-metrics : Immich DB <-> files consistency (orphans = on disk but in no DB
+#   row, e.g. originals uploaded after the dump a restore came from; missing = DB row without
+#   file, e.g. motion clips/thumbs after a restore). Read-only; path lists land in
+#   /var/lib/immich-storage-check/{orphans,missing}-<dir>.txt on the host. Needs immich.
+monitoring_immich_storage_enabled: "{{ 'immich' in (caddy_services | default({})) }}"
+monitoring_immich_storage_oncalendar: "hourly"
+monitoring_immich_storage_dirs: [library, upload, encoded-video, thumbs]
+
+#   pitr-metrics : PITR archive state per instance (base backups count/oldest/newest, last
+#   archived WAL, size) — "Database backups (PITR)" rows on the Immich + Postgres dashboards.
+monitoring_pitr_metrics_enabled: "{{ postgres_pitr_enabled | default(false) }}"
+monitoring_pitr_metrics_oncalendar: "*-*-* *:05:00"
+
+#   trivy-metrics : CRITICAL/HIGH vulnerabilities of the images of all RUNNING containers
+#   (trivy, pinned .deb, checksum-verified) — "Vulnerabilities" dashboard. No daemon: one
+#   nightly run, memory-capped (a scan of a multi-GB image needs RAM + scratch space, so it
+#   must not compete with the apps); NOT started at boot or on every deploy — only once
+#   right after trivy was installed (first deploy / version bump). DB + scratch files go
+#   to the no-snapshot cache subvolume when cache_root is defined.
+monitoring_trivy_enabled: true
+monitoring_trivy_version: "0.74.0"
+monitoring_trivy_oncalendar: "*-*-* 03:40:00"
+monitoring_trivy_cache_dir: "{{ (cache_root ~ '/trivy') if cache_root is defined else '/var/cache/trivy' }}"
+monitoring_trivy_memory_max: "2G"
+# "Would a version update help?" — per image repository the pattern (POSIX ERE, so [0-9] not
+# \d) its VERSION tags follow. For running images whose tag matches, trivy-metrics lists the
+# registry's tags, picks the newest within the running major ("same-major") and the newest
+# overall if that is another major ("latest"), and scans both from the registry — the
+# dashboard then shows what each update would actually remove. Nothing is pulled/redeployed.
+# Images without a rule (or whose running tag does not match) are simply not compared.
+# tags_from (optional): take the tag list from ANOTHER repository — for images that are
+# released together, when the image's own repository has too many tags to list in time.
+monitoring_trivy_update_rules:
+  - { image: "ghcr.io/immich-app/immich-server",              tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
+  - { image: "ghcr.io/immich-app/immich-machine-learning",    tags: '^v[0-9]+\.[0-9]+\.[0-9]+$', tags_from: "ghcr.io/immich-app/immich-server" }
+  - { image: "ghcr.io/immich-app/postgres",                   tags: '^[0-9]+-vectorchord[0-9]+\.[0-9]+\.[0-9]+$' }
+  - { image: "ghcr.io/goauthentik/server",                    tags: '^[0-9]{4}\.[0-9]+\.[0-9]+$' }
+  - { image: "ghcr.io/goauthentik/ldap",                      tags: '^[0-9]{4}\.[0-9]+\.[0-9]+$' }
+  - { image: "nextcloud",                                     tags: '^[0-9]+-apache$' }
+  - { image: "ghcr.io/juanfont/headscale",                    tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
+  - { image: "ghcr.io/tale/headplane",                        tags: '^[0-9]+\.[0-9]+\.[0-9]+$' }
+  - { image: "grafana/grafana",                               tags: '^[0-9]+\.[0-9]+\.[0-9]+$' }
+  - { image: "prom/prometheus",                               tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
+  - { image: "prom/node-exporter",                            tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
+  - { image: "prom/blackbox-exporter",                        tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
+  - { image: "quay.io/prometheuscommunity/postgres-exporter", tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
+  - { image: "ghcr.io/google/cadvisor",                       tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
+  - { image: "joohoi/acme-dns",                               tags: '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' }
+  - { image: "valkey/valkey",                                 tags: '^[0-9]+$' }
+  - { image: "postgres",                                      tags: '^[0-9]+-alpine$' }
+  - { image: "amir20/dozzle",                                 tags: '^v[0-9]+$' }
+
+# "Start new scan" button on the Vulnerabilities dashboard. Grafana cannot run host
+# commands, so the button POSTs to /hooks/trivy-scan on Grafana's own (VPN-only) host name;
+# Caddy passes that to the distro's `webhook` service on loopback, which has ONE hook:
+# `systemctl start trivy-metrics`. No Grafana login is checked on that path — whoever can
+# reach the internal Grafana route can start a scan (harmless: one run at a time, memory-capped).
+monitoring_scan_button_enabled: true
+monitoring_webhook_port: 9777
+
+# Grafana plugins installed at container start (treemap for the "Disk usage" dashboard).
+grafana_plugins:
+  - marcusolsson-treemap-panel
+
+# systemd units the node_exporter systemd collector reports (regex on the unit name) —
+# feeds the "Scheduled jobs" dashboard: the scheduled timers/services this repo and the
+# OS rely on, plus the long-running helpers docker-swap-sync + storagebox-mount.
+node_exporter_systemd_units: >-
+  (pg-pitr-backup|backup-restic|trivy-metrics|docker-prune|snapper-(timeline|cleanup|boot)|apt-daily(-upgrade)?|caddy-tailscale-cert-renew|fstrim|logrotate|dpkg-db-backup|docker-swap-sync|storagebox-mount)\.(service|timer)
+
+# cAdvisor (per-container metrics; host-level metrics come from node_exporter)
+cadvisor_version: "v0.60.5"
+cadvisor_image: "ghcr.io/google/cadvisor:{{ cadvisor_version }}"
+# cadvisor is EXPENSIVE by default (200%+ CPU on hosts with many containers,
+# plus induced dockerd/containerd load). Tame it: slower housekeeping and the
+# costly sub-metrics off. Per-container CPU/mem/net/disk — what the Grafana
+# docker dashboard uses — remain fully available.
+cadvisor_housekeeping_interval: "120s"
+cadvisor_disabled_metrics: "percpu,sched,tcp,udp,advtcp,process,hugetlb,referenced_memory,disk"
 
 # Grafana
 grafana_version: "12.2.9"

@@ -1,0 +1,32 @@
+[Unit]
+Description=rclone mount Hetzner Storage Box ({{ storagebox_remote_name }}:{{ storagebox_remote_subdir }})
+Documentation=man:rclone(1)
+After=network-online.target
+Wants=network-online.target
+AssertPathIsDirectory={{ storagebox_mountpoint }}
+
+[Service]
+Type=notify
+ExecStartPre=/bin/mkdir -p {{ storagebox_mountpoint }}
+ExecStart=/usr/bin/rclone mount {{ storagebox_remote_name }}:{{ storagebox_remote_subdir }} {{ storagebox_mountpoint }} \
+  --config {{ storagebox_config_file }} \
+  --allow-other \
+  --cache-dir {{ storagebox_cache_dir }} \
+  --vfs-cache-mode {{ storagebox_vfs_cache_mode }} \
+  --vfs-cache-max-size {{ storagebox_vfs_cache_max_size }} \
+  --vfs-cache-max-age {{ storagebox_vfs_cache_max_age }} \
+  --dir-cache-time {{ storagebox_dir_cache_time }} \
+  --umask 002 \
+  --log-level INFO{% if storagebox_extra_mount_args | length > 0 %} {{ storagebox_extra_mount_args | join(' ') }}{% endif %}
+
+# Make the mount SHARED so it propagates into Docker containers that bind it (with rslave).
+# Without this a container binding the mount sees an empty dir. Runs after Type=notify ready.
+ExecStartPost=/bin/mount --make-rshared {{ storagebox_mountpoint }}
+ExecStop=/bin/fusermount -uz {{ storagebox_mountpoint }}
+Restart=on-failure
+RestartSec=10
+# Give the SSH/VFS setup room on a slow link before systemd calls it failed.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

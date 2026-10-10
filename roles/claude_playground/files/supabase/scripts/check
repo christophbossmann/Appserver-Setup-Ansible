@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Smoke test: tooling present, all SUPABASE_* env vars set, DB reachable (DDL-capable
+# connection), and the anon REST endpoint responds. Values are never printed.
+set -uo pipefail
+fail=0
+
+echo "== tooling =="
+if command -v supabase >/dev/null 2>&1; then echo "supabase: $(supabase --version 2>/dev/null | head -1)"; else echo "supabase: MISSING"; fail=1; fi
+if command -v psql     >/dev/null 2>&1; then echo "psql:     $(psql --version)";                          else echo "psql: MISSING";     fail=1; fi
+
+echo "== env (presence only) =="
+for v in SUPABASE_URL SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY SUPABASE_DB_URL; do
+  if [ -n "${!v:-}" ]; then echo "$v: set"; else echo "$v: MISSING"; fail=1; fi
+done
+
+echo "== db connectivity (DDL-capable) =="
+if psql "${SUPABASE_DB_URL:-}" -tAc 'select 1' >/dev/null 2>&1; then echo "select 1: OK"; else echo "select 1: FAIL"; fail=1; fi
+
+echo "== anon REST (RLS-gated notes) =="
+code=$(curl -sS -o /dev/null -w '%{http_code}' \
+  "${SUPABASE_URL:-}/rest/v1/notes?select=id&limit=1" \
+  -H "apikey: ${SUPABASE_ANON_KEY:-}" -H "Authorization: Bearer ${SUPABASE_ANON_KEY:-}" 2>/dev/null || echo 000)
+echo "GET /rest/v1/notes (anon): $code"
+[ "$code" = "200" ] || echo "  (non-200 is expected until you run ./scripts/db-migrate to create the table)"
+
+echo "== result =="
+[ "$fail" -eq 0 ] && echo "OK" || echo "some checks FAILED (see above)"
+exit "$fail"

@@ -20,6 +20,21 @@
     password_lock: true
     state: present
 
+# On a FRESH host the supabase stack starts BEFORE this role and bind-mounts
+# {{ playground_ctl_workspace }}/supabase/functions into its edge-runtime —
+# docker pre-creates that missing path chain root:root, INCLUDING the home dir
+# itself (the user doesn't exist yet, and the user module never chowns an
+# existing home). A root-owned HOME breaks dockerd-rootless-setuptool.sh
+# ("HOME needs to be writable"). Heal it explicitly (non-recursive — the
+# workspace tasks below and the supabase scaffold own the deeper dirs).
+- name: Ensure the playground home itself is owned by playground
+  ansible.builtin.file:
+    path: "{{ playground_ctl_home }}"
+    state: directory
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "0755"
+
 # task.md: "playground ist nicht in der Gruppe docker."
 - name: Read playground group membership
   ansible.builtin.command: "id -nG {{ playground_ctl_user }}"
@@ -75,7 +90,7 @@
       {{ playground_ctl_workspace }} is a symlink. The workspace must be a real
       directory owned by {{ playground_ctl_user }}. Remove the symlink and re-run.
 
-- name: Ensure playground workspace exists (owner playground, real directory)
+- name: Ensure playground workspace root exists (owner playground, real directory)
   ansible.builtin.file:
     path: "{{ playground_ctl_workspace }}"
     state: directory
@@ -87,3 +102,16 @@
     # the rootless playground daemon (running as the playground user) builds
     # from the very same files. No container uid change needed.
     mode: "02775"
+
+# One real subdirectory per environment. Each is an independent compose project
+# root; the broker's --env selector maps a name -> this dir (see broker.yml /
+# environments.json). Same owner + setgid as the root so claude-ctl (group) can
+# write and the rootless playground daemon can build from the same files.
+- name: Ensure a workspace subdirectory exists for every environment
+  ansible.builtin.file:
+    path: "{{ playground_ctl_workspace }}/{{ item }}"
+    state: directory
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "02775"
+  loop: "{{ playground_environments }}"

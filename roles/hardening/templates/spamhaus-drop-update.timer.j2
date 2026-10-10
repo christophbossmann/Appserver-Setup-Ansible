@@ -1,0 +1,12 @@
+# Managed by Ansible (roles/hardening).
+[Unit]
+Description=Refresh Spamhaus DROP lists ({{ hardening_spamhaus_drop_oncalendar }})
+
+[Timer]
+OnCalendar={{ hardening_spamhaus_drop_oncalendar }}
+OnBootSec=5min
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,26 @@
+---
+# compose_stack settings for Nextcloud. See roles/compose_stack/defaults/main.yml.
+
+dir: /opt/nextcloud
+
+compose_mode: "0600"   # compose carries DB + admin credentials
+
+networks:
+  - backend            # shared net; the shared postgres instance lives there
+
+dirs:
+  # www-data (uid 33) inside the official image. ABSOLUTE paths — the data lives in the
+  # 'business' data domain (/srv/business/nextcloud/*), NOT under the compose project dir.
+  - { path: "{{ nextcloud_html_dir }}", owner: "33", group: "33", mode: "0750" }
+  - { path: "{{ nextcloud_data_dir }}", owner: "33", group: "33", mode: "0750" }
+
+# First start installs Nextcloud + runs DB migrations — give it headroom.
+health_url: "http://127.0.0.1:{{ nextcloud_port }}/status.php"
+health_retries: 30
+health_delay: 5
+
+status_msg: >-
+  Nextcloud up at https://{{ nextcloud_hostname }} — local admin
+  '{{ nextcloud_admin_user }}' / <vault_nextcloud_admin_password>; Authentik SSO
+  via the "Log in with Authentik" button (roles/nextcloud_bootstrap wires it).
+  Backups: see roles/backup_restic (cloud) + playbooks/backup-pull.yml (local).

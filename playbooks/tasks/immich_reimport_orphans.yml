@@ -1,0 +1,188 @@
+---
+# Re-import Immich ORPHANS: original files on disk (library/ + upload/, i.e. the Storage Box
+# when externalized) that NO row in the Immich DB references. Typical cause: a DB restore
+# from a dump older than the newest uploads — the files survived on the box, the DB rows
+# didn't, so Immich doesn't show them (the "Originals not in DB" panel on the Immich
+# dashboard counts them).
+#
+# Used by playbooks/immich-reimport-orphans.yml (standalone) and by
+# playbooks/immich-restore-local.yml (-e immich_restore_reimport_orphans=true).
+#
+# How (re-import as NORMAL uploads, not an external library):
+#   1. find the orphans fresh (same logic as the monitoring collector, files older than 1h)
+#   2. map each to its owner via the path: library/<storageLabel|userId>/…, upload/<userId>/…
+#   3. MOVE them into <box>/reimport/<owner>/… (a rename on the same mount, no copy) — this
+#      frees their library paths, so the storage template can put them back at the SAME
+#      path instead of "<name>+1.jpg"
+#   4. per owner: a temporary API key (inserted into api_key, removed again in `always`)
+#   5. immich CLI `upload --delete --delete-duplicates` from the staging dir: Immich imports
+#      each file (EXIF date, faces, thumbnails …) and the CLI deletes it from staging once the
+#      upload succeeded -> whatever is LEFT in staging afterwards did not make it (unsupported
+#      type / error) and is reported; a re-run retries it (staging is picked up again).
+# What is NOT recoverable: album membership, favourites, faces naming etc. of these assets
+# (that lived only in the lost DB rows).
+#
+# Inputs: immich_reimport_confirm=YES (else DRY RUN: report only, nothing is moved).
+
+- name: Re-import orphaned Immich originals
+  vars:
+    _ri_confirm: "{{ (immich_reimport_confirm | default('')) == 'YES' }}"
+    _ri_root: "{{ immich_upload_dir }}"
+    _ri_staging: >-
+      {{ (immich_storagebox_root if (immich_originals_external | default(false) | bool) else immich_upload_dir) ~ '/reimport' }}
+    _ri_db: "{{ immich_db_host | default('postgres') }}"
+    _ri_dbuser: "{{ immich_db_admin_user | default(postgres_user | default('postgres')) }}"
+    _ri_cli_image: "{{ immich_cli_image | default('ghcr.io/immich-app/immich-cli:latest') }}"
+    _ri_key_name: ansible-reimport
+  block:
+    - name: Wait until immich-server is healthy
+      ansible.builtin.command: "docker inspect immich-server -f {{ '{{.State.Health.Status}}' }}"
+      register: _ri_health
+      until: (_ri_health.stdout | trim) == 'healthy'
+      retries: 48
+      delay: 5
+      changed_when: false
+      check_mode: false
+
+    - name: Create a work dir for the scan
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: immich-reimport
+      register: _ri_tmp
+      check_mode: false
+
+    - name: Ship the consistency scanner (same script as the monitoring collector)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../roles/monitoring/files/immich-storage-metrics"
+        dest: "{{ _ri_tmp.path }}/scan"
+        mode: "0755"
+      check_mode: false
+
+    - name: Find orphaned originals (library/ + upload/)
+      ansible.builtin.command:
+        argv: ["{{ _ri_tmp.path }}/scan", "{{ _ri_root }}", /data, "{{ _ri_db }}", "{{ _ri_dbuser }}",
+               "{{ immich_db_name }}", library, upload]
+      environment:
+        TEXTFILE_DIR: "{{ _ri_tmp.path }}"
+        IMMICH_STORAGE_LIST_DIR: "{{ _ri_tmp.path }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Fail when the scan could not read the DB
+      ansible.builtin.command: grep -q '^immich_storage_scan_success 1' {{ _ri_tmp.path }}/immich-storage.prom
+      changed_when: false
+      check_mode: false
+
+    - name: Read the Immich users (id + storage label)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ _ri_db }}", psql, -U, "{{ _ri_dbuser }}", -d, "{{ immich_db_name }}", -XAt,
+               -c, "SELECT id, coalesce(nullif(\"storageLabel\", ''), id::text) FROM \"user\" WHERE \"deletedAt\" IS NULL"]
+      register: _ri_users
+      changed_when: false
+      check_mode: false
+
+    # Owner = first path segment below library/ (storage label, or the user id when the
+    # user has none) resp. upload/ (always the user id). Unmappable files are reported only.
+    - name: Map the orphans (and leftovers already in staging) to their owners
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json, os
+        root, tmp, staging = {{ _ri_root | to_json }}, {{ _ri_tmp.path | to_json }}, {{ _ri_staging | to_json }}
+        users = [l.split('|', 1) for l in {{ _ri_users.stdout_lines | to_json }} if '|' in l]
+        by_key = {}
+        for uid, label in users:
+            by_key[uid] = (uid, label); by_key[label] = (uid, label)
+        plan, unknown = {}, []
+        for d in ('library', 'upload'):
+            p = os.path.join(tmp, 'orphans-%s.txt' % d)
+            for f in (open(p).read().splitlines() if os.path.exists(p) else []):
+                rel = os.path.relpath(f, os.path.join(root, d))
+                owner, _, rest = rel.partition('/')
+                if owner not in by_key or not rest:
+                    unknown.append(f); continue
+                uid, label = by_key[owner]
+                e = plan.setdefault(uid, {'label': label, 'move': [], 'staged': 0})
+                e['move'].append([f, os.path.join(staging, label, d, rest)])
+        for uid, label in users:                      # files left over from an earlier run
+            sd = os.path.join(staging, label)
+            if os.path.isdir(sd):
+                n = sum(len(fs) for _, _, fs in os.walk(sd))
+                if n:
+                    plan.setdefault(uid, {'label': label, 'move': [], 'staged': 0})['staged'] = n
+        json.dump({'plan': plan, 'unknown': unknown}, open(os.path.join(tmp, 'plan.json'), 'w'))
+        print(json.dumps({'users': {e['label']: {'new_orphans': len(e['move']), 'already_staged': e['staged']}
+                                    for e in plan.values()}, 'unmapped': len(unknown),
+                          'owners': [{'uid': u, 'label': e['label']} for u, e in plan.items()]}))
+        PY
+      args: { executable: /bin/bash }
+      register: _ri_summary
+      changed_when: false
+      check_mode: false
+
+    - name: Orphans found
+      ansible.builtin.debug:
+        msg: >-
+          {{ (_ri_summary.stdout | from_json).users }} (unmapped: {{ (_ri_summary.stdout | from_json).unmapped }}) —
+          {% if _ri_confirm %}importing now (staging: {{ _ri_staging }}).{% else %}DRY RUN, nothing
+          moved. Re-run with -e immich_reimport_confirm=YES to import.{% endif %}
+          {% if (_ri_summary.stdout | from_json).unmapped > 0 %} Unmapped files (no matching user)
+          stay where they are — see {{ _ri_tmp.path }}/plan.json.{% endif %}
+
+    - name: Import
+      when: _ri_confirm | bool
+      block:
+        - name: Move the orphans into the staging dir (rename on the same mount)
+          ansible.builtin.shell: |
+            python3 - <<'PY'
+            import json, os
+            plan = json.load(open({{ (_ri_tmp.path ~ '/plan.json') | to_json }}))['plan']
+            n = 0
+            for e in plan.values():
+                for src, dst in e['move']:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    if not os.path.exists(dst):
+                        os.rename(src, dst); n += 1
+            print(n)
+            PY
+          args: { executable: /bin/bash }
+          register: _ri_moved
+          changed_when: (_ri_moved.stdout | trim | int) > 0
+
+        - name: Pull the immich CLI image
+          ansible.builtin.command: docker pull -q {{ _ri_cli_image }}
+          changed_when: false
+
+        - name: Upload per owner
+          ansible.builtin.include_tasks: immich_reimport_owner.yml
+          loop: "{{ (_ri_summary.stdout | from_json).owners }}"
+          loop_control: { loop_var: _ri_owner, label: "{{ _ri_owner.label }}" }
+
+        - name: Count what is left in staging (not imported)
+          ansible.builtin.shell: |
+            find {{ _ri_staging | quote }} -type d -empty -delete 2>/dev/null
+            find {{ _ri_staging | quote }} -type f 2>/dev/null | wc -l
+          args: { executable: /bin/bash }
+          register: _ri_left
+          changed_when: false
+
+        - name: Refresh the consistency metrics (Immich dashboard)
+          ansible.builtin.command: systemctl start --no-block immich-storage-metrics.service
+          changed_when: false
+          failed_when: false
+
+        - name: Re-import result
+          ansible.builtin.debug:
+            msg: >-
+              Re-import done. Left in {{ _ri_staging }}: {{ _ri_left.stdout | trim }} file(s)
+              {%- if (_ri_left.stdout | trim | int) > 0 %} — not imported (unsupported type or upload
+              error, see the CLI output above). A re-run retries them; delete them by hand if they
+              are not media.{% else %} — everything imported, staging is empty.{% endif %}
+              Immich now generates thumbnails/metadata for the new assets in the background and the
+              storage template moves them back into library/<user>/YYYY/MM/.
+  always:
+    - name: Remove the scan work dir
+      ansible.builtin.file:
+        path: "{{ _ri_tmp.path }}"
+        state: absent
+      when: _ri_tmp.path is defined
+      check_mode: false

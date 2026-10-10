@@ -1,0 +1,113 @@
+# Managed by Ansible — Authentik LDAP: ONE outpost, one PROVIDER per app (each on its
+# own base_dn). A provider WITH a `group` restricts binds to that group; WITHOUT a
+# group, any Authentik user can bind (generic credential check). All providers share
+# the MFA-free `ldap-bind-flow`, set as **authorization_flow** — the LDAP direct-bind
+# runs authorization_flow (verified in the server logs), NOT authentication_flow. The
+# outpost token is fetched by roles/authentik_bootstrap (blueprints can't expose it).
+version: 1
+metadata:
+  name: "ansible-ldap"
+entries:
+{% if authentik_ldap_enabled | default(false) %}
+  # Shared MFA-free bind flow: reuse the default identification/password/login stages
+  # (NO Authenticator-Validation/MFA stage — it can't run during a headless bind).
+  - model: authentik_flows.flow
+    id: ldap-bind-flow
+    identifiers:
+      slug: ldap-bind-flow
+    attrs:
+      name: "LDAP Bind"
+      title: "LDAP Bind"
+      designation: authentication
+      authentication: none
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf ldap-bind-flow
+      stage: !Find [authentik_stages_identification.identificationstage, [name, default-authentication-identification]]
+      order: 10
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf ldap-bind-flow
+      stage: !Find [authentik_stages_password.passwordstage, [name, default-authentication-password]]
+      order: 20
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf ldap-bind-flow
+      stage: !Find [authentik_stages_user_login.userloginstage, [name, default-authentication-login]]
+      order: 30
+{% for app in authentik_ldap_apps | default([]) %}
+{% if app.group is defined %}
+  # Access group (idempotent with authentik_groups).
+  - model: authentik_core.group
+    id: ldapgrp-{{ app.name }}
+    identifiers:
+      name: "{{ app.group }}"
+{% endif %}
+  - model: authentik_providers_ldap.ldapprovider
+    id: ldapprov-{{ app.name }}
+    identifiers:
+      name: "LDAP {{ app.name }}"
+    attrs:
+      base_dn: "{{ app.base_dn }}"
+      authorization_flow: !KeyOf ldap-bind-flow
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      authentication_flow: !KeyOf ldap-bind-flow
+{% if app.group is defined %}
+      search_group: !Find [authentik_core.group, [name, "{{ app.group }}"]]
+{% endif %}
+  - model: authentik_core.application
+    id: ldapapp-{{ app.name }}
+    identifiers:
+      slug: "ldap-{{ app.name }}"
+    attrs:
+      name: "LDAP {{ app.name }}"
+      provider: !KeyOf ldapprov-{{ app.name }}
+{% if app.group is defined %}
+  # Only this group may use (bind to) the app. NO binding here = EVERY user may bind.
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf ldapapp-{{ app.name }}
+      group: !Find [authentik_core.group, [name, "{{ app.group }}"]]
+      order: 0
+    attrs:
+      enabled: true
+{% if authentik_ldap_admin_access | default(true) %}
+  # Admins always keep access (ANY-mode: app group OR admin group may bind).
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf ldapapp-{{ app.name }}
+      group: !Find [authentik_core.group, [name, "{{ authentik_ldap_admin_group }}"]]
+      order: 1
+    attrs:
+      enabled: true
+{% endif %}
+{% endif %}
+{% endfor %}
+  # ONE outpost serving ALL providers (differentiated by base_dn).
+  - model: authentik_outposts.outpost
+    id: outpost-ldap
+    identifiers:
+      name: "{{ authentik_ldap_outpost_name }}"
+    attrs:
+      type: ldap
+      providers:
+{% for app in authentik_ldap_apps | default([]) %}
+        - !KeyOf ldapprov-{{ app.name }}
+{% endfor %}
+      config:
+        authentik_host: "https://authentik.{{ global_host }}"
+        authentik_host_insecure: false
+        authentik_host_browser: ""
+        log_level: info
+        object_naming_template: "ak-outpost-%(name)s"
+        docker_network: null
+        docker_map_ports: true
+        docker_labels: null
+        container_image: null
+        refresh_interval: "minutes=5"
+        kubernetes_replicas: 1
+        kubernetes_namespace: default
+        kubernetes_service_type: ClusterIP
+        kubernetes_disabled_components: []
+        kubernetes_image_pull_secrets: []
+{% endif %}

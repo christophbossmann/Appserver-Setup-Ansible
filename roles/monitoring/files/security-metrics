@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+# Managed by Ansible (roles/monitoring). Security metrics for node_exporter's textfile
+# collector -> the "Security" Grafana dashboard. Run every minute by
+# security-metrics.timer. Lightweight on purpose (no Loki): reads only NEW journal
+# entries since the last run (journal cursors), keeps counters + 24h rolling per-IP /
+# per-port / per-user tallies in a small state file, and writes one .prom file atomically.
+#
+# Metrics:
+#   security_ssh_events_total{event}            counter: failed_password_valid_user,
+#       failed_password_invalid_user, invalid_user, preauth_closed, probe_disconnect, scanner,
+#       too_many_auth_failures, accepted
+#   security_ufw_blocked_total{proto}           counter: UFW BLOCK kernel log lines
+#   Per-window gauges, window = 1h | 24h | 7d | 30d (the dashboard's "window" selector):
+#   security_events{kind,window}                totals: ssh_attempts, ssh_logins, ufw_blocks
+#   security_top_source{source,ip,window}       top-10 IPs per source (ssh|ufw)
+#   security_top_port{proto,port,window}        top-10 UFW-blocked destination ports
+#   security_top_ssh_user{user,window}          top-10 usernames tried
+#   security_ssh_login_timestamp{user,ip,method,window}  last ACCEPTED login per user+ip
+#   security_fail2ban_banned{jail}              gauge: currently banned
+#   security_fail2ban_failed{jail}              gauge: currently failed (in findtime)
+#   security_fail2ban_banned_since_start{jail}  gauge: total banned since fail2ban start
+#   security_spamhaus_dropped_packets_total{chain}  counter: dropped by Spamhaus DROP rules
+#   security_sshd_password_auth_enabled         gauge: 1 = sshd accepts passwords (BAD)
+#   security_sshd_root_login_enabled            gauge: 1 = root may log in (BAD)
+#   security_metrics_last_run_timestamp_seconds gauge
+import json, os, re, subprocess, time
+
+TEXTFILE_DIR = "/var/lib/node_exporter/textfile"
+OUT = os.path.join(TEXTFILE_DIR, "security.prom")
+STATE = "/var/lib/node_exporter/security-state.json"
+WINDOWS = {"1h": 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+FINE = 300
+TOP = 10
+
+SSH_RULES = [  # order matters: first match wins
+    ("accepted", re.compile(r"^Accepted (\S+) for (\S+) from (\S+)")),
+    ("failed_password_invalid_user", re.compile(r"^Failed \S+ for invalid user (\S*) from (\S+)")),
+    ("failed_password_valid_user", re.compile(r"^Failed \S+ for (\S+) from (\S+)")),
+    ("invalid_user", re.compile(r"^Invalid user (\S*) from (\S+)")),
+    ("too_many_auth_failures", re.compile(r"Too many authentication failures for (?:invalid user )?(\S*) from (\S+)")),
+    # "... by/from (authenticating|invalid) user X IP port N [preauth]" — with password login
+    # off, bots give up here (the server only offers publickey)
+    ("preauth_closed", re.compile(r"^(?:Connection closed|Disconnected|Connection reset) (?:by|from) (?:authenticating |invalid )?user (\S*) (\S+) port \d+ \[preauth\]")),
+    # pre-auth disconnects without a username (probe connects, sees publickey-only, leaves)
+    ("probe_disconnect", re.compile(r"^(?:Received disconnect from|Connection closed by|Connection reset by) (\d+\.\d+\.\d+\.\d+|[0-9a-f:]{3,}) port \d+.*\[preauth\]")),
+    ("scanner", re.compile(r"(?:banner exchange|kex_exchange_identification|Bad protocol version|invalid format).*?(?:from |: )?(\d+\.\d+\.\d+\.\d+|[0-9a-f:]{3,})")),
+]
+UFW_RE = re.compile(r"SRC=(\S+) .*?PROTO=(\S+)(?: .*?DPT=(\d+))?")
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
+
+
+def journal(args, cursor):
+    cmd = ["journalctl", "--no-pager", "-o", "json"] + args
+    cmd += ["--after-cursor", cursor] if cursor else ["--since", "-30d"]   # first run: backfill the longest window
+    entries = []
+    for line in run(cmd).splitlines():
+        try:
+            entries.append(json.loads(line))
+        except ValueError:
+            pass
+    return entries
+
+
+def esc(v):  # Prometheus label value escaping; attacker-controlled strings are capped
+    return str(v)[:48].replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def main():
+    now = time.time()
+    st = load_state()
+    st.setdefault("counters", {})
+    st.setdefault("ufw_total", {})
+    st.setdefault("buckets", {})          # hour -> {"ssh": {ip:n}, "ufw": {ip:n}, "port": {"tcp/22":n}, "user": {u:n}, "tot": {...}}
+    st.setdefault("logins", {})           # "user|ip|method" -> ts
+
+    st.setdefault("fine", {})             # 5-min buckets (last 2h) -> the "1h" window
+
+    def buckets(ts):
+        h = st["buckets"].setdefault(str(int(ts // 3600) * 3600), {})
+        f = st["fine"].setdefault(str(int(ts // FINE) * FINE), {})
+        return (h, f)
+
+    def inc(d, k, n=1):
+        d[k] = d.get(k, 0) + n
+
+    def add(bs, kind, key):
+        for b in bs:
+            inc(b.setdefault(kind, {}), key)
+
+    # --- sshd (journal unit ssh.service; OpenSSH 10 logs as sshd-session) ---
+    entries = journal(["-u", "ssh"], st.get("cursor_ssh"))
+    for e in entries:
+        msg = e.get("MESSAGE", "")
+        if not isinstance(msg, str):
+            continue
+        ts = int(e.get("__REALTIME_TIMESTAMP", now * 1e6)) / 1e6
+        for event, rx in SSH_RULES:
+            m = rx.search(msg)
+            if not m:
+                continue
+            inc(st["counters"], event)
+            bs = buckets(ts)
+            if event == "accepted":
+                method, user, ip = m.groups()
+                st["logins"][f"{user}|{ip}|{method}"] = ts
+                add(bs, "tot", "ssh_logins")
+            else:
+                add(bs, "tot", "ssh_attempts")
+                g = m.groups()
+                user, ip = ("", g[0]) if len(g) == 1 else (g[0], g[1])   # 1 group = IP only
+                if ip:
+                    add(bs, "ssh", ip)
+                if user and event != "preauth_closed":
+                    add(bs, "user", user)
+            break
+    if entries:
+        st["cursor_ssh"] = entries[-1]["__CURSOR"]
+
+    # --- UFW blocks (kernel log) ---
+    entries = journal(["-k", "--grep", "UFW BLOCK"], st.get("cursor_ufw"))
+    for e in entries:
+        msg = e.get("MESSAGE", "")
+        m = UFW_RE.search(msg) if isinstance(msg, str) else None
+        if not m:
+            continue
+        ts = int(e.get("__REALTIME_TIMESTAMP", now * 1e6)) / 1e6
+        ip, proto, port = m.group(1), m.group(2).lower(), m.group(3)
+        inc(st["ufw_total"], proto)
+        bs = buckets(ts)
+        add(bs, "ufw", ip)
+        add(bs, "tot", "ufw_blocks")
+        if port:
+            add(bs, "port", f"{proto}/{port}")
+    if entries:
+        st["cursor_ufw"] = entries[-1]["__CURSOR"]
+
+    # --- prune: hourly buckets + logins keep the longest window, fine buckets 2h ---
+    longest = max(WINDOWS.values())
+    st["buckets"] = {k: v for k, v in st["buckets"].items() if int(k) + 3600 > now - longest}
+    st["fine"] = {k: v for k, v in st["fine"].items() if int(k) + FINE > now - 7200}
+    st["logins"] = {k: v for k, v in st["logins"].items() if v > now - longest}
+
+    def agg(window, kind):
+        secs = WINDOWS[window]
+        store, size = (st["fine"], FINE) if window == "1h" else (st["buckets"], 3600)
+        out_ = {}
+        for start, b in store.items():
+            if int(start) + size > now - secs:
+                for k, n in b.get(kind, {}).items():
+                    out_[k] = out_.get(k, 0) + n
+        return out_
+
+    def top(window, kind):
+        return sorted(agg(window, kind).items(), key=lambda kv: -kv[1])[:TOP]
+
+    out = []
+    def metric(name, help_, typ, samples):
+        out.append(f"# HELP {name} {help_}")
+        out.append(f"# TYPE {name} {typ}")
+        for labels, value in samples:
+            lab = ",".join(f'{k}="{esc(v)}"' for k, v in labels.items())
+            out.append(f"{name}{{{lab}}} {value}" if lab else f"{name} {value}")
+
+    events = ["failed_password_valid_user", "failed_password_invalid_user", "invalid_user",
+              "preauth_closed", "probe_disconnect", "scanner", "too_many_auth_failures", "accepted"]
+    metric("security_ssh_events_total", "sshd authentication events by type", "counter",
+           [({"event": ev}, st["counters"].get(ev, 0)) for ev in events])
+    metric("security_ufw_blocked_total", "UFW BLOCK kernel log lines by protocol", "counter",
+           [({"proto": p}, n) for p, n in sorted(st["ufw_total"].items())] or [({"proto": "tcp"}, 0)])
+    W = list(WINDOWS)
+    metric("security_events", "Event totals per window (1h from 5-min buckets, else hourly)", "gauge",
+           [({"kind": k, "window": w}, agg(w, "tot").get(k, 0))
+            for w in W for k in ("ssh_attempts", "ssh_logins", "ufw_blocks")])
+    metric("security_top_source", "Top source IPs per window", "gauge",
+           [({"source": src, "ip": ip, "window": w}, n)
+            for w in W for src in ("ssh", "ufw") for ip, n in top(w, src)])
+    metric("security_top_port", "Top UFW-blocked destination ports per window", "gauge",
+           [({"proto": k.split("/")[0], "port": k.split("/")[1], "window": w}, n)
+            for w in W for k, n in top(w, "port")])
+    metric("security_top_ssh_user", "Top usernames tried over SSH per window", "gauge",
+           [({"user": u, "window": w}, n) for w in W for u, n in top(w, "user")])
+    recent = sorted(st["logins"].items(), key=lambda kv: -kv[1])
+    metric("security_ssh_login_timestamp", "Last accepted SSH login per user/ip/method within the window", "gauge",
+           [({"user": k.split("|")[0], "ip": k.split("|")[1], "method": k.split("|")[2], "window": w}, int(v))
+            for w in W for k, v in [kv for kv in recent if kv[1] > now - WINDOWS[w]][:20]])
+
+    # --- fail2ban ---
+    f2b = []
+    jails = re.search(r"Jail list:\s*(.*)", run(["fail2ban-client", "status"]))
+    for jail in [j.strip() for j in (jails.group(1).split(",") if jails else []) if j.strip()]:
+        s = run(["fail2ban-client", "status", jail])
+        g = lambda k: int((re.search(rf"{k}:\s*(\d+)", s) or [None, 0])[1])
+        f2b.append((jail, g("Currently banned"), g("Currently failed"), g("Total banned")))
+    metric("security_fail2ban_banned", "fail2ban currently banned IPs per jail", "gauge",
+           [({"jail": j}, b) for j, b, _, _ in f2b])
+    metric("security_fail2ban_failed", "fail2ban currently failed (within findtime) per jail", "gauge",
+           [({"jail": j}, f) for j, _, f, _ in f2b])
+    metric("security_fail2ban_banned_since_start", "fail2ban total bans since its last start", "gauge",
+           [({"jail": j}, t) for j, _, _, t in f2b])
+
+    # --- Spamhaus DROP (roles/hardening): packets dropped by the set-match rules ---
+    sp = []
+    for binary, chain in (("iptables", "ufw-before-input"), ("ip6tables", "ufw6-before-input"),
+                          ("iptables", "DOCKER-USER")):
+        pk = 0
+        for line in run([binary, "-w", "-nvxL", chain]).splitlines():
+            if "match-set spamhaus-drop" in line and line.split()[2:3] == ["DROP"]:
+                pk += int(line.split()[0])
+        sp.append(({"chain": chain}, pk))
+    metric("security_spamhaus_dropped_packets_total",
+           "Packets dropped by the Spamhaus DROP ipset rules (resets on firewall reload)", "counter", sp)
+
+    # --- effective sshd policy (sshd -T) — the config that ACTUALLY applies ---
+    eff = run(["/usr/sbin/sshd", "-T"]).splitlines()
+    metric("security_sshd_password_auth_enabled", "1 = sshd accepts password logins", "gauge",
+           [({}, int("passwordauthentication yes" in eff))])
+    metric("security_sshd_root_login_enabled", "1 = sshd allows root login (any mode but no)", "gauge",
+           [({}, int(any(l.startswith("permitrootlogin ") and l != "permitrootlogin no" for l in eff)))])
+    metric("security_metrics_last_run_timestamp_seconds", "Last successful run", "gauge", [({}, int(now))])
+
+    os.makedirs(TEXTFILE_DIR, exist_ok=True)
+    tmp = OUT + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(out) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, OUT)
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(st, f)
+    os.replace(STATE + ".tmp", STATE)
+
+
+if __name__ == "__main__":
+    main()

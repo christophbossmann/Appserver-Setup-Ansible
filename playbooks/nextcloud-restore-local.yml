@@ -1,0 +1,175 @@
+---
+# Restore Nextcloud from the LOCAL pull backup (./backups/<host>/nextcloud/), the
+# counterpart to playbooks/backup-pull.yml — no restic/cloud needed. DESTRUCTIVE:
+# overwrites live data + config + DB with the local backup.
+#
+#   ansible-playbook playbooks/nextcloud-restore-local.yml \
+#     --limit <host> -e nc_restore_confirm=YES \
+#     [-e nc_restore_files=false] [-e nc_restore_db=false]
+#
+# rsync PUSHES from the controller up to the host (delegate_to localhost, direct
+# rsync over SSH — synchronize breaks on the WSL controller). --rsync-path=sudo rsync
+# lets it write the root-owned target dirs.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+
+- name: Restore Nextcloud from the local pull backup
+  hosts: servers
+  become: true
+  vars:
+    nc_restore_files: true
+    nc_restore_db: true
+    backup_pull_dest: "{{ backup_pull_dir | default(playbook_dir ~ '/../backups') }}/{{ inventory_hostname }}"
+    _src: "{{ backup_pull_dir | default(playbook_dir ~ '/../backups') }}/{{ inventory_hostname }}/nextcloud"
+    _tgt_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+    _tgt_user: "{{ hostvars[inventory_hostname].ansible_user | default('ansible') }}"
+    _ssh: "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+    _remote_dump: /opt/backups/restore-nextcloud-db.dump
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that: [nc_restore_confirm | default('') == 'YES']
+        fail_msg: "Refusing to restore. Re-run with -e nc_restore_confirm=YES (this OVERWRITES live data)."
+
+    - name: Verify the local backup exists
+      ansible.builtin.stat:
+        path: "{{ _src }}/nextcloud-db/db.dump"
+      delegate_to: localhost
+      become: false
+      register: _dump_stat
+      failed_when: not _dump_stat.stat.exists
+
+    - name: Enable maintenance mode
+      ansible.builtin.command:
+        argv: [docker, exec, -u, www-data, nextcloud, php, occ, maintenance:mode, --on]
+
+    - block:
+        - name: Push data/ back over live (rsync --delete = live matches backup exactly)
+          ansible.builtin.command:
+            argv:
+              - rsync
+              - -az
+              - --delete
+              - -e
+              - "{{ _ssh }}"
+              - "--rsync-path=sudo rsync"
+              - "{{ _src }}/data/"
+              - "{{ _tgt_user }}@{{ _tgt_host }}:{{ nextcloud_data_dir }}/"
+          delegate_to: localhost
+          become: false
+          when: nc_restore_files | bool
+
+        - name: Push config/ back over live
+          ansible.builtin.command:
+            argv:
+              - rsync
+              - -az
+              - -e
+              - "{{ _ssh }}"
+              - "--rsync-path=sudo rsync"
+              - "{{ _src }}/config/"
+              - "{{ _tgt_user }}@{{ _tgt_host }}:{{ nextcloud_html_dir }}/config/"
+          delegate_to: localhost
+          become: false
+          when: nc_restore_files | bool
+
+        - name: Re-point config.php dbhost at the CURRENT DB instance
+          # A backup taken before a DB migration carries the old dbhost in config.php;
+          # restoring it would send Nextcloud to an instance where its DB no longer
+          # exists (and then occ can't even start to fix it). Rewrite it at the file
+          # level to wherever the DB lives now. Runs as root in the container (config
+          # was rsynced root-owned); the chown 33:33 task below fixes ownership after.
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - nextcloud
+              - sed
+              - -i
+              - "s/'dbhost' => '[^']*'/'dbhost' => '{{ nextcloud_db_host | default('postgres') }}'/"
+              - /var/www/html/config/config.php
+          when: nc_restore_files | bool
+
+        - name: Push the DB dump up to the host
+          ansible.builtin.command:
+            argv:
+              - rsync
+              - -az
+              - -e
+              - "{{ _ssh }}"
+              - "--rsync-path=sudo rsync"
+              - "{{ _src }}/nextcloud-db/db.dump"
+              - "{{ _tgt_user }}@{{ _tgt_host }}:{{ _remote_dump }}"
+          delegate_to: localhost
+          become: false
+          when: nc_restore_db | bool
+
+        - name: Restore the database (pg_restore --clean, DESTRUCTIVE)
+          # NO --no-owner: the dump (made by the superuser) records owner=nextcloud;
+          # restoring as the superuser re-applies that ownership so the least-privilege
+          # `nextcloud` app role keeps access. --no-owner would leave every object owned
+          # by the restoring superuser -> the app gets "permission denied".
+          ansible.builtin.shell: >-
+            cat {{ _remote_dump }} |
+            docker exec -i {{ nextcloud_db_host | default('postgres') }}
+            pg_restore -U {{ nextcloud_db_admin_user | default(postgres_user) }}
+            -d {{ nextcloud_db_name }} --clean --if-exists
+          args: { executable: /bin/bash }
+          register: _pg_restore
+          failed_when: false   # --clean emits benign "does not exist" notices; inspect output
+          when: nc_restore_db | bool
+
+        # NOTE — no OIDC re-link step needed here (unlike immich-restore-local.yml):
+        # Nextcloud user_oidc maps uid=preferred_username with --unique-uid=0, so an
+        # SSO login re-attaches to the NC account by USERNAME, not by the Authentik
+        # `sub`. A rebuilt/declarative Authentik keeps the same usernames -> the links
+        # survive without restoring the Authentik DB and without clearing anything.
+
+        - name: Ensure every restored object is owned by the Nextcloud DB role
+          # Belt-and-suspenders: if any object ends up owned by the restoring
+          # superuser (e.g. an old --no-owner dump), the least-privilege `nextcloud`
+          # app role gets "permission denied". Reassign anything in public not owned
+          # by the DB owner back to it. Idempotent (touches only mismatches).
+          ansible.builtin.shell: |
+            docker exec -i {{ nextcloud_db_host | default('postgres') }} psql -U {{ nextcloud_db_admin_user | default(postgres_user) }} -d {{ nextcloud_db_name }} <<'SQL'
+            DO $$
+            DECLARE r record; dbowner text;
+            BEGIN
+              SELECT datdba::regrole::text INTO dbowner FROM pg_database WHERE datname = current_database();
+              FOR r IN SELECT tablename AS n FROM pg_tables WHERE schemaname='public' AND tableowner <> dbowner LOOP
+                EXECUTE format('ALTER TABLE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+              FOR r IN SELECT sequencename AS n FROM pg_sequences WHERE schemaname='public' AND sequenceowner <> dbowner LOOP
+                EXECUTE format('ALTER SEQUENCE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+              FOR r IN SELECT viewname AS n FROM pg_views WHERE schemaname='public' AND viewowner <> dbowner LOOP
+                EXECUTE format('ALTER VIEW public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+            END $$;
+            SQL
+          args: { executable: /bin/bash }
+          changed_when: true
+          when: nc_restore_db | bool
+
+        - name: Fix ownership of restored files (www-data uid 33)
+          ansible.builtin.command:
+            argv: [docker, exec, nextcloud, chown, -R, "33:33", /var/www/data, /var/www/html/config]
+          when: nc_restore_files | bool
+      always:
+        - name: Remove the staged dump on the host
+          ansible.builtin.file:
+            path: "{{ _remote_dump }}"
+            state: absent
+
+        - name: Disable maintenance mode
+          ansible.builtin.command:
+            argv: [docker, exec, -u, www-data, nextcloud, php, occ, maintenance:mode, --off]
+
+    - name: Rescan files into the DB filecache
+      ansible.builtin.command:
+        argv: [docker, exec, -u, www-data, nextcloud, php, occ, files:scan, --all]
+      when: nc_restore_files | bool
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Local restore complete (files={{ nc_restore_files }}, db={{ nc_restore_db }}).
+          App-enabled state is now the backup era — re-run --tags nc_apps / nextcloud
+          to re-converge if the backup predates app/version changes.

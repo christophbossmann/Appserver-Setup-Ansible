@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Managed by Ansible (roles/postgres_pitr). For each PITR postgres instance: take a
+# compressed base backup, then prune old base backups + WAL by age. Optional arg =
+# only that instance (by name); no arg = all.
+#
+#   pg-pitr-backup                              # all instances (what the daily timer runs)
+#   pg-pitr-backup <name>                       # one instance
+#   pg-pitr-backup --after-rollback <name>      # after a btrfs SNAPSHOT rollback of <name>
+#
+# --after-rollback: a snapshot rollback puts the cluster back in time, but the archive
+# still holds the WAL of the discarded "future" under the SAME segment names. Postgres
+# then re-creates those names -> archive_command refuses (file exists) -> archiving stalls
+# and pg_wal grows. This moves the archive's wal/ aside to wal-before-rollback-<ts>/ (kept,
+# NOT deleted — lets you still PITR forward into the discarded history from an old base),
+# starts a fresh wal/, and takes a base backup right away, so archive + cluster form one
+# consistent history again. Prefer PITR for intended DB time travel — it switches timeline
+# cleanly and needs none of this.
+#
+# Retention model (simple + safe): base backups older than RET days are dropped; WAL
+# is kept RET+2 days — a bit longer than the oldest base backup — so any point from
+# the oldest retained base backup up to now stays restorable. wal-before-rollback-*/
+# dirs follow the same WAL_RET (by last modification), so they don't pile up.
+set -uo pipefail
+AFTER_ROLLBACK=false
+if [ "${1:-}" = "--after-rollback" ]; then
+  AFTER_ROLLBACK=true; shift
+  [ -n "${1:-}" ] || { echo "usage: $0 --after-rollback <instance name>" >&2; exit 2; }
+fi
+WANT="${1:-}"
+RET={{ postgres_pitr_retention_days }}
+WAL_RET=$(( RET + 2 ))
+rc=0
+found=false
+
+run_one() {
+  local name="$1" cont="$2" user="$3"
+  [ -n "$WANT" ] && [ "$WANT" != "$name" ] && return 0
+  found=true
+  # UTC-named so it sorts/compares correctly against the restore target, which
+  # postgres-pitr-restore computes with `date -u` (recovery_target_time is UTC too).
+  local ts; ts="$(date -u +%Y%m%d-%H%M%S)"
+  if $AFTER_ROLLBACK; then
+    echo "=== after snapshot rollback: rotating WAL archive of $name ($cont) ==="
+    if docker exec -u postgres "$cont" sh -c "mv /archive/wal /archive/wal-before-rollback-$ts && mkdir -m 700 /archive/wal"; then
+      echo "  old WAL kept at /archive/wal-before-rollback-$ts (auto-pruned after $WAL_RET days)"
+    else
+      echo "  ROTATION FAILED: $name — not taking a base backup"; rc=1; return
+    fi
+  fi
+  echo "=== PITR base backup: $name ($cont) ==="
+  # -Ft -z: compressed tar; -Xs: stream WAL into the backup so it is self-consistent;
+  # -cfast: fast checkpoint. Runs as the container's postgres OS user (owns /archive).
+  if docker exec -u postgres "$cont" pg_basebackup -U "$user" -D "/archive/base/$ts" -Ft -z -Xs -cfast; then
+    echo "  base backup $name/$ts OK"
+  else
+    echo "  BASE BACKUP FAILED: $name"; rc=1
+  fi
+  # retention: base backups older than RET days
+  docker exec "$cont" sh -c "find /archive/base -mindepth 1 -maxdepth 1 -type d -mtime +$RET -exec rm -rf {} +"
+  # retention: WAL segments older than WAL_RET days (gzip'd .gz and older plain ones)
+  docker exec "$cont" sh -c "find /archive/wal -type f -mtime +$WAL_RET -delete"
+  # retention: rotated pre-rollback WAL dirs, same window
+  docker exec "$cont" sh -c "find /archive -mindepth 1 -maxdepth 1 -type d -name 'wal-before-rollback-*' -mtime +$WAL_RET -exec rm -rf {} +"
+  echo "  retained base: $(docker exec "$cont" sh -c 'ls -1 /archive/base | wc -l') backups, WAL: $(docker exec "$cont" sh -c 'ls -1 /archive/wal | wc -l') segs, pre-rollback dirs: $(docker exec "$cont" sh -c 'ls -1d /archive/wal-before-rollback-* 2>/dev/null | wc -l')"
+}
+
+{% for inst in postgres_pitr_instances %}
+run_one "{{ inst.name }}" "{{ inst.container }}" "{{ inst.user }}"
+{% endfor %}
+
+if [ -n "$WANT" ] && ! $found; then
+  echo "unknown instance '$WANT' (known: {{ postgres_pitr_instances | map(attribute='name') | join(', ') }})" >&2
+  exit 2
+fi
+exit $rc

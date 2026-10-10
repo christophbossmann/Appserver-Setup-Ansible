@@ -1,0 +1,171 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/nextcloud.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# Nextcloud — public file cloud at nextcloud.<global_host>. compose_stack
+# (stacks/nextcloud), DB on the SHARED postgres instance (like immich/n8n —
+# nextcloud needs no special postgres image), valkey for file locking, cron
+# sidecar. Login: local admin + Authentik OIDC (user_oidc app, configured by
+# roles/nextcloud_bootstrap via occ). NO forward-auth on the route — sync
+# clients (desktop/mobile, CalDAV/CardDAV) authenticate against Nextcloud
+# itself and would break behind an SSO redirect.
+
+nextcloud_version: "31-apache"
+nextcloud_image: "nextcloud:{{ nextcloud_version }}"
+nextcloud_redis_image: "valkey/valkey:9"
+
+# Host loopback port (Caddy fronts it on the external route).
+nextcloud_port: 8096
+
+nextcloud_hostname: "{{ svc_edge_host['nextcloud'] }}"
+
+# Bind mounts — deliberately split so the backup can target them precisely:
+#   html/   app + config (config/config.php is part of every backup)
+#   data/   user files (the big part; NEXTCLOUD_DATA_DIR points here)
+nextcloud_html_dir: "{{ data_root_business }}/nextcloud/html"
+nextcloud_data_dir: "{{ data_root_business }}/nextcloud/data"
+
+# === Read-only raw WebDAV (inspection of the data dir over VPN) ===============
+# For NORMAL file access use Nextcloud's OWN WebDAV instead (see below) — it keeps
+# the DB file cache (oc_filecache) consistent. This sidecar is a READ-ONLY (:ro)
+# raw view of the data dir for inspection/spot-recovery only; NEVER write through
+# it (it bypasses Nextcloud -> files would look missing until `occ files:scan`; the
+# :ro mount blocks writes anyway). Loopback + INTERNAL Caddy route
+# (webdav-nextcloud.int.<host>, Tailscale) + Authentik LDAP (webdav-nextcloud-users).
+#
+# Nextcloud's NATIVE WebDAV (read-write, cache-safe, already deployed) lives at:
+#   https://{{ nextcloud_hostname }}/remote.php/dav/files/<user>/
+# Log in with an app password (Settings -> Security), not the SSO password.
+nextcloud_webdav_enabled: true
+nextcloud_webdav_port: 8891              # host 127.0.0.1:<port> -> container :8888
+nextcloud_webdav_ldap: true
+nextcloud_webdav_ldap_base_dn: "dc=nextcloud,dc=ldap,dc=example,dc=com"
+nextcloud_webdav_cachetime: "5s"
+# basic_auth fallback (only used when nextcloud_webdav_ldap is false):
+nextcloud_webdav_user: "{{ admin_user }}"
+nextcloud_webdav_password: "{{ vault_nextcloud_webdav_password | default('changeme') }}"
+
+# DB on the shared postgres instance (least-privilege role, owns only its DB —
+# same pattern as immich's one-shot db-init).
+nextcloud_db_name: nextcloud
+nextcloud_db_user: nextcloud
+nextcloud_db_password: "{{ vault_nextcloud_db_password }}"
+
+# Local break-glass admin (created on FIRST install only; SSO via Authentik is
+# the everyday login once user_oidc is configured).
+nextcloud_admin_user: admin
+nextcloud_admin_password: "{{ vault_nextcloud_admin_password }}"
+
+# Authentik OIDC (user_oidc app). The provider entry is created by
+# roles/nextcloud_bootstrap; the client is declared in authentik_oauth_apps.
+# Declaratively managed apps (installed from the Nextcloud appstore on every
+# deploy; idempotent). Ansible owns the app SET; the backup owns the DATA. After
+# a restore the next deploy re-installs any declared app that predates the backup.
+# Find app ids at https://apps.nextcloud.com or via `occ app:list`.
+nextcloud_apps_enabled:
+  # Appstore apps (NOT bundled) — a fresh install / restore wouldn't have these,
+  # so they must be declared. The many bundled defaults (Activity, Photos, Text,
+  # Dashboard, Contacts Interaction, PDF viewer, Password policy, Teams/circles …)
+  # ship with the image and are enabled automatically — no need to list them.
+  - calendar
+  - contacts
+  - notes
+  - tasks
+  - spreed        # Talk (chat/calls). Small groups work out of the box; large-scale
+                  # needs the separate High-Performance-Backend (own container) — not set up here.
+  - phonetrack    # PhoneTrack
+  - mail              # Nextcloud Mail
+  - maps              # Nextcloud Maps
+  - rotatingwallpapers  # rotating/changing backgrounds from a wallpaper set you
+                        # provide (replaces the dead 'unsplash'/'Splash' app, which
+                        # relied on the retired source.unsplash.com -> HTTP 503).
+# Apps to force-OFF (e.g. default bloat you don't want). Left empty by default.
+nextcloud_apps_disabled:
+  - unsplash   # dead app (source.unsplash.com retired -> its daily cron spammed 65+
+               # log errors from WikimediaCommonsDaily). We use rotatingwallpapers.
+# Master switch for the declarative app reconciliation (set false to leave apps
+# untouched on a deploy). Independent of restore/upgrade.
+nextcloud_manage_apps: true
+
+# "Rotating Wallpapers" starter pool.
+#   source: repo   -> deploy the FIXED set committed in
+#                     roles/nextcloud_bootstrap/files/wallpapers/ (same images on
+#                     every install — reproducible). This is the default.
+#   source: picsum -> fetch nextcloud_wallpapers_count random landscape photos
+#                     from Lorem Picsum at deploy time (no repo bloat, but a
+#                     different pool each fresh install).
+nextcloud_wallpapers_seed: true
+nextcloud_wallpapers_source: repo
+nextcloud_wallpapers_count: 100          # picsum mode only
+nextcloud_wallpapers_size: "2560/1440"   # picsum mode only (widthxheight, landscape)
+# Rotation interval for the logged-in dashboard background (config.json). One of:
+# every10sec every5min every30min every1h every3h daily
+nextcloud_wallpapers_rotation: every3h
+
+# === Maps tile server ================================================
+# The Maps app's default "Street map" layer uses OpenStreetMap's free volunteer tile
+# servers, which now 403-block the app (tile usage policy). If a MapTiler key is set,
+# nextcloud_bootstrap repoints that layer at MapTiler's "OpenStreetMap" style (same look,
+# legal) by patching the app JS on every deploy (survives app updates). Empty = leave Maps
+# untouched. Free key at maptiler.com — restrict it to your domain (Allowed origins), since
+# it ends up in the client-side JS. Put the secret in vault.yml as vault_maptiler_key.
+nextcloud_maps_maptiler_key: "{{ vault_maptiler_key | default('') }}"
+
+# === Declarative imports: contacts / calendars / tasks ================
+# The import MANIFEST lives in its own file so it doesn't clutter this one:
+#     group_vars/all/nextcloud_imports.yml   (variable: nextcloud_imports)
+# It declares which .vcf/.ics files are seeded into which accounts/collections.
+# Files go under roles/nextcloud_bootstrap/files/imports/ (gitignored — personal
+# data). See that manifest for structure, examples and semantics.
+#
+# Pre-create a target account if it doesn't exist yet, so imports work even for
+# users who have NEVER logged in (local DB account with the same uid; OIDC
+# preferred_username attaches the real SSO login later). false = FAIL if missing.
+nextcloud_imports_create_users: true
+
+# === Declarative default settings ====================================
+# Cherry-pick individual settings to enforce as defaults on every deploy (instead
+# of importing a whole config dump). Idempotent: only set when the value differs.
+# WORKFLOW to find keys: change a setting in the UI, then diff occ config:
+#   docker exec -u www-data nextcloud php occ config:list --output=json > after.json
+#   (compare to a before.json) — the changed key/app is your entry here.
+# Examples:
+#   app:    - { app: theming, key: disable-user-theming, value: "yes" }
+#   system: - { key: default_language, value: "de" }
+#           - { key: knowledgebaseenabled, value: "false", type: boolean }
+nextcloud_settings:
+  app: []
+  system:
+    # Run heavy daily background jobs at night (hour, UTC). Clears the admin-overview
+    # "no maintenance window" warning. 1 = 01:00-05:00 UTC.
+    - { key: maintenance_window_start, value: 1, type: integer }
+    # Needed to validate phone numbers without a country code (we set phone attributes
+    # from Authentik). ISO 3166-1 region.
+    - { key: default_phone_region, value: DE }
+
+nextcloud_oidc_enabled: true
+nextcloud_oidc_client_id: nextcloud
+nextcloud_oidc_client_secret: "{{ vault_authentik_oauth_nextcloud_secret }}"
+
+# Authentik usernames (EXACT case!) that get a pre-provisioned Nextcloud account
+# in the admin group — their first SSO login attaches to it (uid mapping =
+# preferred_username, unique-uid=0). BREAK-GLASS / safety net: with group
+# provisioning below, admin is normally granted via the `nextcloud-admins`
+# Authentik group. Keeping Alice here guarantees he is admin even before the
+# group claim is processed.
+nextcloud_sso_admins:
+  - Alice
+
+# --- OIDC group provisioning ---------------------------------------------------
+# Map the `groups` claim (emitted by the Authentik nextcloud provider's group_map:
+# nextcloud-admins -> admin, nextcloud-users -> nextcloud-users) into real
+# Nextcloud groups on each login. This grants NC admin by AUTHENTIK GROUP
+# MEMBERSHIP, without making the user an Authentik superuser.
+#   whitelist_regex : only these claim values become NC groups (keeps immich-users,
+#                     pg-users, ... OUT of Nextcloud). `admin` = NC administrator.
+#   restrict_login  : users whose claim carries NONE of the whitelisted groups may
+#                     not log in at all (defense in depth on top of the Authentik
+#                     app access binding). The local `admin` account is unaffected
+#                     (it logs in locally, not via OIDC).
+nextcloud_oidc_group_provisioning: true
+nextcloud_oidc_group_whitelist_regex: '^(admin|nextcloud-users)$'
+nextcloud_oidc_group_restrict_login: true

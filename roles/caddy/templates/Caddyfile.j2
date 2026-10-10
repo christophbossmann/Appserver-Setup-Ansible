@@ -1,7 +1,27 @@
-{% if caddy_email or caddy_pki_cas | default([]) | length > 0 %}
+{% if caddy_email or (caddy_pki_cas | default([]) | length > 0) or (caddy_acme_ca | default('') | length > 0) or (caddy_acme_eab | default({}) | length > 0) or (caddy_metrics_enabled | default(false) | bool) %}
 {
 {% if caddy_email %}
     email {{ caddy_email }}
+{% endif %}
+{% if caddy_metrics_enabled | default(false) | bool %}
+    # HTTP request metrics (per host) for Prometheus — served read-only on the
+    # caddy_metrics_bind site below, NOT via the admin API (which can change config).
+    metrics {
+        per_host
+    }
+{% endif %}
+{% if caddy_acme_ca | default('') | length > 0 %}
+    # ACME CA override (caddy_acme_ca) — issue from this CA instead of the LE default.
+    # Used to dodge an exhausted LE rate limit via another free trusted CA (e.g. Google
+    # Trust Services), or to point at LE staging for pipeline tests. Empty = LE default.
+    acme_ca {{ caddy_acme_ca }}
+{% endif %}
+{% if (caddy_acme_eab | default({})) and (caddy_acme_eab.key_id | default('')) %}
+    # External Account Binding — required by the chosen CA (e.g. Google Trust Services).
+    acme_eab {
+        key_id {{ caddy_acme_eab.key_id }}
+        mac_key {{ caddy_acme_eab.mac_key }}
+    }
 {% endif %}
 {% if caddy_pki_cas | default([]) | length > 0 %}
     pki {
@@ -18,7 +38,22 @@
 }
 {% endif %}
 
+{% if caddy_metrics_enabled | default(false) | bool %}
+# Read-only Prometheus endpoint, bound to the docker bridge only (containers reach it via
+# host.docker.internal; UFW admits only docker subnets — roles/monitoring). Plain HTTP on
+# purpose: never leaves the host.
+http://:{{ caddy_metrics_port }} {
+    bind {{ caddy_metrics_bind }}
+    metrics
+}
+
+{% endif %}
 {% for site in caddy_effective_sites | default(caddy_sites | default([])) %}
+{# Skip a site whose bind interface has no IPv4 yet (e.g. tailscale0 before the VPN #}
+{# client has joined). Keeps the public reverse proxy up; the .int sites reappear    #}
+{# automatically once the interface has an address. See roles/caddy/tasks/main.yml.  #}
+{% set _site_missing_binds = (site.caddy_bind_interfaces | default([])) | difference(caddy_bind_interface_ipv4_map | default({}) | list) %}
+{% if _site_missing_binds | length == 0 %}
 {% set site_tls_mode = site.caddy_tls_mode | default(caddy_tls_mode) %}
 {% set allowed_ranges = site.caddy_allowed_ranges | default([]) %}
 {% set effective_ca = site.caddy_pki_ca | default(caddy_pki_default_ca) | default('') %}
@@ -39,23 +74,106 @@
 {% endif %}
 {% elif site_tls_mode == "cloudflare_dns" %}
     tls {
+{% if caddy_acme_issuer | default('') | length > 0 %}
+        # Force a single named CA (caddy_acme_issuer, e.g. zerossl for a fresh rate limit).
+        issuer {{ caddy_acme_issuer }}{% if caddy_acme_issuer == 'zerossl' and (caddy_zerossl_api_key | default('') | length > 0) %} {{ caddy_zerossl_api_key }}{% endif %} {
+            dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+        }
+{% else %}
         dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+{% endif %}
     }
 {% elif site_tls_mode == "tailscale" %}
     tls {{ caddy_tailscale_cert_dir }}/{{ site.hostname }}.crt {{ caddy_tailscale_cert_dir }}/{{ site.hostname }}.key
 {% elif site_tls_mode == "acme_dns" %}
     tls {
+{% if caddy_acme_issuer | default('') | length > 0 %}
+        # Force a single named CA (caddy_acme_issuer, e.g. zerossl for a fresh rate limit).
+        # ZeroSSL: Caddy generates the required EAB from the API key (caddy_zerossl_api_key)
+        # when set, else from the global email — no manual EAB step either way.
+        issuer {{ caddy_acme_issuer }}{% if caddy_acme_issuer == 'zerossl' and (caddy_zerossl_api_key | default('') | length > 0) %} {{ caddy_zerossl_api_key }}{% endif %} {
+            dns acmedns {{ caddy_acme_dns_credentials_file }}
+{% if caddy_acme_dns_resolvers | default([]) | length > 0 %}
+            resolvers {{ caddy_acme_dns_resolvers | join(' ') }}
+{% endif %}
+            propagation_timeout {{ caddy_acme_dns_propagation_timeout | default('-1') }}
+        }
+{% else %}
         dns acmedns {{ caddy_acme_dns_credentials_file }}
+{% if caddy_acme_dns_resolvers | default([]) | length > 0 %}
+        # Use PUBLIC resolvers for zone detection — the host's systemd-resolved SERVFAILs on
+        # the minimal acme-dns server; 8.8.8.8/the acme-dns server answer fine.
+        resolvers {{ caddy_acme_dns_resolvers | join(' ') }}
+{% endif %}
         propagation_timeout {{ caddy_acme_dns_propagation_timeout | default('-1') }}
+{% endif %}
     }
 {% elif site_tls_mode == "manual_cert" %}
     tls {{ effective_cert }} {{ effective_key }}
 {% endif %}
+{% set fwd_auth = site.caddy_forward_auth | default(false) %}
 {% if site.caddy_upstream | default('') %}
 {% if allowed_ranges | length > 0 %}
     @allowed remote_ip {{ allowed_ranges | join(' ') }}
+{% endif %}
+{% if fwd_auth %}
+{% set fa_except = site.caddy_forward_auth_except_paths | default([]) %}
+    route{% if allowed_ranges | length > 0 %} @allowed{% endif %} {
+        # Authentik forward-auth via the server's EMBEDDED outpost. The outpost
+        # callback paths are proxied to Authentik; every other request is checked
+        # and, if unauthenticated, redirected to the Authentik login. Configure a
+        # matching Proxy Provider + Application in Authentik for this hostname.
+{% for pp in site.caddy_path_proxies | default([]) %}
+        # Same-origin API proxy: {{ pp.path }} -> {{ pp.upstream }} (prefix stripped).
+        # Placed FIRST + terminal, so it BYPASSES forward-auth — the upstream carries
+        # its own auth (e.g. Kong key-auth + RLS for Supabase). This lets a browser
+        # app call its OWN origin ({{ pp.path }}) instead of a cross-origin host: no CORS.
+        handle_path {{ pp.path }} {
+            reverse_proxy {{ pp.upstream }}
+        }
+{% endfor %}
+{% if fa_except | length > 0 %}
+        # Listed path prefixes BYPASS Authentik (they carry their own auth, e.g.
+        # API keys/tokens for apps/playgrounds); only the remaining (UI) paths are
+        # SSO-gated. Keep this in sync with the upstream's API routes.
+        @fa_bypass path {{ fa_except | join(' ') }}
+        handle @fa_bypass {
+            reverse_proxy {{ site.caddy_upstream }}
+        }
+        handle {
+            reverse_proxy /outpost.goauthentik.io/* {{ caddy_authentik_outpost }}
+            forward_auth {{ caddy_authentik_outpost }} {
+                uri /outpost.goauthentik.io/auth/caddy
+                copy_headers X-authentik-username X-authentik-groups X-authentik-email X-authentik-name X-authentik-uid
+            }
+            reverse_proxy {{ site.caddy_upstream }}
+        }
+{% else %}
+        reverse_proxy /outpost.goauthentik.io/* {{ caddy_authentik_outpost }}
+        forward_auth {{ caddy_authentik_outpost }} {
+            uri /outpost.goauthentik.io/auth/caddy
+            copy_headers X-authentik-username X-authentik-groups X-authentik-email X-authentik-name X-authentik-uid
+        }
+        reverse_proxy {{ site.caddy_upstream }}
+{% endif %}
+    }
+{% if allowed_ranges | length > 0 %}
+    respond "Forbidden" 403
+{% endif %}
+{% elif allowed_ranges | length > 0 %}
     reverse_proxy @allowed {{ site.caddy_upstream }}
     respond "Forbidden" 403
+{% elif site.caddy_allow_paths | default([]) | length > 0 %}
+    # Allow-list: only these path prefixes are proxied; everything else 404s.
+    # Exposes an API subset while hiding the rest on a dedicated hostname
+    # (e.g. the Supabase API, but NOT Studio).
+    @allow path {{ site.caddy_allow_paths | join(' ') }}
+    handle @allow {
+        reverse_proxy {{ site.caddy_upstream }}
+    }
+    handle {
+        respond "Not Found" 404
+    }
 {% else %}
     reverse_proxy {{ site.caddy_upstream }}
 {% endif %}
@@ -67,4 +185,5 @@
 {% endif %}
 }
 
+{% endif %}
 {% endfor %}

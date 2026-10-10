@@ -1,0 +1,32 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/service_hosts.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# ── EINE Quelle der Wahrheit für den Außen-FQDN eines Dienstes ────────────────
+# Die EINZIGE Stelle, an der die Exposition eines Dienstes (internal/VPN vs
+# external/public) entschieden wird, ist `caddy_services` (host_vars). Alles, was
+# die eigene Außen-URL eines Dienstes braucht — OIDC root_url / redirect_uri,
+# launch_url, App-base_url — MUSS sie hierüber ableiten, niemals internal_host/
+# global_host hartkodieren. Profil in caddy_services umschalten -> jede URL folgt
+# automatisch (Caddy-Bind + headscale-.int-Records tun das ohnehin schon).
+#
+#   internal -> <label>.<internal_host>   (z.B. grafana.int.dev.example.com)
+#   external -> <label>.<global_host>     (z.B. nextcloud.dev.example.com)
+#
+# <label> = DNS-Label. Default = caddy_services-Key mit '_' -> '-' (DNS-Labels haben
+# nie '_'; z.B. immich_uploader -> immich-uploader). Verwendung: svc_edge_host['<key>'].
+#
+# LABEL-OVERRIDE (svc_edge_label): nur nötig, wo das caddy_route-`hostname_label` vom
+# caddy_services-Key abweicht (der Helper kennt die Route-Dateien nicht — die lädt erst
+# Caddy). Muss mit stacks/*/caddy_route.yml übereinstimmen:
+#   immich_int   -> Label 'immich'      (voll-Immich über VPN = immich.int, NICHT immich-int)
+#   playwright_mcp -> Label 'playwright' (= playwright.int, NICHT playwright-mcp)
+# So respektiert svc_edge_host['immich_int'] das Profil von immich_int; der SHARE-Endpunkt
+# nutzt weiter svc_edge_host['immich'] (der eigene, i.d.R. externe caddy_services-Eintrag).
+svc_edge_label:
+  immich_int: immich
+  playwright_mcp: playwright
+_svc_edge_host_yaml: |
+  {% for k, prof in (caddy_services | default({})).items() %}
+  "{{ k }}": "{{ svc_edge_label[k] | default(k | replace('_', '-')) }}.{{ internal_host if prof == 'internal' else global_host }}"
+  {% endfor %}
+svc_edge_host: "{{ _svc_edge_host_yaml | from_yaml }}"

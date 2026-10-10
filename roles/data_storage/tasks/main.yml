@@ -1,0 +1,58 @@
+---
+# Provision the persistent data-domain roots (business / dev / authentik).
+#
+# TWO LAYERS, per the design rule:
+#   - Data directories are created ALWAYS (filesystem-agnostic) so the service roles
+#     can place their data there whether or not btrfs/snapshots are in play.
+#   - ON btrfs WITH snapshots enabled (true/auto+btrfs), each domain root becomes its
+#     own SUBVOLUME (@<name>) with a flat @<name>_snapshots + snapper config (daily,
+#     kept {{ data_snapshot_timeline_daily }} days) + nodatacow on the DB subdirs.
+#   - btrfs_snapshots_enable=true REQUIRES btrfs; auto/false run fine on ext4 (plain dirs).
+- name: Storage mode facts
+  ansible.builtin.set_fact:
+    _stor_off: "{{ (btrfs_snapshots_enable is boolean) and (not btrfs_snapshots_enable) }}"
+    _stor_req: "{{ (btrfs_snapshots_enable is boolean) and btrfs_snapshots_enable }}"
+
+- name: Detect the filesystem at the data root
+  ansible.builtin.command: "findmnt -no FSTYPE --target {{ data_root }}"
+  register: _stor_fs
+  changed_when: false
+  check_mode: false
+
+- name: Resolve whether to use subvolumes
+  ansible.builtin.set_fact:
+    _stor_is_btrfs: "{{ (_stor_fs.stdout | trim) == 'btrfs' }}"
+    _stor_subvols: "{{ ((_stor_fs.stdout | trim) == 'btrfs') and not (_stor_off | bool) }}"
+
+- name: Require btrfs for data subvolumes (btrfs_snapshots_enable=true)
+  ansible.builtin.assert:
+    that: _stor_is_btrfs | bool
+    fail_msg: >-
+      btrfs_snapshots_enable=true, but {{ data_root }} is '{{ _stor_fs.stdout | trim }}', not
+      btrfs. Data subvolumes need btrfs — reinstall on btrfs, or set the switch to auto/false.
+    success_msg: "{{ data_root }} is btrfs — provisioning data subvolumes."
+    quiet: true
+  when: _stor_req | bool
+
+- name: Ensure the base data root exists
+  ansible.builtin.file:
+    path: "{{ data_root }}"
+    state: directory
+    mode: "0755"
+
+# ext4 / snapshots off: the domain roots are just plain directories.
+- name: Ensure domain roots as plain directories (no btrfs subvolumes)
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ data_domains }}"
+  loop_control: { label: "{{ item.name }}" }
+  when: not (_stor_subvols | bool)
+
+# btrfs + enabled: each domain root becomes a subvolume with flat snapshots + snapper.
+- name: Provision btrfs subvolume + snapper per domain
+  ansible.builtin.include_tasks: domain_btrfs.yml
+  loop: "{{ data_domains }}"
+  loop_control: { loop_var: _dom, label: "{{ _dom.name }}" }
+  when: _stor_subvols | bool

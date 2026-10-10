@@ -1,0 +1,18 @@
+---
+# Imperative post-blueprint Authentik setup via the API — everything the DECLARATIVE
+# blueprints (stacks/authentik/blueprints/) can't do. Merged from the former three
+# roles (authentik_service_accounts / authentik_ldap_bootstrap / authentik_avatars),
+# which all ran back-to-back and did the same kind of thing.
+#
+#   passwords.yml — set account passwords: service accounts convergent, humans
+#                   INITIAL-ONLY (authentik_passwordsync overrides for a reset).
+#   ldap.yml      — read the LDAP outpost's API token (a blueprint can't expose it)
+#                   and hand it to the authentik-ldap container.
+#   profile.yml   — sync each human's profile: groups + attributes + avatar. ADDITIVE
+#                   by default, exact-match for users selected via authentik_fullsync.
+#
+# Order matters only loosely (each step waits for the blueprint on its own), but we
+# keep the original sequence.
+- ansible.builtin.import_tasks: passwords.yml
+- ansible.builtin.import_tasks: ldap.yml
+- ansible.builtin.import_tasks: profile.yml

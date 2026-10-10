@@ -5,19 +5,20 @@
 # Flow:
 #   1. Always install Tailscale if missing.
 #   2. If tailscale_enabled is false -> stop here (installed, nothing else).
-#   3. Start tailscaled, then decide identity in this strict order:
-#        a. Server is ALREADY logged in            -> keep it (a live login
-#                                                      always wins; no relogin,
-#                                                      no import) unless
-#                                                      reauth_force.
-#        b. reauth_force = true                     -> interactive auth flow.
-#        c. A backup file exists at the controller
-#           path tailscale_state_file               -> import it (restore the
-#                                                      node identity), no prompt.
-#        d. otherwise                               -> interactive auth flow
-#                                                      (prompt key, then pause to
-#                                                      adjust the node).
-#   4. (default) export the live state back to the controller's ~/.ansible.
+#   3. Start tailscaled, then decide identity:
+#        a. Server is ALREADY logged in  -> keep it (a live login always wins;
+#                                           no relogin) unless reauth_force.
+#        b. otherwise (or reauth_force)  -> interactive auth flow (prompt key /
+#                                           -e tailscale_auth_key, then pause to
+#                                           adjust the node).
+#
+# NOTE: this role does NOT back up / restore the node's tailscaled.state identity.
+# On a rebuild the node re-enrols via an auth key (for a self-hosted Headscale: a
+# cached reusable pre-auth key). The identity-preserving state backup/restore was
+# intentionally removed — it only pays off when the control server is NOT co-located
+# / not yours (Tailscale cloud, a remote Headscale, a future dev<->prod cross-join).
+# See docs/tailscale-identity-backup.md for exactly how it worked and how to bring
+# it back (same role + a few vars — no separate role needed for a single client).
 # =============================================================================
 
 - name: Check if Tailscale is already installed
@@ -73,72 +74,41 @@
       ansible.builtin.set_fact:
         tailscale_logged_in: "{{ tailscale_status_pre.rc == 0 and 'Logged out' not in tailscale_status_pre.stdout }}"
 
-    # --- check for a controller-side backup at tailscale_state_file ---------
-    - name: Check for a state backup on the controller
-      ansible.builtin.stat:
-        path: "{{ tailscale_state_file }}"
-      delegate_to: localhost
-      become: false
-      register: tailscale_state_backup
-      when: tailscale_state_file | length > 0
-
     - name: Decide the identity action
       ansible.builtin.set_fact:
-        # import only when: not already logged in, not forcing reauth, and a backup exists
-        tailscale_do_import: "{{ (not tailscale_logged_in) and (not (tailscale_reauth_force | bool)) and (tailscale_state_file | length > 0) and (tailscale_state_backup.stat.exists | default(false)) }}"
-        # interactive auth when: forcing reauth, OR (not logged in AND no backup to import)
-        tailscale_needs_auth: "{{ (tailscale_reauth_force | bool) or ((not tailscale_logged_in) and not ((tailscale_state_file | length > 0) and (tailscale_state_backup.stat.exists | default(false)))) }}"
+        # interactive auth when: forcing reauth, OR the server is not logged in.
+        tailscale_needs_auth: "{{ (tailscale_reauth_force | bool) or (not tailscale_logged_in) }}"
 
     - name: Keep the existing Tailscale login (live login wins, no relogin)
       ansible.builtin.debug:
-        msg: "Server is already logged in to Tailscale — keeping it as-is (no import, no relogin)."
+        msg: "Server is already logged in to Tailscale — keeping it as-is (no relogin)."
       when: tailscale_logged_in and not (tailscale_reauth_force | bool)
 
-    # --- step c: import the controller backup onto the server --------------
-    - name: Import Tailscale state from the controller backup
-      when: tailscale_do_import | bool
-      block:
-        - name: Stop tailscaled before restoring state
-          ansible.builtin.systemd:
-            name: tailscaled
-            state: stopped
-          failed_when: false
+    # A host that self-enrols into its OWN co-located headscale (tailscale_self_enrol)
+    # must NOT try to enrol here — this role runs before docker/headscale exist. It
+    # only installs + starts; the tailscale_enrol role does the enrolment later
+    # (after headscale_bootstrap, before caddy). Avoids a hung prompt on fresh builds.
+    - name: Defer enrolment to tailscale_enrol (co-located headscale)
+      ansible.builtin.debug:
+        msg: >-
+          tailscale_self_enrol=true — {{ inventory_hostname }} enrols into its own
+          headscale later (role tailscale_enrol). Installed + started only here.
+      when:
+        - tailscale_needs_auth | bool
+        - tailscale_self_enrol | default(false) | bool
 
-        - name: Ensure tailscale state directory exists
-          ansible.builtin.file:
-            path: /var/lib/tailscale
-            state: directory
-            owner: root
-            group: root
-            mode: "0700"
-
-        - name: Copy the backup state file into place
-          ansible.builtin.copy:
-            src: "{{ tailscale_state_file }}"
-            dest: /var/lib/tailscale/tailscaled.state
-            owner: root
-            group: root
-            mode: "0600"
-
-        - name: Start tailscaled with the restored state
-          ansible.builtin.systemd:
-            name: tailscaled
-            state: started
-
-        - name: Confirm Tailscale identity after import
-          ansible.builtin.debug:
-            msg: "Imported Tailscale state from {{ tailscale_state_file }} — node identity restored without a new auth key."
-
-    # --- step b/d: interactive auth flow -----------------------------------
+    # --- interactive auth flow ---------------------------------------------
     - name: Authenticate Tailscale (interactive)
-      when: tailscale_needs_auth | bool
+      when:
+        - tailscale_needs_auth | bool
+        - not (tailscale_self_enrol | default(false) | bool)
       block:
         - name: Prompt for a Tailscale auth key
           ansible.builtin.pause:
             prompt: |
 
               ────────────────────────────────────────────────────────────
-              No Tailscale login and no usable state backup for
+              No Tailscale login for
               host: {{ inventory_hostname }}
               (or re-auth was forced).
 
@@ -156,9 +126,15 @@
           no_log: true
 
         - name: Connect to Tailscale
+          # --login-server points the client at a control server. Empty (default)
+          # = Tailscale's cloud (login.tailscale.com), i.e. unchanged behaviour.
+          # Set tailscale_login_server to a self-hosted Headscale URL to join that
+          # control server instead (the headscale stack is a SEPARATE building
+          # block — this is the only knob that decides where THIS client connects).
           ansible.builtin.command: >
             tailscale up
             --authkey={{ tailscale_effective_authkey }}
+            {{ ('--login-server=' + tailscale_login_server) if (tailscale_login_server | default('') | length > 0) else '' }}
             {{ tailscale_extra_args }}
             {{ '--force-reauth' if (tailscale_reauth_force | bool) else '' }}
           when: tailscale_effective_authkey | length > 0
@@ -198,11 +174,3 @@
           -e "tailscale_auth_key=tskey-auth-..." or log in on the server
           with: sudo tailscale up
       when: tailscale_status.rc != 0
-
-    # --- export state back to the controller (default ON) ------------------
-    - name: Export tailscaled state back to the controller
-      ansible.builtin.fetch:
-        src: /var/lib/tailscale/tailscaled.state
-        dest: "{{ tailscale_state_backup_path if (tailscale_state_backup_path | length > 0) else tailscale_state_export_path }}"
-        flat: true
-      when: tailscale_export_state | bool

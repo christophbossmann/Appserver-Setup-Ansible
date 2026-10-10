@@ -1,0 +1,37 @@
+---
+# Roll the business instance + nextcloud back to the pre-upgrade anchor. Included by
+# nextcloud-upgrade.yml from BOTH the rescue (on failure) and the force_rollback drill
+# path (after a successful upgrade). Does NOT fail the play — the caller decides that.
+# Expects the play vars: _occ, _biz, _snap_dir, _pitr_target, _rollback_version, upgrade_keep_old.
+- name: Freeze nextcloud again (best effort) and stop it before the DB restore
+  ansible.builtin.shell: "{{ _occ | join(' ') }} maintenance:mode --on || true; docker stop nextcloud || true"
+  changed_when: true
+
+- name: PITR the business instance back to the pre-upgrade anchor
+  ansible.builtin.include_tasks: pitr_restore.yml
+  vars:
+    pitr_instance: postgres-business
+    pitr_target_time: "{{ _pitr_target }}"
+    pitr_keep_old: "{{ upgrade_keep_old }}"
+
+- name: Restore the pre-upgrade nextcloud config
+  ansible.builtin.command:
+    argv: [tar, -xzf, "{{ _snap_dir }}/nextcloud-config-pre-{{ _rollback_version }}.tgz",
+           -C, "{{ nextcloud_html_dir }}"]
+  changed_when: true
+
+# NOTE: group_vars needs NO revert here — the upgrade playbook only persists the new
+# version AFTER a fully verified, kept upgrade, so on any rollback the file still holds
+# the pre-upgrade version. We just redeploy the old image via the var override below.
+- name: Redeploy nextcloud with the pre-upgrade image
+  ansible.builtin.include_role:
+    name: compose_stack
+  vars:
+    stack: nextcloud
+    nextcloud_version: "{{ _rollback_version }}"
+
+- name: Take nextcloud out of maintenance after rollback
+  ansible.builtin.command:
+    argv: "{{ _occ + ['maintenance:mode', '--off'] }}"
+  changed_when: true
+  failed_when: false

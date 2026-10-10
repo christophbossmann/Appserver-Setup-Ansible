@@ -1,0 +1,18 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/dozzle.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# Dozzle — lightweight container dashboard (live status, CPU/RAM per container,
+# LIVE LOGS, restart/stop buttons). Complements Grafana (history via cAdvisor):
+# Dozzle = "what is happening right now", Grafana = "since when / trend".
+# Route: dozzle.<internal_host> behind Authentik forward-auth (admins only).
+
+dozzle_version: "v8"                       # major tag; pin e.g. "v8.13.8" for stricter reproducibility
+dozzle_image: "amir20/dozzle:{{ dozzle_version }}"
+
+# Host loopback port (Caddy fronts it on the internal route).
+dozzle_port: 8095
+
+# Show start/stop/restart buttons in the UI. Restarting an Ansible-managed
+# container is safe (same container, same config — no drift); config changes
+# stay impossible from Dozzle. Access is SSO-gated (admins).
+dozzle_enable_actions: true

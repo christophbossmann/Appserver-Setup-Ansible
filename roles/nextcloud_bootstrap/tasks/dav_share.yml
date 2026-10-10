@@ -1,0 +1,51 @@
+---
+# Share ONE owner collection (calendar / tasklist / addressbook) with other users.
+# Nextcloud keeps DAV shares in the oc_dav_shares table; the official DAV sharing
+# POST returns 501 in this version, so we upsert the share rows directly against
+# the business Postgres (idempotent). The owner-side collection + its objects are
+# already created/imported by the reused dav_import pass (main.yml appends the
+# shared entries to the matching import loop) — here we only add the shares.
+#   resourceid = id of the owner's collection in oc_calendars / oc_addressbooks
+#   principaluri = principals/users/<sharee> ; access 2 = read-write, 3 = read-only
+- name: "Share {{ _nc_kind }} '{{ item.slug }}' of {{ item.user }} with {% for e in item.share_with | default([]) %}{{ e.user }}{{ '' if loop.last else ', ' }}{% endfor %}"
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -euo pipefail
+      # Owner + collection are the entry's `user` and `slug` (uniform across types).
+      # kind comes from the calling loop's _nc_kind (addressbook | calendar | tasklist).
+      OWNER='{{ item.user }}'
+      COLL='{{ item.slug }}'
+      KIND='{{ _nc_kind }}'
+      # Per-sharee access. Each share_with entry is a {user, access} dict; access is
+      # optional and defaults to read-write. Rendered as "<user>:<code>" tokens;
+      # code 2 = read-write, 3 = read-only.
+      SHAREES="{% for e in item.share_with | default([]) %}{{ e.user }}:{{ '3' if (e.access | default('read-write')) == 'read-only' else '2' }} {% endfor %}"
+      CREATE='{{ (nextcloud_imports_create_users | default(true)) | ternary("true", "false") }}'
+      if [ "$KIND" = addressbook ]; then TBL=oc_addressbooks; DTYPE=addressbook; else TBL=oc_calendars; DTYPE=calendar; fi
+      sq() { docker exec postgres-business psql -U business -d nextcloud -tAc "$1"; }
+      RID=$(sq "SELECT id FROM $TBL WHERE principaluri='principals/users/$OWNER' AND uri='$COLL' LIMIT 1" | tr -d '[:space:]')
+      if [ -z "$RID" ]; then echo "SHARE_FAILED no-collection:$OWNER/$COLL"; exit 1; fi
+      CH=0
+      for TOK in $SHAREES; do
+        S="${TOK%%:*}"        # username
+        ACCESS="${TOK##*:}"   # per-sharee access code (2 rw / 3 ro)
+        if ! docker exec -u www-data nextcloud php occ user:info "$S" >/dev/null 2>&1; then
+          if [ "$CREATE" != true ]; then echo "SHARE_FAILED sharee-missing:$S"; exit 1; fi
+          docker exec -u www-data nextcloud sh -c 'NP=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32); OC_PASS="$NP" php occ user:add --password-from-env "$1" >/dev/null 2>&1' _ "$S" \
+            || { echo "SHARE_FAILED sharee-create:$S"; exit 1; }
+        fi
+        CUR=$(sq "SELECT access FROM oc_dav_shares WHERE principaluri='principals/users/$S' AND resourceid=$RID AND type='$DTYPE' LIMIT 1" | tr -d '[:space:]')
+        if [ -z "$CUR" ]; then
+          sq "INSERT INTO oc_dav_shares (principaluri, type, access, resourceid, publicuri) VALUES ('principals/users/$S','$DTYPE',$ACCESS,$RID,NULL)" >/dev/null
+          CH=1
+        elif [ "$CUR" != "$ACCESS" ]; then
+          sq "UPDATE oc_dav_shares SET access=$ACCESS WHERE principaluri='principals/users/$S' AND resourceid=$RID AND type='$DTYPE'" >/dev/null
+          CH=1
+        fi
+      done
+      [ "$CH" = 1 ] && echo "SHARE_CHANGED" || echo "SHARE_UNCHANGED"
+  register: _nc_share
+  changed_when: "'SHARE_CHANGED' in (_nc_share.stdout | default(''))"
+  failed_when: _nc_share.rc != 0 or ('SHARE_FAILED' in (_nc_share.stdout | default('')))
+  when: not ansible_check_mode

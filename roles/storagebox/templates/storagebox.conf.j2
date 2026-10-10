@@ -1,0 +1,12 @@
+# rclone config for the Storage Box mount — managed by the storagebox role.
+# Separate from backup_restic's rclone.conf so the two never clobber each other.
+[{{ storagebox_remote_name }}]
+type = sftp
+host = {{ storagebox_host }}
+user = {{ storagebox_user }}
+port = {{ storagebox_port }}
+key_file = {{ storagebox_key_file }}
+shell_type = unix
+# Hetzner Storage Box provides these checksum helpers; lets rclone verify without reading.
+md5sum_command = md5 -r
+sha1sum_command = sha1 -r

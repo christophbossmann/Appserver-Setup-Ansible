@@ -4,6 +4,28 @@ set -euo pipefail
 CRED="${HOME}/.claude/.credentials.json"
 RC="${REMOTE_CONTROL:-false}"
 
+{% if playground_playwright_mcp_enabled | default(true) %}
+# --- Register the Playwright MCP server (idempotent, declarative) ------------
+# Reached over the isolated playground-mcp network. Written straight into
+# ~/.claude.json so it's available in every session (Remote Control OR
+# interactive), independent of the working directory. jq is already in the image.
+CLAUDE_JSON="${HOME}/.claude.json"
+[ -f "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
+_mcp_url="${PLAYWRIGHT_MCP_URL:-{{ playwright_mcp_claude_sse_url }}}"
+if command -v jq >/dev/null 2>&1; then
+  _tmp="$(mktemp)"
+  if jq --arg url "$_mcp_url" \
+        '.mcpServers.playwright = {"type":"sse","url":$url}' \
+        "$CLAUDE_JSON" > "$_tmp" 2>/dev/null; then
+    mv "$_tmp" "$CLAUDE_JSON"
+    echo "[claude-ctl] Playwright MCP registered: $_mcp_url"
+  else
+    rm -f "$_tmp"
+    echo "[claude-ctl] WARN: could not register Playwright MCP in $CLAUDE_JSON" >&2
+  fi
+fi
+{% endif %}
+
 # Remote Control disabled: install/login only, never auto-start it.
 if [ "$RC" != "true" ]; then
   cat <<'EOF'

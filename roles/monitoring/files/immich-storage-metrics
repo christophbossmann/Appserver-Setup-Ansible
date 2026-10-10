@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Managed by Ansible (roles/monitoring). Immich storage consistency for node_exporter's
+# textfile collector -> the "Immich" Grafana dashboard.
+#
+#   immich-storage-metrics <host_root> <container_root> <db_container> <db_user> <db_name> <dir> [<dir> ...]
+#
+# Compares the files under <host_root>/<dir> (symlinked dirs such as library/ -> Storage
+# Box are followed) with every path the Immich DB references: asset."originalPath"
+# (originals incl. motion-photo clips) + asset_file.path (thumbnails, previews,
+# transcodes). DB paths are container paths (<container_root>/...), mapped to host paths.
+#
+#   orphan  = file on disk that NO DB row references (older than ORPHAN_MIN_AGE_MIN, so
+#             uploads still in flight don't count) — e.g. originals left over after a DB
+#             restore from an older dump, or files Immich failed to clean up.
+#   missing = DB row whose file is NOT on disk — e.g. motion clips / thumbs absent after
+#             a restore (fix: Job Queues -> Extract Metadata / Generate Thumbnails -> Missing).
+#
+# Paths are never put into metrics (cardinality); the lists go to $LIST_DIR/<kind>-<dir>.txt.
+# Read-only: nothing is moved or deleted. Written atomically to
+# <textfile dir>/immich-storage.prom.
+set -uo pipefail
+export LC_ALL=C
+TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile}"
+OUT="$TEXTFILE_DIR/immich-storage.prom"
+TMP="$OUT.tmp"
+LIST_DIR="${IMMICH_STORAGE_LIST_DIR:-/var/lib/immich-storage-check}"
+SCAN_TIMEOUT="${IMMICH_STORAGE_TIMEOUT:-1800}"
+ORPHAN_MIN_AGE_MIN="${IMMICH_STORAGE_ORPHAN_MIN_AGE_MIN:-60}"
+
+host_root="${1%/}"; ctr_root="${2%/}"; db_ctr="$3"; db_user="$4"; db_name="$5"; shift 5
+mkdir -p "$LIST_DIR"; chmod 0700 "$LIST_DIR"
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+start=$(date +%s)
+
+write_fail() {   # keep the last good numbers out: a failed scan reports only success=0
+  { echo "# HELP immich_storage_scan_success 1 if the last consistency scan completed"
+    echo "# TYPE immich_storage_scan_success gauge"
+    echo "immich_storage_scan_success 0"
+    echo "# HELP immich_storage_scan_timestamp_seconds When the last scan finished"
+    echo "# TYPE immich_storage_scan_timestamp_seconds gauge"
+    echo "immich_storage_scan_timestamp_seconds $(date +%s)"
+  } > "$TMP" && mv "$TMP" "$OUT"
+  exit 0
+}
+
+# All referenced paths, mapped container -> host. Fails (-> success=0) when the DB is down.
+docker exec "$db_ctr" psql -U "$db_user" -d "$db_name" -XAt -v ON_ERROR_STOP=1 -c \
+  'SELECT "originalPath" FROM asset UNION SELECT path FROM asset_file' > "$work/db.raw" 2>/dev/null \
+  || write_fail
+[ -s "$work/db.raw" ] || write_fail
+sed "s#^${ctr_root}/#${host_root}/#" "$work/db.raw" | sort -u > "$work/db"
+
+metrics=""
+for dir in "$@"; do
+  root="$host_root/$dir"
+  [ -d "$root" ] || continue
+  # Trailing slash: follow a symlinked dir root (library/ -> Storage Box), not below it.
+  timeout "$SCAN_TIMEOUT" find "$root/" -type f -not -path '*/.snapshots/*' 2>/dev/null \
+    | sed "s#^${root}//*#${root}/#" | sort -u > "$work/disk" || write_fail
+  timeout "$SCAN_TIMEOUT" find "$root/" -type f -not -path '*/.snapshots/*' -mmin "+$ORPHAN_MIN_AGE_MIN" 2>/dev/null \
+    | sed "s#^${root}//*#${root}/#" | sort -u > "$work/disk_old" || write_fail
+  grep -F "$root/" "$work/db" | sort -u > "$work/db_dir" || true
+
+  comm -23 "$work/disk_old" "$work/db_dir" > "$LIST_DIR/orphans-$dir.txt"
+  comm -13 "$work/disk" "$work/db_dir" > "$LIST_DIR/missing-$dir.txt"
+  orphan_bytes=0
+  if [ -s "$LIST_DIR/orphans-$dir.txt" ]; then
+    orphan_bytes=$(tr '\n' '\0' < "$LIST_DIR/orphans-$dir.txt" | xargs -0 -r stat -c %s 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  fi
+  metrics+="immich_storage_files{dir=\"$dir\"} $(wc -l < "$work/disk")"$'\n'
+  metrics+="immich_storage_db_refs{dir=\"$dir\"} $(wc -l < "$work/db_dir")"$'\n'
+  metrics+="immich_storage_orphan_files{dir=\"$dir\"} $(wc -l < "$LIST_DIR/orphans-$dir.txt")"$'\n'
+  metrics+="immich_storage_orphan_bytes{dir=\"$dir\"} $orphan_bytes"$'\n'
+  metrics+="immich_storage_missing_files{dir=\"$dir\"} $(wc -l < "$LIST_DIR/missing-$dir.txt")"$'\n'
+done
+
+{
+  for m in files:"Files on disk below the dir" db_refs:"Paths the Immich DB references below the dir" \
+           orphan_files:"Files on disk that no DB row references" orphan_bytes:"Size of the orphan files" \
+           missing_files:"DB-referenced files that are missing on disk"; do
+    name="immich_storage_${m%%:*}"
+    echo "# HELP $name ${m#*:}"
+    echo "# TYPE $name gauge"
+    printf '%s' "$metrics" | grep "^$name{"
+  done
+  echo "# HELP immich_storage_scan_seconds How long the consistency scan took"
+  echo "# TYPE immich_storage_scan_seconds gauge"
+  echo "immich_storage_scan_seconds $(( $(date +%s) - start ))"
+  echo "# HELP immich_storage_scan_success 1 if the last consistency scan completed"
+  echo "# TYPE immich_storage_scan_success gauge"
+  echo "immich_storage_scan_success 1"
+  echo "# HELP immich_storage_scan_timestamp_seconds When the last scan finished"
+  echo "# TYPE immich_storage_scan_timestamp_seconds gauge"
+  echo "immich_storage_scan_timestamp_seconds $(date +%s)"
+} > "$TMP" && mv "$TMP" "$OUT"

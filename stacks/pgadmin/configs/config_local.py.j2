@@ -1,0 +1,35 @@
+# Managed by Ansible (stacks/pgadmin/configs/config_local.py.j2). pgAdmin loads
+# /pgadmin4/config_local.py last, so it overrides the built-in defaults.
+# Vars: group_vars/all/pgadmin.yml (pgadmin_oauth_*).
+{% if pgadmin_oauth_enabled | default(false) %}
+# OAuth2 SSO via Authentik. 'internal' stays enabled so the local admin
+# ({{ pgadmin_email }}) is a break-glass login even if Authentik is unreachable.
+# Access is gated in Authentik (the pgadmin app binds to "authentik Admins");
+# OAuth users are auto-created as NON-admin pgAdmin users.
+AUTHENTICATION_SOURCES = ['oauth2', 'internal']
+OAUTH2_AUTO_CREATE_USER = {{ 'True' if pgadmin_oauth_auto_create_user | default(true) else 'False' }}
+
+# pgAdmin derives the "master password" (used to en/decrypt saved server creds)
+# from the user's LOGIN password. OAuth users have no pgAdmin password, so the
+# master-password subsystem blocks and every connect returns HTTP 503. Disabling
+# it makes SSO connections work; server passwords are entered per-connect (we do
+# not store them) or encrypted with pgAdmin's SECRET_KEY instead.
+MASTER_PASSWORD_REQUIRED = False
+
+OAUTH2_CONFIG = [
+    {
+        'OAUTH2_NAME': '{{ pgadmin_oauth_client_id }}',
+        'OAUTH2_DISPLAY_NAME': '{{ pgadmin_oauth_display_name }}',
+        'OAUTH2_CLIENT_ID': '{{ pgadmin_oauth_client_id }}',
+        'OAUTH2_CLIENT_SECRET': '{{ pgadmin_oauth_client_secret }}',
+        # OIDC discovery — pgAdmin derives authorize/token/userinfo/jwks from here.
+        'OAUTH2_SERVER_METADATA_URL': '{{ pgadmin_oauth_metadata_url }}',
+        'OAUTH2_SCOPE': 'openid email profile',
+        'OAUTH2_ICON': 'fa-key',
+        'OAUTH2_BUTTON_COLOR': '#fd4b2d',
+    }
+]
+{% else %}
+# OAuth disabled (pgadmin_oauth_enabled=false) — internal auth only.
+AUTHENTICATION_SOURCES = ['internal']
+{% endif %}

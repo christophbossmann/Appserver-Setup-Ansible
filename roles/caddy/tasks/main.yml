@@ -24,6 +24,15 @@
   when: caddy_tls_mode == 'cloudflare_dns'
   no_log: true
 
+# An apt index refresh fails as a whole when ONE repository is down — and Caddy's own
+# Cloudsmith repo has outages (seen: "402 Payment Required"). Once Caddy is installed the
+# index is not needed for a config-only run, so only refresh it on a first install;
+# otherwise a repo outage would block every route/config deploy.
+- name: Check whether Caddy is already installed
+  ansible.builtin.stat:
+    path: /usr/bin/caddy
+  register: _caddy_installed
+
 - name: Install Caddy repository prerequisites
   ansible.builtin.apt:
     name:
@@ -33,7 +42,7 @@
       - curl
       - gnupg
     state: present
-    update_cache: true
+    update_cache: "{{ not _caddy_installed.stat.exists }}"
   when: caddy_package_repo_enabled | bool
 
 - name: Add Caddy apt key
@@ -59,7 +68,7 @@
   ansible.builtin.apt:
     name: caddy
     state: present
-    update_cache: true
+    update_cache: "{{ not _caddy_installed.stat.exists }}"
 
 # ==========================================================
 # xcaddy: build Caddy with required DNS provider plugins
@@ -149,7 +158,39 @@
     owner: root
     group: root
     mode: "0755"
-  when: caddy_tls_mode == 'cloudflare_dns'
+
+# Internal sites bind the tailscale IP. At boot that address may not exist yet
+# when caddy starts — ONE failed bind kills the WHOLE config (public listeners
+# included), and the stock unit does not retry on exit-code failures, so caddy
+# stays dead until someone notices. Order after tailscaled and retry
+# indefinitely until the address is available.
+- name: Configure Caddy boot ordering and restart policy
+  ansible.builtin.copy:
+    dest: "{{ caddy_systemd_override_dir }}/20-boot-order.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      After=network-online.target tailscaled.service
+      Wants=network-online.target
+      # No start limit ON PURPOSE: a limit is a cliff — once hit, systemd
+      # NEVER retries again (until manual reset-failed). Unattended failures
+      # are dependency outages (tailscale/network), where late recovery is
+      # exactly what we want. Broken configs can't reach the host: ansible
+      # gates them via `caddy validate` + the restart handler.
+      StartLimitIntervalSec=0
+
+      [Service]
+      Restart=on-failure
+      # Back off from 5s to 60s between attempts (less log noise), but keep
+      # trying forever.
+      RestartSec=5
+      RestartSteps=6
+      RestartMaxDelaySec=60
+  notify:
+    - Reload systemd
+    - Restart caddy
 
 - name: Write Cloudflare API token environment file
   ansible.builtin.copy:
@@ -207,6 +248,31 @@
 - name: Build effective Caddy sites
   ansible.builtin.set_fact:
     caddy_effective_sites: "{{ (_caddy_sites_from_proxy_routes | default([])) + (caddy_sites | default([])) }}"
+
+# Publish the served hostnames as a Prometheus file_sd target list, so the blackbox
+# probes (roles/monitoring) always match the live routes — Prometheus re-reads the file
+# on change, no restart. A directory (not a single bind-mounted file) because the copy
+# module replaces the file atomically (new inode). Wildcard hosts can't be probed.
+- name: Publish served hostnames for the blackbox probes (Prometheus file_sd)
+  vars:
+    _hosts: "{{ caddy_effective_sites | map(attribute='hostname') | reject('search', '\\*') | unique | list }}"
+    _int: "{{ _hosts | select('search', '\\.' ~ (internal_host | default('__none__') | regex_escape) ~ '$') | list }}"
+    _ext: "{{ _hosts | difference(_int) }}"
+  block:
+    - name: Ensure the shared file_sd directory exists
+      ansible.builtin.file:
+        path: /etc/prometheus-file-sd
+        state: directory
+        mode: "0755"
+
+    - name: Write caddy-probes.json
+      ansible.builtin.copy:
+        dest: /etc/prometheus-file-sd/caddy-probes.json
+        mode: "0644"
+        content: >-
+          {{ ([{'targets': _ext | sort | map('regex_replace', '^', 'https://') | list, 'labels': {'exposure': 'external'}}]
+              + [{'targets': _int | sort | map('regex_replace', '^', 'https://') | list, 'labels': {'exposure': 'internal'}}])
+             | to_nice_json }}
 
 - name: Require cert and key for each manual_cert site
   ansible.builtin.assert:
@@ -549,25 +615,11 @@
     - caddy_tls_mode == 'acme_dns'
     - (_acme_dns_new_domains | default([]) | length > 0) or (_acme_dns_pending_domains | default([]) | length > 0)
 
-# Fetch acmedns.json back to the controller for use as seed credentials on re-install.
-- name: Fetch acme-dns credentials to controller
-  ansible.builtin.fetch:
-    src: "{{ caddy_acme_dns_credentials_file }}"
-    dest: "{{ caddy_acme_dns_credentials_backup_path }}"
-    flat: true
-  when:
-    - caddy_tls_mode == 'acme_dns'
-    - caddy_acme_dns_credentials_backup_path | length > 0
-
-- name: Notify about acme-dns credentials backup
-  ansible.builtin.debug:
-    msg: >
-      [acme-dns] Credentials backed up to: {{ caddy_acme_dns_credentials_backup_path }}
-      Use this file as caddy_acme_dns_seed_credentials input on re-install
-      (convert JSON to YAML and paste into vars under caddy_acme_dns_seed_credentials).
-  when:
-    - caddy_tls_mode == 'acme_dns'
-    - caddy_acme_dns_credentials_backup_path | length > 0
+# NOTE: acme-dns credentials are seeded DECLARATIVELY. The acme_dns_bootstrap role
+# derives caddy_acme_dns_seed_credentials from acme_dns_accounts (git + vault) and the
+# "Seed acme-dns credentials on fresh server" task above writes acmedns.json from it — same
+# UUIDs on every rebuild, so the registrar CNAMEs never change. No controller-side backup /
+# fetch-back is needed (the old acme-dns.io seed-from-backup flow has been removed).
 
 # ==========================================================
 # Tailscale TLS — fetch certs and set up renewal
@@ -735,15 +787,6 @@
   loop: "{{ caddy_bind_interfaces | default([]) }}"
   when: (caddy_bind_interfaces | default([]) | length) > 0
 
-- name: Fail if a configured Caddy bind interface has no IPv4 address
-  ansible.builtin.assert:
-    that:
-      - item.rc == 0
-      - item.stdout is search('inet ')
-    fail_msg: "Caddy bind interface '{{ item.item }}' was configured but no IPv4 address could be resolved for it."
-  loop: "{{ caddy_bind_interface_ip_results.results | default([]) }}"
-  when: (caddy_bind_interfaces | default([]) | length) > 0
-
 - name: Build Caddy bind interface IPv4 map
   ansible.builtin.set_fact:
     caddy_bind_interface_ipv4_map: >-
@@ -764,6 +807,41 @@
     caddy_bind_interface_ipv4_map: {}
   when: (caddy_bind_interfaces | default([]) | length) == 0
 
+# Graceful degrade (instead of failing the whole deploy): a bind interface with no
+# IPv4 yet (classically tailscale0 before the VPN client has joined its tunnel) must
+# not block the PUBLIC reverse proxy. We compute which configured bind interfaces have
+# no address; the Caddyfile template then SKIPS exactly the sites bound to them, so the
+# public sites (incl. headscale) still come up. Once the interface gets an IPv4 (e.g.
+# tailscale re-auth), the next run renders those .int sites automatically. This breaks
+# the bootstrap deadlock where Caddy served the very headscale endpoint the tailscale
+# client needs to obtain that IPv4.
+- name: Determine bind interfaces without a resolved IPv4 (degrade, do not fail)
+  ansible.builtin.set_fact:
+    caddy_missing_bind_ifaces: >-
+      {{ (caddy_bind_interfaces | default([]))
+         | difference(caddy_bind_interface_ipv4_map | default({}) | list) }}
+
+- name: WARN — Caddy site skipped (bind interface has no IPv4 yet)
+  ansible.builtin.debug:
+    msg: >-
+      [WARNING] Skipping Caddy site '{{ item.hostname | default(item.name | default('?')) }}'
+      — bind interface(s) {{ item.caddy_bind_interfaces | default([]) | intersect(caddy_missing_bind_ifaces) }}
+      have no IPv4 yet (e.g. tailscale0 not joined). It will be served automatically once the
+      interface has an address (re-run after the VPN client is up).
+  loop: "{{ caddy_effective_sites | default([]) }}"
+  loop_control:
+    label: "{{ item.hostname | default(item.name | default('?')) }}"
+  when:
+    - (caddy_missing_bind_ifaces | default([]) | length) > 0
+    - (item.caddy_bind_interfaces | default([]) | intersect(caddy_missing_bind_ifaces) | length) > 0
+
+# Restore the cached cert store BEFORE Caddy starts, so a wiped/rebuilt host reuses its
+# still-valid trusted certs instead of re-issuing (dodges the CA rate limit). No-op unless
+# restore_cached_ssl_certificates=true and every cached cert is unexpired.
+- name: Restore cached certificates from the controller
+  ansible.builtin.import_tasks: cert_cache_restore.yml
+  when: restore_cached_ssl_certificates | bool
+
 - name: Deploy Caddyfile
   ansible.builtin.template:
     src: Caddyfile.j2
@@ -776,7 +854,7 @@
     # caddy validate provisions the DNS provider while parsing the Caddyfile.
     # Without this, {env.CLOUDFLARE_API_TOKEN} is empty during Ansible's validate step.
     CLOUDFLARE_API_TOKEN: "{{ caddy_cloudflare_api_token | default('') | trim }}"
-  no_log: "{{ caddy_tls_mode == 'cloudflare_dns' }}"
+  no_log: "{{ (caddy_tls_mode == 'cloudflare_dns') or (caddy_zerossl_api_key | default('') | length > 0) or (caddy_acme_eab | default({}) | length > 0) }}"
   notify: Restart caddy
 
 - name: Enable and start Caddy
@@ -815,7 +893,7 @@
 - name: Wait for valid (unexpired) acme_dns certificates in Caddy's store
   ansible.builtin.shell: |
     set -o pipefail
-    f="{{ item | regex_replace('^\*', 'wildcard_') }}"
+    f="{{ item.hostname | regex_replace('^\*', 'wildcard_') }}"
     crt=$(find {{ caddy_acme_cert_store }}/certificates -type f -name "${f}.crt" 2>/dev/null | head -n1)
     # Existence alone is not enough: a cert whose renewal has been failing for
     # weeks is still on disk but expired. -checkend 0 = must not be expired NOW
@@ -829,9 +907,14 @@
   delay: "{{ caddy_acme_cert_wait_delay }}"
   until: _acme_dns_cert_wait.rc == 0
   ignore_errors: true
-  loop: "{{ _acme_dns_sites | default([]) | map(attribute='hostname') | unique | list }}"
+  loop: "{{ _acme_dns_sites | default([]) }}"
   loop_control:
-    label: "{{ item }}"
+    label: "{{ item.hostname }}"
+  # Degrade-aware: don't wait for a cert of a site we deliberately skipped because
+  # its bind interface has no IPv4 yet (e.g. *.int.dev over tailscale0 before the VPN
+  # client joined). Its cert isn't needed while the site isn't served; the next run
+  # (once tailscale0 has an IP) renders the site and obtains the cert.
+  when: (item.caddy_bind_interfaces | default([]) | intersect(caddy_missing_bind_ifaces | default([])) | length) == 0
 
 - name: Collect Caddy TLS errors after failed issuance
   ansible.builtin.shell: |
@@ -851,7 +934,7 @@
   ansible.builtin.fail:
     msg: |
       Caddy has no valid certificate (missing or expired) for:
-      {{ _acme_dns_cert_wait.results | selectattr('failed', 'defined') | selectattr('failed') | map(attribute='item') | list | to_nice_yaml }}
+      {{ _acme_dns_cert_wait.results | selectattr('failed', 'defined') | selectattr('failed') | map(attribute='item') | map(attribute='hostname') | list | to_nice_yaml }}
       Last TLS errors from `journalctl -u caddy`:
       {{ _acme_dns_cert_errors.stdout | default('(no errors captured)') }}
       Typical causes: broken/typo'd _acme-challenge CNAME (compare against
@@ -859,3 +942,10 @@
       Let's Encrypt rate limits, or a renewal that has been failing silently
       until the cert expired.
   when: _acme_dns_cert_wait is failed
+
+# Cache the (now valid) cert store on the controller so a future wipe/rebuild can restore
+# it via cert_cache_restore.yml. Runs last, after certs are confirmed present. No-op when
+# cache_ssl_certificates=false or the store is still empty.
+- name: Cache certificate store to the controller
+  ansible.builtin.import_tasks: cert_cache_backup.yml
+  when: cache_ssl_certificates | bool

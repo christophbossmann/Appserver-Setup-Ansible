@@ -10,8 +10,9 @@ WorkingDirectory={{ playground_ctl_install_dir }}
 ExecStart=/usr/bin/python3 -m playground_ctl.app
 Restart=always
 RestartSec=2
-# Target port for the playground_http_get action (deploy verification).
-Environment=PLAYGROUND_PUBLIC_PORT={{ playground_public_port }}
+# Root-owned allowlist mapping each environment name -> (workspace, port). The
+# broker reads it to resolve --env; the sandbox never supplies paths/ports.
+Environment=PLAYGROUND_CTL_ENVIRONMENTS={{ playground_ctl_environments_file }}
 
 # The broker runs as root on purpose:
 #   - host Docker is reached read-only (`docker ps`, `image ls`, `compose ls`)

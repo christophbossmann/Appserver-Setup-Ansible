@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Managed by Ansible (roles/monitoring). Directory sizes for node_exporter's textfile
+# collector -> the "Disk usage" Grafana dashboard (treemap). node_exporter only knows
+# whole filesystems; this measures what INSIDE them takes the space.
+#
+#   disk-usage-metrics <root>:<depth> [<root>:<depth> ...]
+#
+# For each root, every directory exactly <depth> levels below it is measured with du
+# (apparent bytes on disk, .snapshots excluded — btrfs snapshots are shared extents and
+# would be counted again). Output: disk_usage_bytes{root,path}. Written atomically to
+# <textfile dir>/disk-usage.prom. Each root runs under its own timeout so one slow
+# mount (e.g. the Storage Box over rclone) can't stall the rest.
+set -uo pipefail
+TEXTFILE_DIR=/var/lib/node_exporter/textfile
+OUT="$TEXTFILE_DIR/disk-usage.prom"
+TMP="$OUT.tmp"
+PER_ROOT_TIMEOUT="${DISK_USAGE_TIMEOUT:-900}"
+
+esc() { local s="${1//\\/\\\\}"; printf '%s' "${s//\"/\\\"}"; }
+
+SCAN=""   # scan times are emitted AFTER all disk_usage_bytes samples (a metric
+          # family's samples must be contiguous in the exposition format)
+{
+  echo "# HELP disk_usage_bytes Size of a directory (du, .snapshots excluded)"
+  echo "# TYPE disk_usage_bytes gauge"
+  for spec in "$@"; do
+    root="${spec%%:*}"; depth="${spec##*:}"
+    [ -d "$root" ] || continue
+    start=$(date +%s)
+    while IFS=$'\t' read -r bytes path; do
+      [ -n "$path" ] && echo "disk_usage_bytes{root=\"$(esc "$root")\",path=\"$(esc "$path")\"} $bytes"
+    done < <(
+      timeout "$PER_ROOT_TIMEOUT" find "$root" -mindepth "$depth" -maxdepth "$depth" -type d \
+          -not -path '*/.snapshots' -not -path '*/.snapshots/*' -print0 2>/dev/null \
+        | timeout "$PER_ROOT_TIMEOUT" xargs -0 -r du -sb --exclude=.snapshots 2>/dev/null
+    )
+    SCAN+="disk_usage_scan_seconds{root=\"$(esc "$root")\"} $(( $(date +%s) - start ))"$'\n'
+  done
+  echo "# HELP disk_usage_scan_seconds How long measuring a root took"
+  echo "# TYPE disk_usage_scan_seconds gauge"
+  printf '%s' "$SCAN"
+  echo "# HELP disk_usage_last_run_timestamp_seconds Last run of disk-usage-metrics"
+  echo "# TYPE disk_usage_last_run_timestamp_seconds gauge"
+  echo "disk_usage_last_run_timestamp_seconds $(date +%s)"
+} > "$TMP"
+chmod 0644 "$TMP"
+mv -f "$TMP" "$OUT"

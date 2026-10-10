@@ -17,9 +17,11 @@ playground_fresh_start: false
 playground_ctl_provision: true       # provision user + rootless Docker + broker
 playground_stack_enabled: true       # build/run the claude-ctl AI container
 
-# === Default playground app + public route ===
-playground_public_port: 8090         # 127.0.0.1:<this> backs the playground.<host> route
-playground_default_app_enabled: true # seed + start the "Welcome to Playground" page
+# === Deploy environments + public routes ===
+# One claude-ctl session, N deploy targets. Target one with --env <name>.
+playground_environments: [pg1, pg2, pg3]
+playground_env_base_port: 8100       # pg1 -> 8100, pg2 -> 8101, pg3 -> 8102
+playground_default_app_enabled: true # seed + start the "Welcome to Playground" page per env
 
 # The fixed identity values are hardcoded in the broker (playground_ctl/policy.py)
 # per task.md. Only uncomment to document; do not change without editing policy.py.
@@ -30,5 +32,7 @@ playground_default_app_enabled: true # seed + start the "Welcome to Playground" 
 # playground_ctl_subid_start: 231072
 # playground_ctl_subid_count: 65536
 
-# Route (playground, public + basic auth) lives in group_vars/all/proxy_routes.yml
-# and targets localhost:8090. Keep its upstream in sync with playground_public_port.
+# Routes (one per env, public + basic auth) live in
+# roles/claude_playground/defaults/caddy_route.yml; each caddy_route_<env>
+# targets 127.0.0.1:(playground_env_base_port + index). Enable per host via
+# caddy_services (pg1/pg2/pg3: external).

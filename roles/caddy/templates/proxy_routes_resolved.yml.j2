@@ -15,9 +15,29 @@
 {%   set prof  = route_ext if profile == 'external' else route_int %}
 {%   set basis = global_host if profile == 'external' else internal_host %}
 - name: "{{ route.name | default(svc) }}"
+  # Which DEPLOYED service this route belongs to (intent-aware post-check gate). Defaults
+  # to the route name; set explicitly in caddy_route.yml when the backend's deploy unit
+  # differs (e.g. webdav-immich -> immich, grafana -> monitoring, pgN -> playground).
+  depends_service: "{{ route.depends_service | default(route.name | default(svc)) }}"
   hostname: "{{ route.hostname_label }}.{{ basis }}"
   caddy_enabled: {{ route.caddy_enabled | default(true) | bool | lower }}
   caddy_upstream: "{{ route.caddy_upstream }}"
+  caddy_forward_auth: {{ route.caddy_forward_auth | default(false) | bool | lower }}
+{%   if route.caddy_forward_auth_except_paths | default([]) | length > 0 %}
+  caddy_forward_auth_except_paths: {{ route.caddy_forward_auth_except_paths | to_json }}
+{%   endif %}
+{%   if route.caddy_allow_paths | default([]) | length > 0 %}
+  caddy_allow_paths: {{ route.caddy_allow_paths | to_json }}
+{%   endif %}
+{%   if route.caddy_path_proxies | default([]) | length > 0 %}
+  caddy_path_proxies: {{ route.caddy_path_proxies | to_json }}
+{%   endif %}
+{%   if route.healthcheck_status_codes is defined %}
+  healthcheck_status_codes: {{ route.healthcheck_status_codes | to_json }}
+{%   endif %}
+{%   if route.healthcheck_skip is defined %}
+  healthcheck_skip: {{ route.healthcheck_skip | bool | lower }}
+{%   endif %}
   caddy_tls_mode: "{{ prof.caddy_tls_mode }}"
   caddy_bind_interfaces: {{ prof.caddy_bind_interfaces | default([]) | to_json }}
 {%   if route.caddy_extra is defined and route.caddy_extra | trim | length > 0 %}

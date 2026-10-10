@@ -13,6 +13,9 @@
       - dbus-user-session
       - docker-ce-rootless-extras
       - acl
+      # sysstat provides iostat/mpstat for the broker's read-only `host diag`
+      # action (disk vs CPU attribution); vmstat/df/free are stock.
+      - sysstat
     state: present
     update_cache: true
 

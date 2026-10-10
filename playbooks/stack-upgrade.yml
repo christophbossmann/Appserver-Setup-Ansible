@@ -1,0 +1,157 @@
+---
+# Generic upgrade for services WITHOUT a database of their own (grafana, prometheus, the
+# exporters, dozzle, headplane …) and for the few with small file-based state (headscale,
+# acme-dns). One playbook because the logic is always the same:
+#
+#   new image -> redeploy -> verify (running, right image, healthy, not restart-looping)
+#   on ANY failure: back to the old image (and the old state copy) -> verify -> fail the play
+#
+#   ansible-playbook playbooks/stack-upgrade.yml --limit <host> \
+#     -e upgrade_service=grafana -e upgrade_version=12.4.12 -e upgrade_confirm=YES \
+#     [-e force_rollback=true]      # DRILL: upgrade, then roll back on purpose
+#     [-e upgrade_keep_old=true]    # keep the pre-upgrade state copy after a success
+#
+# Which services exist and how each is deployed: playbooks/vars/upgrade_catalog.yml.
+# Database-backed apps are NOT handled here — they need a PITR anchor and a DB rollback:
+# immich-upgrade.yml, nextcloud-upgrade.yml, authentik-upgrade.yml.
+#
+# The new version is written to the private config (group_vars/all/<file>) only AFTER the
+# upgrade is verified and kept, so a failed or drilled upgrade never leaves a stale version.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+  when: not (upgrade_local_run | default(false) | bool)
+
+- name: Stack upgrade (auto-rollback to the previous image)
+  hosts: all
+  become: true
+  vars_files:
+    - vars/upgrade_catalog.yml
+  vars:
+    upgrade_confirm: ""
+    upgrade_service: ""
+    upgrade_version: ""
+    upgrade_keep_old: false
+    force_rollback: false
+    upgrade_settle_seconds: 20      # how long the new containers must stay up without restarting
+    upgrade_health_retries: 36      # x5s for containers that define a docker healthcheck
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that:
+          - upgrade_confirm | default('') == 'YES'
+          - upgrade_service in upgrade_catalog
+          - upgrade_catalog[upgrade_service].playbook == 'stack-upgrade.yml'
+          - (upgrade_version | default('')) | length > 0
+        fail_msg: >-
+          Need -e upgrade_service=<one of {{ upgrade_catalog | dict2items | selectattr('value.playbook', 'equalto', 'stack-upgrade.yml') | map(attribute='key') | join(', ') }}>
+          -e upgrade_version=<tag> -e upgrade_confirm=YES. (immich / nextcloud / authentik
+          have their own playbooks with a database rollback.)
+
+    # Pick up versions an on-host upgrade changed since the config repo was last touched.
+    - name: Reconcile versions with the host
+      ansible.builtin.include_tasks: tasks/adopt_host_versions.yml
+
+    # A role's DEFAULTS are only visible inside that role. Read just the ONE key from the
+    # defaults file (plain YAML) as the fallback — loading the file as variables would template
+    # entries that reference each other and outrank the private group_vars that override them.
+    - name: Read the role default of the version variable (services deployed by a role)
+      ansible.builtin.set_fact:
+        _upg_role_default: "{{ (lookup('ansible.builtin.file', playbook_dir ~ '/../roles/' ~ upgrade_catalog[upgrade_service].role ~ '/defaults/main.yml') | from_yaml)[upgrade_catalog[upgrade_service].var] | default('') }}"
+      when: upgrade_catalog[upgrade_service].role is defined
+
+    - name: Resolve the service
+      ansible.builtin.set_fact:
+        _svc: "{{ upgrade_catalog[upgrade_service] }}"
+        _old_value: "{{ lookup('ansible.builtin.vars', upgrade_catalog[upgrade_service].var, default=(_upg_role_default | default(''))) }}"
+        _new_value: "{{ (upgrade_catalog[upgrade_service].value | default('{v}')) | replace('{v}', upgrade_version) }}"
+        _stamp: "{{ lookup('pipe', 'date -u +%Y%m%d-%H%M%S') }}"
+
+    - name: Refuse a no-op / an unknown current version
+      ansible.builtin.assert:
+        that:
+          - _old_value | length > 0
+          - _new_value != _old_value
+        fail_msg: "{{ upgrade_service }}: current value of {{ _svc.var }} is '{{ _old_value }}' — already there, or not resolvable."
+
+    - name: Plan
+      ansible.builtin.debug:
+        msg: "{{ upgrade_service }}: {{ _svc.var }} {{ _old_value }} -> {{ _new_value }}{{ ' (state copy: ' ~ (_svc.state_paths | join(', ')) ~ ')' if (_svc.state_paths | default([]) | length > 0) else '' }}"
+
+    # ---- file-based state: stop, copy, (the upgrade below starts the new image) ------------
+    - name: Stop the containers for a consistent state copy
+      ansible.builtin.command: "docker stop {{ _svc.containers | join(' ') }}"
+      changed_when: true
+      when: _svc.state_paths | default([]) | length > 0
+
+    - name: Copy the state aside (reflink where the filesystem supports it)
+      ansible.builtin.command: "cp -a --reflink=auto {{ item }} {{ item }}.pre-upgrade-{{ _stamp }}"
+      loop: "{{ _svc.state_paths | default([]) }}"
+      changed_when: true
+
+    # ---- UPGRADE (block) with automatic ROLLBACK (rescue) ----------------------------------
+    - name: Upgrade
+      block:
+        - name: Switch to the new version (for this run only)
+          ansible.builtin.set_fact:
+            "{{ _svc.var }}": "{{ _new_value }}"
+
+        - name: Redeploy
+          ansible.builtin.include_tasks: tasks/stack_upgrade_deploy.yml
+          vars:
+            _expect_tag: "{{ upgrade_version }}"
+
+        - name: Upgrade verified
+          ansible.builtin.debug:
+            msg: "{{ upgrade_service }} upgraded {{ _old_value }} -> {{ _new_value }}: containers up, right image, stable."
+
+        - name: Persist the new version to the private config (verified upgrade, kept)
+          ansible.builtin.lineinfile:
+            path: "{{ inventory_dir }}/group_vars/all/{{ _svc.file }}"
+            regexp: '^{{ _svc.var }}:'
+            line: '{{ _svc.var }}: "{{ _new_value }}"'
+          delegate_to: localhost
+          become: false
+          when: not (force_rollback | default(false) | bool)
+
+        - name: Record the deployed version on the host
+          ansible.builtin.include_tasks: tasks/record_version.yml
+          vars:
+            rec_service: "{{ upgrade_service }}"
+            rec_var: "{{ _svc.var }}"
+            rec_file: "{{ _svc.file }}"
+            rec_value: "{{ _new_value }}"
+            rec_previous: "{{ _old_value }}"
+          when: not (force_rollback | default(false) | bool)
+
+        - name: Drop the pre-upgrade state copy (upgrade kept)
+          ansible.builtin.file:
+            path: "{{ item }}.pre-upgrade-{{ _stamp }}"
+            state: absent
+          loop: "{{ _svc.state_paths | default([]) }}"
+          when:
+            - not (force_rollback | default(false) | bool)
+            - not (upgrade_keep_old | default(false) | bool)
+
+        # ---- force_rollback DRILL: undo the (successful) upgrade on purpose ----------------
+        - name: force_rollback — roll the just-upgraded service back (drill)
+          ansible.builtin.include_tasks: tasks/stack_upgrade_rollback.yml
+          when: force_rollback | default(false) | bool
+
+        - name: Drill complete
+          ansible.builtin.debug:
+            msg: "force_rollback drill complete — {{ upgrade_service }} is back at {{ _old_value }}."
+          when: force_rollback | default(false) | bool
+
+      rescue:
+        - name: Upgrade FAILED — rolling back
+          ansible.builtin.debug:
+            msg: "{{ upgrade_service }} upgrade to {{ _new_value }} failed. Rolling back to {{ _old_value }}."
+
+        - name: Roll back (shared steps — same as the force_rollback drill)
+          ansible.builtin.include_tasks: tasks/stack_upgrade_rollback.yml
+
+        - name: Roll-back complete — fail the play so the outcome is unmistakable
+          ansible.builtin.fail:
+            msg: >-
+              {{ upgrade_service }} upgrade to {{ _new_value }} FAILED and was rolled back to
+              {{ _old_value }}. Investigate before retrying.

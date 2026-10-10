@@ -1,0 +1,122 @@
+---
+# Take ONE named checkpoint snapshot (btrfs_snapshot=<label>) of the checkpoint config.
+# The host is EXPECTED to be fully set up for btrfs snapshots already (the @-layout +
+# snapper + grub-btrfs + the 'snapshot' helper), done once by ./btrfs-bootstrap.sh. This
+# file does NOT install or configure anything — it only checks readiness and creates the
+# snapshot (grub-btrfsd picks it up for the GRUB menu on its own).
+#
+# btrfs_snapshots_enable:
+#   true  -> snapshots MUST work here: FAIL if btrfs/snapper isn't set up (run bootstrap)
+#   auto  -> best effort: warn + skip if the host isn't set up (e.g. a non-btrfs host)
+#   false -> skip entirely
+- name: Mode for the checkpoint
+  ansible.builtin.set_fact:
+    _btrfs_req: "{{ (btrfs_snapshots_enable is boolean) and btrfs_snapshots_enable }}"
+    _btrfs_off: "{{ (btrfs_snapshots_enable is boolean) and (not btrfs_snapshots_enable) }}"
+
+- name: BTRFS snapshots disabled (false) — checkpoint '{{ btrfs_snapshot }}' skipped
+  ansible.builtin.debug:
+    msg: "btrfs_snapshots_enable=false — not creating checkpoint '{{ btrfs_snapshot }}'."
+  when: _btrfs_off | bool
+
+- name: Checkpoint '{{ btrfs_snapshot }}'
+  when: not (_btrfs_off | bool)
+  block:
+    - name: Detect filesystem for the checkpoint
+      ansible.builtin.command: "findmnt -no FSTYPE --target {{ btrfs_check_path }}"
+      register: _btrfs_cp_fs
+      changed_when: false
+      check_mode: false
+
+    - name: Confirm the snapper checkpoint config exists
+      ansible.builtin.command: "snapper -c {{ btrfs_checkpoint_config }} list"
+      register: _btrfs_cp_cfg
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: (_btrfs_cp_fs.stdout | trim) == 'btrfs'
+
+    # The checkpoints run through the 'snapshot' helper, which ONLY btrfs-bootstrap.sh
+    # installs (separation of concerns: this role never installs/configures anything).
+    # Missing helper = the bootstrap didn't (fully) run -> host counts as NOT set up.
+    - name: Check the 'snapshot' helper is installed (by btrfs-bootstrap.sh)
+      ansible.builtin.stat:
+        path: /usr/local/bin/snapshot
+      register: _btrfs_cp_tool
+
+    - name: Whether this host is set up for checkpoints
+      ansible.builtin.set_fact:
+        _btrfs_ready: >-
+          {{ ((_btrfs_cp_fs.stdout | trim) == 'btrfs')
+             and ((_btrfs_cp_cfg.rc | default(1)) == 0)
+             and (_btrfs_cp_tool.stat.executable | default(false)) }}
+
+    # mode=true = "this host is a btrfs-snapshots host, snapshots MUST work". If the
+    # foundational setup is missing, that's a real misconfiguration — abort with a
+    # pointer to the one-time bootstrap rather than silently skipping.
+    - name: Require a finished btrfs setup (mode=true)
+      ansible.builtin.assert:
+        that: _btrfs_ready | bool
+        fail_msg: >-
+          btrfs_snapshots_enable=true on {{ inventory_hostname }}, but the host is NOT set up
+          for snapshots ({{ btrfs_check_path }}='{{ _btrfs_cp_fs.stdout | trim }}', need btrfs;
+          snapper config '{{ btrfs_checkpoint_config }}' present={{ (_btrfs_cp_cfg.rc | default(1)) == 0 }};
+          'snapshot' helper installed={{ _btrfs_cp_tool.stat.executable | default(false) }}).
+          Run the one-time  ./btrfs-bootstrap.sh <host> <ssh_user>  from the controller first
+          (it does the @-layout + snapper + grub-btrfs, see btrfs-setup.md), then re-run.
+          Aborting.
+        success_msg: "btrfs + snapper ready — creating checkpoint '{{ btrfs_snapshot }}'."
+        quiet: true
+      when: _btrfs_req | bool
+
+    - name: Not set up for checkpoints (mode=auto) — skip with a warning
+      ansible.builtin.debug:
+        msg: >-
+          [WARNING] Checkpoint '{{ btrfs_snapshot }}' skipped — host not set up for btrfs
+          snapshots ({{ btrfs_check_path }}='{{ _btrfs_cp_fs.stdout | trim }}', snapper config
+          present={{ (_btrfs_cp_cfg.rc | default(1)) == 0 }}, 'snapshot' helper
+          installed={{ _btrfs_cp_tool.stat.executable | default(false) }}). Run ./btrfs-bootstrap.sh to
+          enable, or set btrfs_snapshots_enable=false to silence this.
+      when:
+        - not (_btrfs_req | bool)
+        - not (_btrfs_ready | bool)
+
+    - name: Create the checkpoint (host is ready)
+      when: _btrfs_ready | bool
+      block:
+        # The description IS the label (no date suffix — the snapper 'Date' column already
+        # shows when; skip_if_exists keeps at most one per label anyway). The 'ans_' prefix
+        # (from the play) marks it as ansible-created. Uses the same 'snapshot' helper that
+        # is on the server (installed by btrfs-bootstrap.sh) for consistency. Normal
+        # checkpoints get --cleanup number (auto-pruned); PERMANENT anchors
+        # (btrfs_snapshot_permanent=true, e.g. ans_pre_setup / ans_subvols_ready) are
+        # created WITHOUT a cleanup algorithm so they are never auto-deleted.
+        - name: Create {{ 'PERMANENT anchor' if (btrfs_snapshot_permanent | default(false) | bool) else 'checkpoint' }} snapshot '{{ btrfs_snapshot }}' (via the 'snapshot' helper)
+          ansible.builtin.command: >-
+            snapshot create {{ '' if (btrfs_snapshot_permanent | default(false) | bool) else '--cleanup number' }}
+            {{ btrfs_snapshot }}
+          register: _btrfs_cp_create
+          changed_when: (_btrfs_cp_create.rc | default(1)) == 0
+          # mode=true: a creation failure on a set-up host is a real error -> fail.
+          # mode=auto: stay tolerant (warn below).
+          failed_when: (_btrfs_req | bool) and ((_btrfs_cp_create.rc | default(1)) != 0)
+          when:
+            - not ((btrfs_checkpoint_skip_if_exists | default(true) | bool) and (btrfs_snapshot in (_btrfs_cp_cfg.stdout | default(''))))
+
+        - name: Checkpoint '{{ btrfs_snapshot }}' already exists — not re-created
+          ansible.builtin.debug:
+            msg: "A '{{ btrfs_snapshot }}_*' snapshot already exists — skipping (btrfs_checkpoint_skip_if_exists=true)."
+          when:
+            - btrfs_checkpoint_skip_if_exists | default(true) | bool
+            - btrfs_snapshot in (_btrfs_cp_cfg.stdout | default(''))
+
+        - name: Checkpoint snapshot could NOT be created (mode=auto) — warn, continue
+          ansible.builtin.debug:
+            msg: >-
+              [WARNING] Checkpoint '{{ btrfs_snapshot }}' not created
+              ({{ _btrfs_cp_create.stderr | default('') | trim }}). snapper is set up but the
+              snapshot failed — check `snapper -c {{ btrfs_checkpoint_config }} list`.
+          when:
+            - not (_btrfs_req | bool)
+            - not (_btrfs_cp_create.skipped | default(false))
+            - (_btrfs_cp_create.rc | default(1)) != 0

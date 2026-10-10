@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Managed by Ansible (roles/monitoring). PostgreSQL PITR archive state (roles/postgres_pitr)
+# for node_exporter's textfile collector -> "Database backups (PITR)" on the Immich and
+# Postgres dashboards.
+#
+#   pitr-metrics <instance>:<host archive dir> [<instance>:<dir> ...]
+#
+# Per instance: number of base backups, oldest one (= the earliest restorable point),
+# newest one, newest WAL segment archived, archive size. Base backup dirs are named by
+# pg-pitr-backup in UTC (base/YYYYmmdd-HHMMSS), so their time comes from the name, not the
+# mtime. Read-only. Written atomically to <textfile dir>/pitr.prom.
+set -uo pipefail
+TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile}"
+OUT="$TEXTFILE_DIR/pitr.prom"
+TMP="$OUT.tmp"
+
+ts_of() {   # base/20261004-151230 -> epoch (UTC)
+  local n="${1##*/}"
+  date -u -d "${n:0:8} ${n:9:2}:${n:11:2}:${n:13:2}" +%s 2>/dev/null
+}
+
+declare -A M
+add() { M[$1]+="$1{instance=\"$2\"} $3"$'\n'; }
+
+for spec in "$@"; do
+  inst="${spec%%:*}"; dir="${spec#*:}"
+  [ -d "$dir" ] || continue
+  mapfile -t bases < <(find "$dir/base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+  add pitr_base_backups "$inst" "${#bases[@]}"
+  if [ "${#bases[@]}" -gt 0 ]; then
+    o=$(ts_of "${bases[0]}"); n=$(ts_of "${bases[-1]}")
+    [ -n "$o" ] && add pitr_base_oldest_timestamp_seconds "$inst" "$o"
+    [ -n "$n" ] && add pitr_base_newest_timestamp_seconds "$inst" "$n"
+    add pitr_base_newest_bytes "$inst" "$(du -sb "${bases[-1]}" | cut -f1)"
+  fi
+  last_wal=$(find "$dir/wal" -maxdepth 1 -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+  [ -n "$last_wal" ] && add pitr_wal_last_archived_timestamp_seconds "$inst" "${last_wal%.*}"
+  add pitr_wal_segments "$inst" "$(find "$dir/wal" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+  add pitr_archive_bytes "$inst" "$(du -sb "$dir" | cut -f1)"
+done
+
+{
+  for m in "pitr_base_backups:Base backups kept in the PITR archive" \
+           "pitr_base_oldest_timestamp_seconds:Oldest base backup = earliest restorable point" \
+           "pitr_base_newest_timestamp_seconds:Newest base backup" \
+           "pitr_base_newest_bytes:Size of the newest base backup" \
+           "pitr_wal_last_archived_timestamp_seconds:Newest WAL segment in the archive" \
+           "pitr_wal_segments:WAL segments in the archive" \
+           "pitr_archive_bytes:Total size of the instance's PITR archive"; do
+    name="${m%%:*}"
+    [ -n "${M[$name]:-}" ] || continue
+    echo "# HELP $name ${m#*:}"
+    echo "# TYPE $name gauge"
+    printf '%s' "${M[$name]}"
+  done
+} > "$TMP" && mv "$TMP" "$OUT"

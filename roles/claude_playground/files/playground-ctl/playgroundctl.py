@@ -5,7 +5,24 @@ import os
 import socket
 import sys
 
-SOCKET_PATH = os.environ.get("PLAYGROUND_CTL_SOCKET", "/run/playground-ctl.sock")
+SOCKET_PATH = os.environ.get("PLAYGROUND_CTL_SOCKET", "/run/playground-ctl/playground-ctl.sock")
+
+# Actions that operate on ONE environment's workspace and therefore accept the
+# --env selector. Everything else (ps, image ls/rm, compose ls, envs, host ...)
+# is daemon-wide and rejects --env.
+ENV_SCOPED_ACTIONS = {
+    "playground_compose_ps",
+    "playground_compose_logs",
+    "playground_compose_up",
+    "playground_compose_stop",
+    "playground_compose_restart",
+    "playground_compose_down",
+    "playground_compose_destroy",
+    "playground_compose_kill",
+    "playground_compose_build",
+    "playground_compose_reset",
+    "playground_http_get",
+}
 
 
 def call(request):
@@ -78,8 +95,40 @@ def denied(daemon, args):
     )
 
 
-def parse_args(argv):
-    args = argv[1:]
+def extract_env(args):
+    """Pull an optional `--env <name>` / `--env=<name>` out of args (it may
+    appear anywhere). Returns (env, remaining_args, error_message)."""
+    env = None
+    remaining = []
+    i = 0
+
+    while i < len(args):
+        token = args[i]
+
+        if token == "--env":
+            if i + 1 >= len(args):
+                return None, None, "missing value for --env"
+            env = args[i + 1]
+            i += 2
+            continue
+
+        if token.startswith("--env="):
+            env = token.split("=", 1)[1]
+            i += 1
+            continue
+
+        remaining.append(token)
+        i += 1
+
+    if env is not None and env == "":
+        return None, None, "empty value for --env"
+
+    return env, remaining, None
+
+
+def parse_args(command_args):
+    """command_args = argv[1:] with --env already stripped."""
+    args = command_args
 
     if not args:
         return client_error("missing daemon")
@@ -87,11 +136,22 @@ def parse_args(argv):
     daemon = args[0]
     command = args[1:]
 
-    if daemon not in {"host", "playground"}:
+    if daemon not in {"host", "playground", "functions"}:
         return client_error(f"unknown daemon: {daemon}")
 
     if not command:
         return client_error(f"missing command for daemon '{daemon}'")
+
+    # -----------------
+    # functions — supabase edge functions (deploy = drop files in
+    # /workspace/supabase/functions/<name>/index.ts; reload sheds cached workers)
+    # -----------------
+    if daemon == "functions":
+        if command == ["reload"]:
+            return {"action": "functions_reload"}
+        return client_error(
+            f"unknown command for daemon '{daemon}': {command_text(command)}"
+        )
 
     # -----------------
     # host daemon
@@ -106,6 +166,21 @@ def parse_args(argv):
 
         if command == ["compose", "ls"]:
             return {"action": "host_compose_ls"}
+
+        # Read-only diagnostics: attribute host saturation to a container or
+        # subsystem (CPU vs I/O vs storage) instead of only seeing loadavg.
+        if command == ["stats"]:
+            return {"action": "host_stats"}
+
+        if command == ["diag"]:
+            return {"action": "host_diag"}
+
+        if command[0] == "promql":
+            if len(command) < 2:
+                return client_error("missing PromQL expression (quote it: host promql 'node_load1')")
+            if len(command) > 2:
+                return client_error("too many arguments — quote the whole expression")
+            return {"action": "host_promql", "query": command[1]}
 
         # Known command families, but not allowed on host.
         if command[0] in {
@@ -137,6 +212,9 @@ def parse_args(argv):
     if daemon == "playground":
         if command == ["ps"]:
             return {"action": "playground_ps"}
+
+        if command == ["envs"]:
+            return {"action": "playground_environments"}
 
         if command == ["image", "ls"]:
             return {"action": "playground_image_ls"}
@@ -196,7 +274,7 @@ def parse_args(argv):
             return client_error("too many arguments for playground compose logs")
 
         # HTTP fetch of the workspace app via the broker (host loopback) —
-        # the sandbox has no network path to 127.0.0.1:<public port> itself.
+        # the sandbox has no network path to 127.0.0.1:<env port> itself.
         if len(command) >= 2 and command[0:2] == ["http", "get"]:
             if len(command) == 2:
                 return {"action": "playground_http_get"}
@@ -221,26 +299,41 @@ def usage():
     print("  playgroundctl host ps", file=sys.stderr)
     print("  playgroundctl host image ls", file=sys.stderr)
     print("  playgroundctl host compose ls", file=sys.stderr)
+    print("  playgroundctl host stats                     # per-container CPU/mem/net/disk snapshot + docker df", file=sys.stderr)
+    print("  playgroundctl host diag                      # CPU vs I/O vs storage: PSI, vmstat, iostat, df, free", file=sys.stderr)
+    print("  playgroundctl host promql '<expr>'           # read-only Prometheus query (history, per-container via cAdvisor)", file=sys.stderr)
     print("", file=sys.stderr)
+    print("  playgroundctl functions reload               # restart the supabase edge-runtime (pick up edited functions)", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  playgroundctl playground envs                # list deploy environments", file=sys.stderr)
     print("  playgroundctl playground ps", file=sys.stderr)
     print("  playgroundctl playground image ls", file=sys.stderr)
     print("  playgroundctl playground image rm playground/<image>:<tag>", file=sys.stderr)
     print("  playgroundctl playground compose ls", file=sys.stderr)
-    print("  playgroundctl playground compose ps", file=sys.stderr)
-    print("  playgroundctl playground compose up", file=sys.stderr)
-    print("  playgroundctl playground compose stop", file=sys.stderr)
-    print("  playgroundctl playground compose restart", file=sys.stderr)
-    print("  playgroundctl playground compose down", file=sys.stderr)
-    print("  playgroundctl playground compose destroy", file=sys.stderr)
-    print("  playgroundctl playground compose kill", file=sys.stderr)
-    print("  playgroundctl playground compose build", file=sys.stderr)
-    print("  playgroundctl playground compose reset", file=sys.stderr)
-    print("  playgroundctl playground compose logs [tail]", file=sys.stderr)
-    print("  playgroundctl playground http get [/path]    # fetch the app (verify deploys)", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  Environment-scoped (pick a target with --env <name>; default env if omitted):", file=sys.stderr)
+    print("  playgroundctl playground compose ps      [--env <name>]", file=sys.stderr)
+    print("  playgroundctl playground compose up      [--env <name>]", file=sys.stderr)
+    print("  playgroundctl playground compose stop    [--env <name>]", file=sys.stderr)
+    print("  playgroundctl playground compose restart [--env <name>]", file=sys.stderr)
+    print("  playgroundctl playground compose down    [--env <name>]", file=sys.stderr)
+    print("  playgroundctl playground compose destroy [--env <name>]", file=sys.stderr)
+    print("  playgroundctl playground compose kill    [--env <name>]", file=sys.stderr)
+    print("  playgroundctl playground compose build   [--env <name>]", file=sys.stderr)
+    print("  playgroundctl playground compose reset   [--env <name>]", file=sys.stderr)
+    print("  playgroundctl playground compose logs [tail]   [--env <name>]", file=sys.stderr)
+    print("  playgroundctl playground http get [/path]      [--env <name>]   # verify a deploy", file=sys.stderr)
 
 
 def main():
-    request = parse_args(sys.argv)
+    env, command_args, env_error = extract_env(sys.argv[1:])
+
+    if env_error:
+        print(f"playgroundctl: {env_error}", file=sys.stderr)
+        usage()
+        sys.exit(1)
+
+    request = parse_args(command_args)
 
     if "client_error" in request:
         print(f"playgroundctl: {request['client_error']}", file=sys.stderr)
@@ -249,6 +342,16 @@ def main():
             usage()
 
         sys.exit(1)
+
+    if env is not None:
+        if request["action"] not in ENV_SCOPED_ACTIONS:
+            print(
+                f"playgroundctl: --env is not valid for '{command_text(command_args)}' "
+                f"(only environment-scoped commands accept --env)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        request["env"] = env
 
     response = call(request)
 

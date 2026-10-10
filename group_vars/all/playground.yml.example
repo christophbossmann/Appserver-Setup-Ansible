@@ -1,0 +1,149 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/playground.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# Claude Playground config (was vars/playground.yml). Non-secret defaults live
+# in roles/claude_playground/defaults/main.yml; secrets in group_vars/all/vault.yml.
+
+# === Claude Code (claude-ctl container) ===
+claude_code_version: "latest"        # pin e.g. "2.1.79" for reproducibility
+playground_remote_control_autoactivate: true
+
+# Keep false for normal runs! true tears down the claude-ctl stack + image and
+# rebuilds clean (workspace files are kept). For a one-off clean slate:
+#   ansible-playbook ... -e playground_fresh_start=true
+playground_fresh_start: false
+
+# Run-only switches (pass with -e ...=true when needed):
+# playground_new_session: false      # restart -> fresh Remote Control session, login kept
+# playground_force_relogin: false    # drop creds -> fresh login (interactive confirm guard)
+
+# === playgroundctl broker / rootless provisioning ===
+playground_ctl_provision: true       # provision user + rootless Docker + broker
+playground_stack_enabled: true       # build/run the claude-ctl AI container
+
+# === Deploy environments + public routes ===
+# N independent playground environments; one claude-ctl session picks the target
+# per action with `playgroundctl playground compose up --env <name>`. Each env
+# gets a workspace subdir, a loopback port (base + index) and a <env>.<host>
+# route. To grow: append a name here, add a caddy_route_<name> block in the
+# role's defaults/caddy_route.yml, and add `<name>: external` to caddy_services.
+playground_environments:
+  - pg1
+  - pg2
+  - pg3
+  - pg4
+  - pg5
+playground_env_base_port: 8100       # pg1 -> 8100 … pg5 -> 8104
+playground_default_app_enabled: true # seed + start the "Welcome to Playground" page per env
+
+# === Playwright MCP integration (test deployed WebUIs from claude-ctl) ===
+# claude-ctl joins the isolated "playground-mcp" network with the existing
+# playwright-mcp stack and registers it as an MCP server. The AI drives a real
+# browser (watch it via the playwright.int.<host> noVNC route) to test the apps
+# it deploys to pg1..pgN at their real https://pgN.<host> URLs.
+playground_playwright_mcp_enabled: true
+playwright_mcp_claude_sse_url: "http://playwright-mcp:3000/sse"
+# basic_auth identity for the pgN routes (matches caddy_route_pgN: `kunde <hash>`).
+# The plaintext password lives in the vault (vault_playground_basicauth_password)
+# and is handed to Playwright as httpCredentials. Interim until Authentik SSO.
+playground_basicauth_user: "kunde"
+
+# === Supabase access for playground apps ===
+# The Supabase reached via the dedicated API host (supabase-api.<host>): Kong
+# enforces key-auth + ACL + RLS. The anon key is PUBLIC-by-design (it ships in
+# frontend bundles; RLS protects rows), so exposing it to the AI runtime is fine.
+#
+# IMPORTANT: this Supabase is the PLAYGROUND/DEV instance (a scratch DB), NOT a
+# production system — despite the *.prod.<host> server name, no productive data is
+# operated here. That is why the AI agent is given FULL access below (deliberate
+# operator decision): the SERVICE key (RLS bypass) AND a direct, DDL-capable DB URL
+# so it can run schema migrations. Do NOT copy this onto a real production DB.
+playground_supabase_enabled: true
+playground_supabase_url: "https://supabase-api.{{ global_host }}"
+playground_supabase_anon_key: "{{ vault_supabase_anon_key }}"
+
+# service_role key: BYPASSES RLS (full data access via PostgREST/GoTrue). ON here
+# because the agent builds schema/seed against the dev Supabase. NEVER goes into a
+# frontend bundle — server/CLI use only.
+playground_supabase_service_key_enabled: true
+playground_supabase_service_key: "{{ vault_supabase_service_role_key }}"
+
+# Direct DB access for the agent: join claude-ctl to the supabase docker network
+# and inject a DDL-capable SUPABASE_DB_URL (postgres role, verified DDL-capable) so
+# `supabase db push` / `psql` work for migrations. This DELIBERATELY punches through
+# claude-ctl's network isolation (normally playground-mcp only) to reach the DB —
+# acceptable ONLY because this Supabase is a dev/scratch instance. Set false to
+# revert to API-only (no DB URL, no supabase network).
+playground_supabase_db_direct: true
+playground_supabase_network: "supabase_default"   # external docker network of the supabase stack
+playground_supabase_pg_major: "17"                # server major version -> psql client + config.toml
+# host = the db container on that network; POSTGRES_DB is 'postgres' (see stacks/supabase/configs/env.j2).
+# sslmode=disable: supabase-db does not offer TLS on the internal docker bridge; the
+# supabase CLI otherwise forces TLS and fails ("server refused TLS connection"). The
+# link is internal-only (supabase_default network), so plaintext is fine here.
+playground_supabase_db_url: "postgresql://postgres:{{ vault_supabase_postgres_password }}@supabase-db:5432/postgres?sslmode=disable"
+# Optional extras for the agent (JWT signing/verify + Studio URL for docs):
+playground_supabase_jwt_secret: "{{ vault_supabase_jwt_secret }}"
+playground_supabase_studio_url: "https://supabase.{{ global_host }}"
+
+# Edge-function deploy path for the agent: the workspace dir below is bind-mounted
+# READ-ONLY into the supabase edge-runtime container (host daemon) as
+# /home/deno/playground-functions; the main router resolves /functions/v1/<name>
+# there first, then falls back to the stack's own volumes/functions. DELIBERATE
+# trade-off (operator-approved): agent-written code executes in a HOST-daemon
+# container — contained by the Deno sandbox + read-only mount + cpu/mem limits on
+# the runtime container, not by the rootless sandbox. Dev instance only.
+# Path is literal (not {{ playground_ctl_workspace }}) because the supabase stack
+# renders outside the claude_playground role; keep in sync with policy.py.
+playground_supabase_functions_enabled: true
+playground_supabase_functions_dir: "/home/playground/workspace/supabase/functions"
+
+# Same-origin Supabase access for browser apps: each pgN route proxies this path
+# prefix to the Supabase Kong gateway (see caddy_path_proxies in the pgN routes), so
+# a frontend calls `<origin>{{ playground_supabase_same_origin_path }}/rest/v1/...`
+# on its OWN origin -> NO CORS. Supabase already versions internally (/rest/v1,
+# /auth/v1, …), so this is just a mount prefix, not an API version. "/api" = the
+# conventional same-origin backend path; change it if an app needs /api for itself.
+playground_supabase_same_origin_path: "/api"
+
+# === WebDAV (workspace + claude-home/memory file access) ===
+# Serves /workspace and /claude-home (memory files; credentials excluded).
+# Loopback-only; reachable via the webdav-playground.<host> route
+# (caddy_services: webdav_playground) with basic_auth.
+playground_webdav_enabled: true
+# LDAP mode: authenticate WebDAV against Authentik via the LDAP outpost (rclone
+# --auth-proxy). Login = an Authentik user in webdav-playground-users (bind DN
+# cn=<user>,ou=users,<base_dn>). false -> fixed basic_auth below. Needs the LDAP
+# outpost (authentik_ldap_apps: webdav-playground) + the rclone-ldap image; the
+# container joins the backend network to reach authentik-ldap:3389.
+#
+# HINWEIS — Windows-Caching-Falle: Der Windows-WebDAV-Client (Dienst "WebClient")
+# cached Credentials im RAM und spielt ALTE weiter ab, selbst wenn du bei "net use"
+# ein neues Passwort tippst -> Symptom: im Browser (Inkognito) geht es sofort, im
+# Explorer/Laufwerk aber dauerhaft "Systemfehler 5 / Zugriff verweigert" bzw. im
+# Outpost-Log "flow error password: Invalid password" in Schleife (Username/Bind-DN
+# ist dabei KORREKT). Lösung (PowerShell als Admin, Reihenfolge wichtig — der
+# Dienst-Neustart ist der entscheidende Schritt):
+#   net use * /delete /y
+#   cmdkey /delete:webdav-playground.int.<host>   # + alle Treffer aus `cmdkey /list`
+#   net stop webclient ; net start webclient
+#   net use Z: https://webdav-playground.int.<host>/ /user:<authentik-user> *  # * = frischer PW-Prompt
+# Danach flott (rclone cached die Auth nach dem 1. Login; jeder LDAP-Bind fährt sonst
+# den vollen Auth-Flow ~2-3s).
+playground_webdav_ldap: true
+playground_webdav_ldap_base_dn: "dc=playground,dc=ldap,dc=example,dc=com"
+# Fallback basic_auth (used when playground_webdav_ldap is false):
+playground_webdav_user: "{{ admin_user }}"
+playground_webdav_password: "{{ vault_playground_webdav_password }}"
+
+# The fixed identity values are hardcoded in the broker (playground_ctl/policy.py).
+# Only uncomment to document; do not change without editing policy.py.
+# playground_ctl_user: "playground"
+# playground_ctl_socket_group: "playgroundctl"
+# playground_ctl_workspace: "/home/playground/workspace"   # env subdirs live under this
+# playground_ctl_socket: "/run/playground-ctl/playground-ctl.sock"
+
+# Routes (one per env, public + basic auth) live in
+# roles/claude_playground/defaults/caddy_route.yml; each caddy_route_<env>
+# targets 127.0.0.1:(playground_env_base_port + index). Enable them per host via
+# caddy_services (pg1/pg2/pg3: external).

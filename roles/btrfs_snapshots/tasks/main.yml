@@ -1,0 +1,13 @@
+---
+# This role ONLY takes deploy-time checkpoint snapshots. It EXPECTS the host to be
+# fully prepared for btrfs snapshots already (the @-layout + snapper + grub-btrfs),
+# which is done ONCE, outside Ansible, by ./btrfs-bootstrap.sh (a controller-run
+# script — that setup needs a reboot and is a one-way migration, so it doesn't belong
+# in an idempotent deploy). See btrfs-setup.md.
+#
+# The play calls the role once per checkpoint with `btrfs_snapshot: <label>` (meta/
+# allow_duplicates makes the repeated invocations run). A call WITHOUT btrfs_snapshot
+# is a no-op (there is no setup mode any more).
+- name: Take a checkpoint snapshot
+  ansible.builtin.include_tasks: snapshot.yml
+  when: (btrfs_snapshot | default('')) | length > 0

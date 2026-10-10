@@ -1,0 +1,9 @@
+# Supabase project config — REMOTE migration management only.
+# We do NOT run a full local Supabase stack here. The CLI is used to apply the
+# migrations in ./migrations against the remote dev DB via $SUPABASE_DB_URL
+# (see scripts/db-migrate). project_id is just a local label; major_version must
+# match the remote server so the CLI generates compatible SQL.
+project_id = "playground"
+
+[db]
+major_version = {{ playground_supabase_pg_major | default('17') }}

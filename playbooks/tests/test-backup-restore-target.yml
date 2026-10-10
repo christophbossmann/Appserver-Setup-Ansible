@@ -1,0 +1,84 @@
+---
+# TEST helper — included per backup_verify_targets entry (loop_var: t) by
+# test-backup-restore.yml. NOT a deploy; restores into a throwaway scratch DB and
+# drops it in `always`. See the header of test-backup-restore.yml.
+- name: "[{{ t.app }}] locate local DB dump"
+  ansible.builtin.stat:
+    path: "{{ backup_pull_dest }}/{{ t.app }}/{{ t.dump_dir | default(t.app) }}/db.dump"
+  delegate_to: localhost
+  become: false
+  register: _dump
+
+- name: "[{{ t.app }}] fail early if there is no local backup to verify"
+  ansible.builtin.assert:
+    that: [_dump.stat.exists]
+    fail_msg: "No local dump for {{ t.app }} — run: ansible-playbook … playbooks/backup-pull.yml --limit {{ inventory_hostname }} -e backup_only={{ t.app }}"
+    success_msg: "{{ t.app }}: local dump present ({{ (_dump.stat.size / 1048576) | round(1) }} MB)."
+
+- name: "[{{ t.app }}] restore into a throwaway DB and check"
+  vars:
+    _staged: "/opt/backups/verify-{{ t.app }}.dump"
+    _scratch: "verify_restore_{{ t.app }}"
+  block:
+    - name: "[{{ t.app }}] push the dump up to the host"
+      ansible.builtin.command:
+        argv:
+          - rsync
+          - -az
+          - -e
+          - "{{ _ssh }}"
+          - "--rsync-path=sudo rsync"
+          - "{{ backup_pull_dest }}/{{ t.app }}/{{ t.dump_dir | default(t.app) }}/db.dump"
+          - "{{ _tgt_user }}@{{ _tgt_host }}:{{ _staged }}"
+      delegate_to: localhost
+      become: false
+
+    - name: "[{{ t.app }}] create scratch DB -> pg_restore -> count -> sanity"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        C={{ t.container }}; SU={{ t.su }}; S={{ _scratch }}; O={{ t.owner }}
+        docker exec -i $C psql -U $SU -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $S" >/dev/null
+        docker exec -i $C psql -U $SU -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE $S OWNER $O" >/dev/null
+        cat {{ _staged }} | docker exec -i $C pg_restore -U $SU -d $S >/tmp/verify_{{ t.app }}.log 2>&1
+        RC=$?
+        TABLES=$(docker exec -i $C psql -U $SU -d $S -tAc "select count(*) from information_schema.tables where table_schema='public'" | tr -d '[:space:]')
+        SANITY=$(docker exec -i $C psql -U $SU -d $S -tAc "{{ t.sanity }}" 2>/dev/null | tr -d '[:space:]')
+        echo "VERIFY_RESULT rc=$RC tables=${TABLES:-0} sanity=${SANITY:-NA}"
+      args: { executable: /bin/bash }
+      register: _vr
+      changed_when: false
+
+    - name: "[{{ t.app }}] parse the result"
+      ansible.builtin.set_fact:
+        _v_tables: "{{ _vr.stdout | regex_search('tables=(\\d+)', '\\1') | first | int }}"
+        _v_sanity: "{{ _vr.stdout | regex_search('sanity=(\\S+)', '\\1') | first }}"
+
+    - name: "[{{ t.app }}] ASSERT the dump restored (public tables > 0)"
+      ansible.builtin.assert:
+        that: [_v_tables | int > 0]
+        fail_msg: "RESTORE FAILED for {{ t.app }} — 0 tables. See /tmp/verify_{{ t.app }}.log on the host. Raw: {{ _vr.stdout }}"
+        success_msg: "{{ t.app }}: DB restored OK -> {{ _v_tables }} tables; sanity({{ t.sanity }}) = {{ _v_sanity }}"
+
+    - name: "[{{ t.app }}] check the file/photo backup is present & non-empty"
+      ansible.builtin.find:
+        paths: "{{ backup_pull_dest }}/{{ t.app }}/{{ t.data_dir }}"
+        recurse: true
+        file_type: file
+      delegate_to: localhost
+      become: false
+      register: _files
+      when: t.data_dir is defined
+
+    - name: "[{{ t.app }}] ASSERT the file backup has files"
+      ansible.builtin.assert:
+        that: [_files.matched | int > 0]
+        fail_msg: "{{ t.app }}: file backup ({{ t.data_dir }}/) is EMPTY or missing."
+        success_msg: "{{ t.app }}: file backup has {{ _files.matched }} files."
+      when: t.data_dir is defined
+  always:
+    - name: "[{{ t.app }}] cleanup: drop scratch DB + remove staged dump"
+      ansible.builtin.shell: |
+        docker exec -i {{ t.container }} psql -U {{ t.su }} -d postgres -c "DROP DATABASE IF EXISTS {{ _scratch }}" >/dev/null 2>&1 || true
+        rm -f {{ _staged }}
+      args: { executable: /bin/bash }
+      changed_when: false

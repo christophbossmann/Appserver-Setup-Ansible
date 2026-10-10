@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Apply the migrations in supabase/migrations/ to the remote dev DB, idempotently.
+#
+# We do NOT use `supabase db push` here: that CLI forces a TLS connection, but the
+# self-hosted supabase-db offers no TLS on the internal docker network, so it fails
+# with "server refused TLS connection". psql connects fine (sslmode=disable), so we
+# apply migrations with psql and track applied files in a small ledger table
+# (public.schema_migrations) — re-runs apply only NEW files.
+#
+# Each migration runs in a single transaction together with its ledger insert, so a
+# failing migration is fully rolled back and stays un-applied.
+set -euo pipefail
+
+: "${SUPABASE_DB_URL:?SUPABASE_DB_URL is not set (server/CLI-only var)}"
+
+cd "$(cd "$(dirname "$0")/.." && pwd)"   # -> /workspace/supabase
+
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -qtAc \
+  "create table if not exists public.schema_migrations (
+     version text primary key,
+     applied_at timestamptz not null default now());" >/dev/null
+
+shopt -s nullglob
+applied=0
+for f in migrations/*.sql; do
+  v="$(basename "$f" .sql)"
+  if [ "$(psql "$SUPABASE_DB_URL" -qtAc "select 1 from public.schema_migrations where version = '$v'")" = "1" ]; then
+    echo "-- skip (already applied): $v"
+    continue
+  fi
+  echo ">> applying: $v"
+  psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 --single-transaction \
+    -f "$f" \
+    -c "insert into public.schema_migrations(version) values ('$v');"
+  applied=$((applied + 1))
+done
+echo ">> done: $applied new migration(s) applied"

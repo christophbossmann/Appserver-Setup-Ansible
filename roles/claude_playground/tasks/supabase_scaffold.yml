@@ -1,0 +1,94 @@
+---
+# === Supabase project scaffold in the shared workspace =============================
+# Seeds /workspace/supabase/ with a ready-to-run project (config, ONE example
+# migration with RLS, seed, helper scripts, README) so the agent can manage schema
+# migrations against the dev Supabase from the start.
+#
+# Idempotent: every file is force: false by default -> an existing file (e.g. the
+# agent already edited it) is NEVER overwritten. Set playground_supabase_scaffold_force=true
+# to reset the scaffold. Owned by the playground user with a setgid, group-writable
+# tree so the claude-ctl container (uid 10001, in the playground group) can read AND
+# write (add migrations, edit files).
+
+- name: Ensure the supabase scaffold directory tree
+  ansible.builtin.file:
+    path: "{{ playground_ctl_workspace }}/supabase/{{ item }}"
+    state: directory
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "2775"   # setgid -> agent-created files inherit the playground group
+  loop:
+    - ""
+    - migrations
+    - scripts
+    # Edge-function deploy path: bind-mounted READ-ONLY into the supabase
+    # edge-runtime (see the supabase compose + playground_supabase_functions_dir).
+    # If the supabase stack deployed first, docker pre-created this dir root-owned
+    # — this task then fixes the ownership so the agent can write into it.
+    - functions
+
+# ROLE-OWNED reference/tooling: always kept current (like CLAUDE.md) — README, config
+# and the helper scripts are ours to maintain, not agent state, so bug fixes reach
+# the agent on every run.
+- name: Seed the role-owned templated files (README, config — always current)
+  ansible.builtin.template:
+    src: "supabase/{{ item.src }}"
+    dest: "{{ playground_ctl_workspace }}/supabase/{{ item.dest }}"
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "0664"
+  loop:
+    - { src: "config.toml.j2", dest: "config.toml" }
+    - { src: "README.md.j2",   dest: "README.md" }
+
+- name: Seed the role-owned helper scripts (db-migrate/db-psql/check — always current)
+  ansible.builtin.copy:
+    src: "supabase/{{ item }}"
+    dest: "{{ playground_ctl_workspace }}/supabase/{{ item }}"
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "0775"
+  loop:
+    - scripts/db-migrate
+    - scripts/db-psql
+    - scripts/check
+
+# AGENT-EDITABLE: the example migration + seed are starting points the agent builds
+# on -> never overwritten (force:false). Set playground_supabase_scaffold_force=true
+# to reset them.
+- name: Seed the agent-editable files (example migration + seed; never overwrite)
+  ansible.builtin.copy:
+    src: "supabase/{{ item }}"
+    dest: "{{ playground_ctl_workspace }}/supabase/{{ item }}"
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "0664"
+    force: "{{ playground_supabase_scaffold_force | default(false) | bool }}"
+  loop:
+    - migrations/20260101000000_example_notes.sql
+    - seed.sql
+
+- name: Ensure the example edge function directory
+  ansible.builtin.file:
+    path: "{{ playground_ctl_workspace }}/supabase/functions/hello"
+    state: directory
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "2775"
+
+- name: Seed the example edge function (never overwrite)
+  ansible.builtin.copy:
+    src: "supabase/functions/hello/index.ts"
+    dest: "{{ playground_ctl_workspace }}/supabase/functions/hello/index.ts"
+    owner: "{{ playground_ctl_user }}"
+    group: "{{ playground_ctl_user }}"
+    mode: "0664"
+    force: "{{ playground_supabase_scaffold_force | default(false) | bool }}"
+
+- name: Supabase scaffold ready
+  ansible.builtin.debug:
+    msg: >-
+      Supabase scaffold at {{ playground_ctl_workspace }}/supabase (agent path
+      /workspace/supabase): config.toml, migrations/ (1 example), seed.sql,
+      scripts/{db-migrate,db-psql,check}, README.md. Existing files were kept
+      (force={{ playground_supabase_scaffold_force | default(false) }}).

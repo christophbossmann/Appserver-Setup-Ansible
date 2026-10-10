@@ -14,7 +14,7 @@ users:
     sudo: true
     password: "{{ 'YOUR_PLAIN_PASSWORD' | password_hash('sha512', 'YOUR_SALT') }}"
     ssh_keys:
-      - "{{ lookup('file', '~/.ssh/YOUR_KEY.pub') }}"
+      - "{{ lookup('file', ssh_pubkey_dir ~ '/YOUR_USERNAME_key.pub') }}"
 
 docker_users:
   - ansible
@@ -79,13 +79,11 @@ caddy_acme_dns_verify_ns: "ns1.desec.io" #Optional override for faster CNAME ver
 caddy_manage_ufw: false
 # caddy_cloudflare_api_token not needed for acme_dns mode
 
-# Seed credentials so fresh servers reuse the same acme-dns registration.
-# Credentials are stored outside the repo at ~/.ansible/acmedns/<hostname>.json (chmod 600).
-# The backup task writes to the same path after each run — always up to date.
-# First run: set backup path only; credentials file is created automatically.
-# Re-install: both lines below restore the existing registration without a new CNAME.
-caddy_acme_dns_seed_credentials: "{{ lookup('file', '~/.ansible/acmedns/YOUR_HOSTNAME.json') | from_json }}"
-caddy_acme_dns_credentials_backup_path: "~/.ansible/acmedns/YOUR_HOSTNAME.json"
+# acme-dns credentials are seeded DECLARATIVELY: define this host's domains in
+# acme_dns_accounts (group_vars/all/acme_dns.yml) with fixed UUIDs + a vault password. The
+# acme_dns_bootstrap role creates the accounts in the acme-dns DB and derives Caddy's
+# acmedns.json from the same list — same UUIDs on every rebuild, so the registrar CNAMEs
+# never change. No controller-side backup / seed file needed.
 
 # Optional: custom root CAs for caddy_tls_mode=internal.
 # Caddy uses these instead of auto-generating its own CA.

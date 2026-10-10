@@ -1,0 +1,75 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/nextcloud_imports.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# =============================================================================
+# group_vars/all/nextcloud_imports.yml
+#
+# Declarative import manifest for Nextcloud — seeds CONTACTS (vCard), CALENDARS
+# (iCal events) and TASKS (iCal to-dos) into accounts, and sets up SHARED
+# collections. Kept in its own file (referenced from nextcloud.yml).
+#
+# How it works (roles/nextcloud_bootstrap/tasks/dav_import.yml + dav_share.yml):
+#   * Files live in roles/nextcloud_bootstrap/files/imports/ (gitignored — personal
+#     data; only the README is tracked).
+#   * Contacts go in over CardDAV, calendars/tasks over CalDAV; a multi-object file
+#     is split per object and uploaded keyed by UID -> re-import UPDATES, never dups.
+#   * One-time, content-hash guarded: a normal deploy does nothing; editing a file
+#     re-imports it (updates/adds; never deletes what you removed).
+#   * Missing accounts are auto-created (works before first login; OIDC attaches the
+#     real SSO login later). Toggle: nextcloud_imports_create_users (nextcloud.yml).
+#
+# Grouped by TYPE. Sharing is an ATTRIBUTE, not a category: add `share_with` to ANY
+# entry to turn its collection into a shared one (owner keeps it; sharees see/edit the
+# SAME collection, changes sync). Without share_with an entry is a private collection.
+#
+# Item fields:
+#   Every entry: { user, file, slug }   — `slug` = the collection's URL id (same field
+#     name in all three categories). contacts may omit it -> the built-in 'contacts' book;
+#     calendars/tasks require it (created if missing).
+#   Optional on ANY entry:
+#     name: "Pretty Name"                  the collection's DISPLAY name (slug stays the
+#                                          URL); applied only when first created.
+#     share_with: [{user, access}, ...]    share this collection. access per sharee is
+#                                          read-write (default) | read-only, e.g.
+#       share_with:
+#         - { user: Carol, access: read-only }
+#         - { user: Bob,   access: read-write }
+#         - { user: Alice }            # access omitted = read-write
+#   Slugs: lowercase a-z0-9- . Tags: nc_contacts / nc_calendars / nc_tasks /
+#   nc_shares (the share passes), or nc_imports for all.
+# =============================================================================
+
+nextcloud_imports:
+
+  # --- Address books (CardDAV). Add share_with to make one a SHARED book. -----
+  contacts:
+    - { user: Alice, file: test-alice.vcf, slug: test-alice }
+    - { user: Bob,      file: test-bob.vcf,      slug: test-bob }
+    - { user: Carol,    file: test-carol.vcf,    slug: test-carol }
+    - { user: Alice, file: alices-adressbuch.vcf, slug: alices-adressbuch, name: "Alices Adressbuch" }
+    - { user: Carol,    file: carols-adressbuch.vcf,    slug: carols-adressbuch,    name: "Carols Adressbuch" }
+    - { user: Bob,      file: bobs-adressbuch.vcf,      slug: bobs-adressbuch,      name: "Bobs Adressbuch" }
+
+    - user: Bob
+      file: familienadressbuch.vcf
+      slug: familienadressbuch
+      name: "Familienadressbuch"
+      share_with:
+        - { user: Alice, access: read-write }
+        - { user: Carol,    access: read-write }
+
+    - user: Bob
+      file: carols-und-bobs-adressbuch.vcf
+      slug: carols-und-bobs-adressbuch
+      name: "Carols und Bobs Adressbuch"
+      share_with:
+        - { user: Carol, access: read-write }
+
+  # --- Calendars (CalDAV). Add share_with to SHARE a calendar. ----------------
+  calendars:
+    - { user: Alice, file: alice.ics, slug: alice, name: "Alices Kalender" }
+    - { user: Alice, file: alices-kalender.ics, slug: alices-kalender, name: "Alices Kalender" }
+
+  # --- Task lists (CalDAV VTODO) ----------------------------------------------
+  tasks:
+    - { user: Alice, file: alice-tasks.ics, slug: alice-aufgaben, name: "Aufgaben" }

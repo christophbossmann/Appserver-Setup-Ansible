@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# Managed by Ansible (roles/monitoring). Known vulnerabilities of the container images
+# RUNNING on this host, for node_exporter's textfile collector -> the "Vulnerabilities"
+# Grafana dashboard.
+#
+#   trivy-metrics <cache dir> [<update rules file>]
+#
+# 1. Scans every image a running container uses (docker ps — so it always matches what is
+#    actually deployed, pinned or not) with trivy and counts CRITICAL/HIGH findings, split
+#    by whether a fixed PACKAGE version exists: fixable="true" is what an image that ships
+#    the fixed package would resolve, fixable="false" has no fix upstream yet.
+#    NOTE: "fixable" says the package has a fix — NOT that a newer image already contains it.
+#    That question is answered by 3. + 4., which scan the candidate images themselves.
+# 2. Per CRITICAL/HIGH finding one trivy_vulnerability_info series incl. severity, CVSS score and
+#    short title (CVE tables on the dashboard); the complete list with titles goes to
+#    $REPORT_DIR/vulnerabilities.tsv.
+# 3. "Would re-pulling help?": the local digest is compared with the registry's digest of
+#    the SAME tag. If the registry has a newer build (floating tags like nextcloud:31-apache),
+#    that build is scanned -> trivy_image_update_vulnerabilities.
+# 4. "Would a version update help?": for images with a rule in <update rules file>
+#    (<repository>\t<ERE the version tags match>[\t<repository to list the tags of>]) the
+#    registry's tags are listed (skopeo; the 3rd column lets images that are released
+#    together share one list — some repositories have so many tags that listing times out),
+#    filtered by the rule and version-sorted. Up to three targets newer than the running tag
+#    are scanned: target="same-major" (newest tag with the same leading number — the low-risk
+#    update), "next-major" (newest tag of the next major — the realistic next step where
+#    majors must not be skipped) and "latest" (newest overall, when that is yet another major)
+#    -> trivy_image_newer_vulnerabilities, plus the CRITICAL/HIGH CVEs still present there
+#    (trivy_vulnerability_in_newer), so the dashboard can show what each update would remove.
+#    Candidates are scanned straight from the registry: nothing is pulled into docker,
+#    nothing is redeployed.
+#
+# No daemon: trivy runs only here (nightly timer / the dashboard's scan button) and holds
+# no memory in between. During a scan it needs RAM + scratch space for big images (the unit
+# caps memory; the vuln DB and temp files live in <cache dir>, a no-snapshot location).
+# One image failing (timeout / OOM / registry error) only marks that image as failed.
+# Read-only on the containers. Written atomically to <textfile dir>/trivy.prom.
+set -uo pipefail
+TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile}"
+REPORT_DIR="${TRIVY_REPORT_DIR:-/var/lib/trivy-report}"
+OUT="$TEXTFILE_DIR/trivy.prom"
+TMP="$OUT.tmp"
+CACHE="${1:?usage: trivy-metrics <cache dir> [<update rules file>]}"
+RULES="${2:-}"
+PER_IMAGE_TIMEOUT="${TRIVY_IMAGE_TIMEOUT:-30m}"
+# MEDIUM/LOW are left out on purpose: MEDIUM alone is ~7,500 findings / ~5,000 CVEs on a typical
+# host — a list nobody works through. Add them here (e.g. CRITICAL,HIGH,MEDIUM) to count them.
+SEVERITIES="${TRIVY_SEVERITIES:-CRITICAL,HIGH}"
+# Per-CVE series (the dashboard's CVE tables) only for these; other scanned severities are
+# counted (per image + distinct CVEs) and listed in the TSV report only.
+DETAIL_SEVERITIES="${TRIVY_DETAIL_SEVERITIES:-CRITICAL,HIGH}"
+
+mkdir -p "$CACHE/tmp" "$REPORT_DIR"
+export TMPDIR="$CACHE/tmp"          # image layers are unpacked here, not into (tmpfs) /tmp
+exec 9> "$CACHE/.lock"
+flock -n 9 || { echo "another trivy-metrics run is active"; exit 0; }
+
+start=$(date +%s)
+# work dir next to (not inside) the scratch dir, which is emptied after every image
+work=$(mktemp -d -p "$CACHE" run.XXXXXX); trap 'rm -rf "$work" "$CACHE"/tmp/*' EXIT
+for f in vulns info status upd_avail upd_vulns newer_info newer_vulns in_newer newer_check tsv cves created; do : > "$work/$f"; done
+
+# $work/scan.json -> metric lines. MODE: current (counts + per-CVE info + TSV rows),
+# update (counts of the same tag's newer build), newer (counts + remaining CRITICAL CVEs of
+# a newer version; TARGET/VERSION say which). The image label is always the RUNNING image.
+summarize() {
+  RUNNING="$running" MODE="$1" TARGET="${2:-}" VERSION="${3:-}" WORK="$work" SEVERITIES="$SEVERITIES" DETAIL_SEVERITIES="$DETAIL_SEVERITIES" python3 - "$work/scan.json" <<'PY'
+import json, os, sys
+esc = lambda s: str(s or "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+e = os.environ
+img, mode, work = esc(e["RUNNING"]), e["MODE"], e["WORK"]
+RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}   # numeric, so tables can sort by severity
+n = {(s, f): 0 for s in e["SEVERITIES"].split(",") for f in ("true", "false")}
+DETAIL = set(e["DETAIL_SEVERITIES"].split(","))
+info, rows, crit, cves, present = set(), [], set(), set(), set()
+for res in json.load(open(sys.argv[1])).get("Results") or []:
+    for v in res.get("Vulnerabilities") or []:
+        sev, fixed = v.get("Severity"), v.get("FixedVersion") or ""
+        key = (sev, "true" if fixed else "false")
+        if key not in n:
+            continue
+        n[key] += 1
+        cve, pkg, inst = v.get("VulnerabilityID"), v.get("PkgName"), v.get("InstalledVersion")
+        rows.append("\t".join(str(x or "").replace("\t", " ").replace("\n", " ")
+                              for x in (e["RUNNING"], sev, cve, pkg, inst, fixed, v.get("Title"))))
+        cves.add("%s\t%s" % (sev, cve))
+        if sev == "CRITICAL":
+            crit.add((cve, pkg))
+        if sev not in DETAIL:          # counted + in the TSV report, but no per-CVE series
+            continue
+        present.add((cve, pkg))
+        title = " ".join(str(v.get("Title") or "").split())
+        title = title if len(title) <= 110 else title[:107] + "..."
+        # The series VALUE is the CVSS base score (0 = none known), so tables sort it numerically;
+        # `rank` does the same for the severity (4 = CRITICAL … 2 = MEDIUM). The score must match
+        # the severity shown: take it from the source the severity comes from (SeveritySource),
+        # CVSS 4.0 before 3.x — e.g. GHSA rates CVE-2026-59873 CRITICAL on its v4.0 score 9.2 while
+        # the v3.1 score is 7.5. Only if that source has no score: the highest any source reports.
+        cv = {k: c for k, c in (v.get("CVSS") or {}).items() if isinstance(c, dict)}
+        own = cv.get(v.get("SeveritySource") or "", {})
+        scores = [own.get("V40Score") or own.get("V3Score")] if (own.get("V40Score") or own.get("V3Score")) else \
+                 [x for c in cv.values() for x in (c.get("V40Score"), c.get("V3Score")) if x]
+        info.add('trivy_vulnerability_info{image="%s",severity="%s",rank="%d",cve="%s",pkg="%s",installed="%s",fixed="%s",fixable="%s",title="%s"} %.1f'
+                 % (img, sev, RANK.get(sev, 0), esc(cve), esc(pkg), esc(inst), esc(fixed), key[1], esc(title), max(scores) if scores else 0))
+out = lambda name, lines: open(os.path.join(work, name), "a").write("".join(l + "\n" for l in lines))
+counts = sorted(n.items())
+if mode == "current":
+    out("vulns", ['trivy_image_vulnerabilities{image="%s",severity="%s",fixable="%s"} %d' % (img, s, f, c) for (s, f), c in counts])
+    out("info", sorted(info)); out("tsv", rows); out("cves", sorted(cves))
+elif mode == "update":
+    out("upd_vulns", ['trivy_image_update_vulnerabilities{image="%s",severity="%s",fixable="%s"} %d' % (img, s, f, c) for (s, f), c in counts])
+else:
+    lbl = 'image="%s",target="%s",version="%s"' % (img, esc(e["TARGET"]), esc(e["VERSION"]))
+    out("newer_vulns", ['trivy_image_newer_vulnerabilities{%s,severity="%s",fixable="%s"} %d' % (lbl, s, f, c) for (s, f), c in counts])
+    out("in_newer", sorted('trivy_vulnerability_in_newer{image="%s",target="%s",cve="%s",pkg="%s"} 1'
+                           % (img, esc(e["TARGET"]), esc(c), esc(p)) for c, p in present))
+PY
+}
+
+scan() {   # <image ref> [extra trivy args...] -> $work/scan.json
+  local ref="$1"; shift
+  trivy image --quiet --scanners vuln --severity "$SEVERITIES" --format json \
+    --skip-db-update --timeout "$PER_IMAGE_TIMEOUT" --cache-dir "$CACHE" \
+    --output "$work/scan.json" "$@" "$ref" 2>"$work/scan.err"
+}
+cleanup_scan() { rm -rf "$work/scan.json" "$CACHE"/tmp/*; }
+rule_for() { [ -n "$RULES" ] && [ -r "$RULES" ] && awk -F'\t' -v r="$1" -v c="$2" '$1 == r { print $c; exit }' "$RULES"; }   # <repo> <column>
+# Tags of a repository, cached per run (images released together share one list).
+tags_of() {
+  local cache="$work/tags.$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+  [ -e "$cache" ] || timeout 240 skopeo list-tags "docker://$1" 2>/dev/null \
+      | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin).get("Tags") or []))' > "$cache" 2>/dev/null
+  cat "$cache"
+}
+major_of() { sed -E 's/^[^0-9]*([0-9]+).*/\1/' <<<"$1"; }
+is_newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]; }   # $2 newer than $1
+
+# Refresh the vulnerability DB once, then scan with --skip-db-update (one download per run).
+db_ok=1
+trivy image --download-db-only --cache-dir "$CACHE" --quiet >/dev/null 2>"$work/db.err" || db_ok=0
+
+mapfile -t images < <(docker ps --format '{{.Image}}' | sort -u)
+
+# The registry comparisons (3. + 4.) cost registry requests on EVERY run (digest lookups,
+# manifests of the candidate versions) — Docker Hub allows an anonymous IP only ~100 per 6h
+# and answers 429 beyond that, which also blocks real `docker pull`s (deploys!). So they run
+# at most once per REG_MAX_AGE; in between (e.g. the dashboard's scan button) the previous
+# registry results are reused and only the LOCAL images are rescanned, which costs nothing.
+# They are refreshed early when the set of running images or the rules changed.
+REG_STATE="$CACHE/registry-state"
+REG_MAX_AGE="${TRIVY_REGISTRY_MAX_AGE:-72000}"      # 20h: the nightly run refreshes, daytime runs reuse
+REG_FILES="upd_avail upd_vulns newer_info newer_vulns in_newer newer_check"
+REG_FORMAT=2      # bump when the registry logic changes (new targets …) so stored results are refreshed
+reg_sig=$( { echo "$REG_FORMAT $DETAIL_SEVERITIES"; printf '%s\n' "${images[@]}"; cat "$RULES" 2>/dev/null; } | sha256sum | cut -d' ' -f1)
+registry=1; reg_failed=0
+if [ "${TRIVY_FORCE_REGISTRY:-0}" != 1 ] && [ -f "$REG_STATE/stamp" ] \
+   && [ "$(cat "$REG_STATE/sig" 2>/dev/null)" = "$reg_sig" ] \
+   && [ $(( start - $(cat "$REG_STATE/stamp") )) -lt "$REG_MAX_AGE" ]; then
+  registry=0
+  for f in $REG_FILES; do cat "$REG_STATE/$f" > "$work/$f" 2>/dev/null; done
+fi
+
+for running in "${images[@]}"; do
+  # --- 1./2. what is running ---
+  if scan "$running"; then
+    summarize current
+    echo "trivy_image_scan_success{image=\"$running\"} 1" >> "$work/status"
+  else
+    echo "scan failed: $running — $(tail -1 "$work/scan.err" 2>/dev/null)" >&2
+    echo "trivy_image_scan_success{image=\"$running\"} 0" >> "$work/status"
+  fi
+  cleanup_scan
+  # Build date of the running image: an image that has not been rebuilt for months gets no
+  # security fixes any more (e.g. the tag of an end-of-life major version) — whatever the CVE
+  # counts say. Reproducible builds carry a fake epoch date (1970/1980): skipped.
+  created=$(date -d "$(docker image inspect "$running" --format '{{.Created}}' 2>/dev/null)" +%s 2>/dev/null || echo 0)
+  [ "$created" -gt 1420070400 ] && echo "trivy_image_created_timestamp_seconds{image=\"$running\"} $created" >> "$work/created"
+  [ "$registry" = 1 ] || continue
+
+  # --- 3. newer build of the SAME tag? (no answer = local build / registry down) ---
+  repo="${running%:*}"; tag="${running##*:}"
+  rx=""; [ "$repo" = "$running" ] || rx=$(rule_for "$repo" 2) || true
+  local_digest=$(docker image inspect "$running" --format '{{range .RepoDigests}}{{.}} {{end}}' 2>/dev/null \
+                   | tr ' ' '\n' | sed -n 's/.*@//p' | head -1)
+  remote_digest=$(timeout 30 docker buildx imagetools inspect "$running" --format '{{.Manifest.Digest}}' 2>/dev/null)
+  if [ -n "$local_digest" ] && [ -n "$remote_digest" ]; then
+    if [ "$local_digest" = "$remote_digest" ]; then
+      echo "trivy_image_update_available{image=\"$running\"} 0" >> "$work/upd_avail"
+    else
+      echo "trivy_image_update_available{image=\"$running\"} 1" >> "$work/upd_avail"
+      if scan "$running" --image-src remote; then summarize update
+      else echo "scan of the registry build failed: $running — $(tail -1 "$work/scan.err" 2>/dev/null)" >&2; fi
+      cleanup_scan
+    fi
+  elif [ -n "${rx:-}" ]; then
+    # an image with an update rule comes from a registry — no digest = registry unreachable / rate-limited
+    echo "no registry digest for $running (registry unreachable or rate-limited)" >&2; reg_failed=1
+  fi
+
+  # --- 4. newer VERSION? (only for images with a rule whose pattern the running tag matches) ---
+  [ -n "${rx:-}" ] && grep -Eq -- "$rx" <<<"$tag" || continue
+  tags_repo=$(rule_for "$repo" 3) || true      # optional 3rd column: list ANOTHER repository's tags
+  tags=$(tags_of "${tags_repo:-$repo}" | grep -E -- "$rx" | sort -V)
+  if [ -z "$tags" ]; then
+    echo "could not list the tags of $repo" >&2; reg_failed=1
+    echo "trivy_image_newer_check_success{image=\"$running\"} 0" >> "$work/newer_check"
+    continue
+  fi
+  echo "trivy_image_newer_check_success{image=\"$running\"} 1" >> "$work/newer_check"
+  latest=$(tail -1 <<<"$tags")
+  maj=$(major_of "$tag")
+  same=$(while read -r t; do [ "$(major_of "$t")" = "$maj" ] && echo "$t"; done <<<"$tags" | tail -1)
+  # next major = the smallest major above the running one; its newest version is the realistic
+  # next step for apps that must not skip majors (Nextcloud: 31 -> 32, not 31 -> 35)
+  nextmaj=$(while read -r t; do m=$(major_of "$t"); [ -n "$m" ] && [ "$m" -gt "$maj" ] 2>/dev/null && echo "$m"; done <<<"$tags" | sort -n | head -1)
+  next=""; [ -z "$nextmaj" ] || next=$(while read -r t; do [ "$(major_of "$t")" = "$nextmaj" ] && echo "$t"; done <<<"$tags" | tail -1)
+  for target in same-major next-major latest; do
+    case "$target" in
+      same-major) cand="$same" ;;
+      next-major) cand="$next" ;;
+      latest)     cand="$latest"   # only when it is neither of the two above
+                  [ "$(major_of "$latest")" != "$maj" ] && [ "$latest" != "$next" ] || continue ;;
+    esac
+    [ -n "$cand" ] && is_newer "$tag" "$cand" || continue
+    echo "trivy_image_newer_version_info{image=\"$running\",target=\"$target\",version=\"$cand\"} 1" >> "$work/newer_info"
+    if scan "$repo:$cand" --image-src remote; then summarize newer "$target" "$cand"
+    else echo "scan of $repo:$cand failed — $(tail -1 "$work/scan.err" 2>/dev/null)" >&2; reg_failed=1; fi
+    cleanup_scan
+  done
+done
+
+# Keep the registry results for the next runs — only when they are complete (a rate-limited
+# or offline run is retried next time instead of being reused for REG_MAX_AGE).
+if [ "$registry" = 1 ] && [ "$reg_failed" = 0 ]; then
+  mkdir -p "$REG_STATE"
+  for f in $REG_FILES; do cp "$work/$f" "$REG_STATE/$f"; done
+  echo "$reg_sig" > "$REG_STATE/sig"; echo "$start" > "$REG_STATE/stamp"
+  echo "$DETAIL_SEVERITIES" > "$REG_STATE/in_newer_sevs"   # which severities in_newer covers
+elif [ "$registry" = 1 ] && [ -f "$REG_STATE/stamp" ]; then
+  # incomplete now, but an older complete result exists: show that one rather than fragments
+  for f in $REG_FILES; do cat "$REG_STATE/$f" > "$work/$f" 2>/dev/null; done
+fi
+reg_stamp=$(cat "$REG_STATE/stamp" 2>/dev/null || echo 0)
+
+# "Which update removes this finding?" — add fix_target / fix_version to every per-CVE series,
+# from the newer versions that were scanned (4.):
+#   same-major  gone in the newest version of the RUNNING major  -> a minor/patch update fixes it
+#   latest      still there, but gone in the newest version overall -> only a major update fixes it
+#   none        present in every newer version that was scanned     -> no update fixes it yet
+#   unknown     no newer version known for the image (no rule / already newest / not scanned)
+# fix_version is the version to update to. This is "fixed BY updating to X" (measured), not
+# "first fixed in X" — the versions in between are not scanned.
+INFO="$work/info" NEWER_INFO="$work/newer_info" NEWER_VULNS="$work/newer_vulns" IN_NEWER="$work/in_newer" \
+COVERED="$(cat "$REG_STATE/in_newer_sevs" 2>/dev/null || echo "$DETAIL_SEVERITIES")" python3 - <<'PY'
+import os, re
+e = os.environ
+LBL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+labels = lambda line: dict(LBL.findall(line))
+read = lambda p: [l.rstrip("\n") for l in open(p)] if os.path.exists(p) else []
+scanned = {(l["image"], l["target"]) for l in map(labels, read(e["NEWER_VULNS"]))}      # candidate scan succeeded
+versions = {(l["image"], l["target"]): l["version"] for l in map(labels, read(e["NEWER_INFO"]))
+            if (l["image"], l["target"]) in scanned}
+still = {(l["image"], l["target"], l["cve"], l["pkg"]) for l in map(labels, read(e["IN_NEWER"]))}
+covered = set(e["COVERED"].split(","))
+out = []
+for line in read(e["INFO"]):
+    l = labels(line)
+    target, version = "unknown", ""
+    if l["severity"] in covered:
+        for t in ("same-major", "next-major", "latest"):
+            if (l["image"], t) in versions:
+                target = "none"
+                if (l["image"], t, l["cve"], l["pkg"]) not in still:
+                    target, version = t, versions[(l["image"], t)]
+                    break
+    head, value = line.rsplit("} ", 1)
+    out.append('%s,fix_target="%s",fix_version="%s"} %s' % (head, target, version.replace("\\", "\\\\").replace('"', '\\"'), value))
+open(e["INFO"], "w").write("".join(o + "\n" for o in out))
+PY
+
+{ printf 'image\tseverity\tcve\tpackage\tinstalled\tfixed\ttitle\n'; sort -t$'\t' -k2,2 -k3,3 -k1,1 "$work/tsv"; } \
+  > "$REPORT_DIR/vulnerabilities.tsv.tmp" && mv "$REPORT_DIR/vulnerabilities.tsv.tmp" "$REPORT_DIR/vulnerabilities.tsv"
+
+family() {   # <metric> <help> <file>
+  echo "# HELP $1 $2"; echo "# TYPE $1 gauge"; cat "$work/$3"
+}
+{
+  family trivy_image_vulnerabilities "CRITICAL/HIGH vulnerabilities in a running image (fixable = a fixed package version exists)" vulns
+  family trivy_vulnerability_info "One series per CRITICAL/HIGH finding (image, CVE, package) — the same CVE counts once per image and package" info
+  echo "# HELP trivy_distinct_cves Number of DIFFERENT CVEs across all running images, per severity"
+  echo "# TYPE trivy_distinct_cves gauge"
+  for sev in ${SEVERITIES//,/ }; do
+    echo "trivy_distinct_cves{severity=\"$sev\"} $(sort -u "$work/cves" | grep -c "^$sev	")"
+  done
+  family trivy_image_update_available "1 if the registry holds a newer build of the image's tag than the one running" upd_avail
+  family trivy_image_update_vulnerabilities "CRITICAL/HIGH vulnerabilities of the registry's newer build of the same tag" upd_vulns
+  family trivy_image_newer_check_success "1 if the registry's version tags could be listed for the image (images with an update rule)" newer_check
+  family trivy_image_newer_version_info "A newer version than the running one exists (target: same-major | latest)" newer_info
+  family trivy_image_newer_vulnerabilities "CRITICAL/HIGH vulnerabilities of that newer version" newer_vulns
+  family trivy_vulnerability_in_newer "CRITICAL finding that is still present in that newer version" in_newer
+  family trivy_image_scan_success "1 if the image was scanned in the last run" status
+  family trivy_image_created_timestamp_seconds "When the running image was built" created
+  echo "# HELP trivy_db_update_success 1 if the vulnerability DB could be refreshed in the last run"
+  echo "# TYPE trivy_db_update_success gauge"
+  echo "trivy_db_update_success $db_ok"
+  echo "# HELP trivy_registry_check_timestamp_seconds When the registry comparison (newer builds/versions) last completed"
+  echo "# TYPE trivy_registry_check_timestamp_seconds gauge"
+  echo "trivy_registry_check_timestamp_seconds $reg_stamp"
+  echo "# HELP trivy_registry_check_failed 1 if this run tried the registry comparison and it was incomplete (unreachable / rate-limited)"
+  echo "# TYPE trivy_registry_check_failed gauge"
+  echo "trivy_registry_check_failed $(( registry == 1 && reg_failed == 1 ? 1 : 0 ))"
+  echo "# HELP trivy_scan_duration_seconds How long the last run took"
+  echo "# TYPE trivy_scan_duration_seconds gauge"
+  echo "trivy_scan_duration_seconds $(( $(date +%s) - start ))"
+  echo "# HELP trivy_scan_timestamp_seconds When the last run finished"
+  echo "# TYPE trivy_scan_timestamp_seconds gauge"
+  echo "trivy_scan_timestamp_seconds $(date +%s)"
+} > "$TMP" && mv "$TMP" "$OUT"

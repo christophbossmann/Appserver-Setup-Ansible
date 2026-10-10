@@ -58,13 +58,44 @@ def handle_client(conn):
 
 
 def run_socket_server():
-    if os.path.exists(SOCKET_PATH):
+    group = grp.getgrnam(SOCKET_GROUP)
+
+    # The socket lives in its OWN directory so the claude-ctl container can
+    # bind-mount the DIRECTORY instead of the socket file. After a reboot
+    # /run is empty (tmpfs); if docker starts the container first, it
+    # auto-creates missing bind-mount paths as directories — mounting the
+    # socket file directly therefore raced the broker into a crash loop
+    # (IsADirectoryError on cleanup). With the directory mount the race is
+    # harmless: whoever creates the dir first wins, the socket appears
+    # inside it later and is visible in the container immediately.
+    socket_dir = os.path.dirname(SOCKET_PATH)
+
+    # HARD guard: we chown/chmod socket_dir below — that must only ever hit
+    # the broker's DEDICATED directory. A mismatched policy/module mix could
+    # otherwise point dirname at a shared path like /run and lock every other
+    # user out of it (this happened once during a deploy race: /run became
+    # 750 root:playgroundctl and broke D-Bus/logind for the whole host).
+    if os.path.basename(socket_dir) != "playground-ctl":
+        raise RuntimeError(
+            "refusing to manage socket dir %r — SOCKET_PATH must live in a "
+            "dedicated 'playground-ctl' directory" % socket_dir
+        )
+
+    os.makedirs(socket_dir, exist_ok=True)
+    os.chown(socket_dir, 0, group.gr_gid)
+    os.chmod(socket_dir, 0o750)
+
+    if os.path.isdir(SOCKET_PATH):
+        # Leftover from the old socket-file mount layout: docker created the
+        # socket PATH as a directory. Empty -> removable; if this fails the
+        # old claude-ctl container still holds the mount — recreate it.
+        os.rmdir(SOCKET_PATH)
+    elif os.path.exists(SOCKET_PATH):
         os.unlink(SOCKET_PATH)
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
 
-    group = grp.getgrnam(SOCKET_GROUP)
     os.chown(SOCKET_PATH, 0, group.gr_gid)
     os.chmod(SOCKET_PATH, 0o660)
 

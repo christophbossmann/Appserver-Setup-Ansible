@@ -1,0 +1,64 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/headplane.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# =============================================================================
+# headplane — web UI for THIS host's Headscale (juanfont/headscale has no
+# official UI). Deployed INTERNAL (tailscale-only) + native Authentik OIDC, so
+# it's reachable only over the VPN AND login is real SSO. Pure visibility +
+# node/key management via the Headscale API — NO docker-socket integration (can't
+# edit headscale config / restart it), kept slim & safe.
+#
+# Enable per host with `caddy_services: { headplane: internal }` + the role line
+# in server-all.yml. Needs headscale_bootstrap to have run first (it provides the
+# API key cached on the controller).
+# =============================================================================
+headplane_image: "ghcr.io/tale/headplane:0.7.1"   # NB: docker tag has NO leading 'v' (git tag is v0.7.1)
+
+# Host loopback port Caddy proxies to (container listens on 3000).
+headplane_port: 8093
+
+# Persistent data on the host (config + headplane state).
+headplane_data_dir: /opt/headplane
+
+# Public URL of the UI (internal host). MUST match the caddy route.
+headplane_base_url: "https://headplane.{{ internal_host }}"
+
+# Session cookie signing secret — headplane requires EXACTLY 32 characters. Put a
+# real 32-char secret in the vault; the placeholder default is exactly 32 chars.
+headplane_cookie_secret: "{{ vault_headplane_cookie_secret | default('headplane_cookie_secret_change32') }}"
+
+# Headscale API endpoint headplane talks to (both join the `backend` docker net;
+# headscale's container listens on :8080). public_url is only for display/links.
+headplane_headscale_url: "http://headscale:8080"
+headplane_headscale_public_url: "{{ headscale_server_url }}"
+
+# --- Native OIDC against Authentik (replaces the old forward-auth/proxy_auth) ---
+# headplane 0.7.1 speaks OIDC directly: it redirects unauthenticated users to
+# Authentik and logs them in (no Caddy forward-auth, no manual API key). The
+# provider/app is created by the oauth-apps blueprint (authentik_oauth_apps:
+# headplane); issuer = the app's discovery URL (slug=headplane). client_secret is
+# shared with Authentik via the same vault value. Callback route = /oidc/callback.
+headplane_oidc_issuer: "https://{{ svc_edge_host['authentik'] }}/application/o/headplane/"
+headplane_oidc_client_id: "headplane"
+headplane_oidc_client_secret: "{{ vault_authentik_oauth_headplane_secret }}"
+# Role for NEW OIDC users (the first-ever user becomes owner automatically = Alice).
+# viewer = read-only + may generate ONLY their own pre-auth keys; cannot manage users,
+# other machines, ACLs/DNS or the network. Safe for family (bob/carol).
+headplane_oidc_default_role: viewer
+# OIDC claim that maps to a Headplane role, synced on EVERY login (takes precedence
+# over default_role when valid). Authentik emits it from group membership (headplane
+# oauth app role_claim): headplane-admins -> "admin", everyone else -> "viewer".
+# So upgrading/downgrading a person = just change their Authentik group. "" = off.
+headplane_oidc_role_claim: "headplane_role"
+# RP-initiated logout: without this, "logout" only ends Headplane's session but the
+# Authentik session stays active, so a page reload silently re-authenticates (SSO) =
+# you look logged in again. true -> /logout also hits Authentik's end_session_endpoint
+# so the upstream session ends too. The post-logout URL MUST be registered as a
+# redirect_uri on the Authentik provider (added to the headplane oauth app).
+headplane_oidc_use_end_session: true
+headplane_oidc_post_logout_redirect: "{{ headplane_base_url }}/admin/login"
+# Force OIDC-only: with the API-key login enabled, ANYONE holding a Headscale API
+# key could sign into Headplane and bypass Authentik entirely (the tailnet-mgmt
+# backdoor). OIDC is verified working, so disable it -> Authentik SSO is the ONLY
+# way in. (Recoverable: flip back to false + redeploy if SSO ever breaks.)
+headplane_oidc_disable_api_key_login: true

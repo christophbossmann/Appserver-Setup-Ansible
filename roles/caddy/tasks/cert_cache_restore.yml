@@ -1,0 +1,129 @@
+---
+# Restore Caddy's certificate store from the controller-side cache — BEFORE Caddy starts.
+# Purpose: a wiped/rebuilt host reuses its already-issued (still trusted) certs instead of
+# re-issuing, which avoids the CA rate limit and keeps a browser-trusted cert across rebuilds.
+#
+# Safety: the cache is only restored when it exists AND EVERY cert in it is still valid
+# (unexpired). Anything expired/missing -> skip entirely and let Caddy issue fresh, so we
+# never install a broken store. Gated by restore_cached_ssl_certificates (default false).
+#
+# The tarball is produced by cert_cache_backup.yml: `tar -C <store> certificates`.
+
+- name: Locate cached certificate tarball on the controller
+  ansible.builtin.stat:
+    path: "{{ _caddy_cert_cache_tarball }}"
+  delegate_to: localhost
+  become: false
+  register: _caddy_cert_cache_stat
+  vars:
+    _caddy_cert_cache_tarball: "{{ (caddy_cert_cache_dir ~ '/' ~ inventory_hostname ~ '/certs.tgz') | expanduser }}"
+
+- name: Restore cached certificates (only if all are still valid)
+  # Not in --check: tempfile/unarchive yield no paths there, and a dry run must not
+  # touch Caddy's store anyway.
+  when: _caddy_cert_cache_stat.stat.exists and not ansible_check_mode
+  block:
+    - name: Create temp dir for cache validation
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: caddy-certcache
+      register: _caddy_cert_tmp
+
+    - name: Copy cached tarball to the host
+      ansible.builtin.copy:
+        src: "{{ (caddy_cert_cache_dir ~ '/' ~ inventory_hostname ~ '/certs.tgz') | expanduser }}"
+        dest: "{{ _caddy_cert_tmp.path }}/certs.tgz"
+        mode: "0600"
+
+    - name: Extract cached certificates into the temp dir
+      ansible.builtin.unarchive:
+        src: "{{ _caddy_cert_tmp.path }}/certs.tgz"
+        dest: "{{ _caddy_cert_tmp.path }}"
+        remote_src: true
+
+    # A cert counts only if it is present AND not expired NOW (-checkend 0). If even one
+    # leaf cert in the cache is expired, we discard the WHOLE cache and let Caddy re-issue
+    # — a half-valid store would leave Caddy serving an expired cert for some hostnames.
+    - name: Validate every cached certificate is unexpired
+      ansible.builtin.shell: |
+        set -o pipefail
+        crts=$(find "{{ _caddy_cert_tmp.path }}/certificates" -type f -name '*.crt' 2>/dev/null)
+        [ -z "$crts" ] && { echo "NO_CERTS"; exit 1; }
+        rc=0
+        for c in $crts; do
+          if ! openssl x509 -checkend 0 -noout -in "$c" >/dev/null 2>&1; then
+            echo "EXPIRED: $c"; rc=1
+          fi
+        done
+        exit $rc
+      args:
+        executable: /bin/bash
+      register: _caddy_cert_cache_valid
+      changed_when: false
+      failed_when: false
+
+    - name: Report cache discarded (expired/empty certs)
+      ansible.builtin.debug:
+        msg: >-
+          [WARNING] Cached cert store for {{ inventory_hostname }} discarded — not restoring.
+          {{ _caddy_cert_cache_valid.stdout | default('') | trim }}
+          Caddy will issue fresh certificates.
+      when: _caddy_cert_cache_valid.rc != 0
+
+    - name: Install cached certificates into Caddy's store
+      when: _caddy_cert_cache_valid.rc == 0
+      block:
+        - name: Ensure Caddy store directory exists
+          ansible.builtin.file:
+            path: "{{ caddy_acme_cert_store }}"
+            state: directory
+            owner: "{{ caddy_user }}"
+            group: "{{ caddy_user }}"
+            mode: "0700"
+
+        - name: Detect which cached subtrees are present (certificates, acme account)
+          ansible.builtin.stat:
+            path: "{{ _caddy_cert_tmp.path }}/{{ item }}"
+          register: _caddy_cache_subtrees
+          loop:
+            - certificates
+            - acme
+
+        - name: Copy cached subtrees into the store
+          ansible.builtin.copy:
+            src: "{{ _caddy_cert_tmp.path }}/{{ item.item }}/"
+            dest: "{{ caddy_acme_cert_store }}/{{ item.item }}/"
+            remote_src: true
+            owner: "{{ caddy_user }}"
+            group: "{{ caddy_user }}"
+            mode: preserve
+          loop: "{{ _caddy_cache_subtrees.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          when: item.stat.exists
+          notify: Restart caddy
+
+        - name: Ensure restored subtrees are owned by the Caddy user
+          ansible.builtin.file:
+            path: "{{ caddy_acme_cert_store }}/{{ item.item }}"
+            state: directory
+            owner: "{{ caddy_user }}"
+            group: "{{ caddy_user }}"
+            recurse: true
+          loop: "{{ _caddy_cache_subtrees.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          when: item.stat.exists
+
+        - name: Report restored certificates
+          ansible.builtin.debug:
+            msg: >-
+              Restored cached (valid) certificates{{ ' + ACME account' if (_caddy_cache_subtrees.results | selectattr('item', 'equalto', 'acme') | selectattr('stat.exists') | list | length > 0) else '' }}
+              for {{ inventory_hostname }} into {{ caddy_acme_cert_store }} — Caddy reuses them instead of re-issuing.
+
+  always:
+    - name: Remove cert-cache temp dir
+      ansible.builtin.file:
+        path: "{{ _caddy_cert_tmp.path }}"
+        state: absent
+      when: _caddy_cert_tmp.path is defined

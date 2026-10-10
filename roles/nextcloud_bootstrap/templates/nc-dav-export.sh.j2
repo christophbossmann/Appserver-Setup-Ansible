@@ -1,0 +1,41 @@
+#!/bin/sh
+# nc-dav-export — export every Nextcloud user's calendars (.ics) and address
+# books (.vcf) as standalone, directly re-importable files. Managed by Ansible
+# (roles/nextcloud_bootstrap). Used as a backup pre-step so a total-loss restore
+# can simply re-import these instead of digging through the DB dump.
+#
+# Usage:  nc-dav-export [OUTPUT_DIR]   (default: /opt/backups/nextcloud/dav-export)
+# Layout: <OUT>/<user>/calendars/<slug>.ics , <OUT>/<user>/addressbooks/<slug>.vcf
+# Skips generated/system collections (z-*, contact_birthdays) and shared copies
+# (<name>_shared_by_<owner>) — the latter are exported once under their owner.
+set -e
+OUT="${1:-/opt/backups/nextcloud/dav-export}"
+
+docker exec -i -u www-data nextcloud sh -s <<'INNER'
+NCHOST='{{ nextcloud_hostname }}'
+rm -rf /tmp/dav-export; mkdir -p /tmp/dav-export
+USERS=$(php occ user:list --output=json | php -r 'foreach(array_keys(json_decode(file_get_contents("php://stdin"),true)) as $k) echo $k,"\n";')
+for U in $USERS; do
+  RAW=$(php occ user:add-app-password "$U" -n 2>&1)
+  T=$(printf '%s\n' "$RAW" | grep -oE '[A-Za-z0-9]{40,}' | tail -1)
+  [ -z "$T" ] && continue
+  TID=$(php occ user:auth-tokens:list "$U" 2>/dev/null | awk -F'|' '$2 ~ /[0-9]/ {gsub(/ /,"",$2); id=$2} END{print id}')
+  mkdir -p "/tmp/dav-export/$U/calendars" "/tmp/dav-export/$U/addressbooks"
+  for C in $(php occ dav:list-calendars "$U" 2>/dev/null | awk -F'|' 'NR>3{v=$2;gsub(/^ +| +$/,"",v); if(v!="" && v!~/ / && v!~/^z-/ && v!="contact_birthdays" && v!~/_shared_by_/)print v}'); do
+    curl -s -u "$U:$T" -H "Host: $NCHOST" "http://localhost/remote.php/dav/calendars/$U/$C/?export" > "/tmp/dav-export/$U/calendars/$C.ics"
+  done
+  for B in $(php occ dav:list-addressbooks "$U" 2>/dev/null | awk -F'|' 'NR>3{v=$2;gsub(/^ +| +$/,"",v); if(v!="" && v!~/ / && v!~/^z-/ && v!~/_shared_by_/)print v}'); do
+    curl -s -u "$U:$T" -H "Host: $NCHOST" "http://localhost/remote.php/dav/addressbooks/users/$U/$B/?export" > "/tmp/dav-export/$U/addressbooks/$B.vcf"
+  done
+  [ -n "$TID" ] && php occ user:auth-tokens:delete "$U" "$TID" >/dev/null 2>&1
+  # drop empty exports so the tree only holds real data
+  find "/tmp/dav-export/$U" -type f -size 0 -delete 2>/dev/null || true
+done
+find /tmp/dav-export -type d -empty -delete 2>/dev/null || true
+INNER
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+docker cp nextcloud:/tmp/dav-export/. "$OUT/" 2>/dev/null || true
+docker exec nextcloud rm -rf /tmp/dav-export
+echo "nc-dav-export: wrote DAV exports to $OUT"

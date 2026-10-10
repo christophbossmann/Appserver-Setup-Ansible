@@ -1,0 +1,216 @@
+---
+# Nextcloud upgrade with automatic PITR rollback on failure.
+#
+#   ansible-playbook playbooks/nextcloud-upgrade.yml --limit <host> \
+#     -e nextcloud_upgrade_version=32-apache \
+#     -e upgrade_confirm=YES \
+#     [-e upgrade_keep_old=false]   # drop the pre-rollback data dir if a rollback happens
+#
+# WHY both apps are quiesced: nextcloud + immich share the `postgres-business` instance.
+# A PITR rollback restores the WHOLE instance (both DBs) to the pre-upgrade moment, so
+# immich MUST be write-frozen for the entire window — otherwise its writes during the
+# nextcloud upgrade would be lost on rollback. We stop immich (server+ML) and put
+# nextcloud in maintenance to capture a clean PITR anchor, then let the new nextcloud
+# image run its own DB upgrade. On ANY failure in the block, we PITR the business
+# instance back to the anchor, restore the pre-upgrade config + old image, and fail.
+# immich is always restarted at the end (always:), whatever happened.
+#
+# Nextcloud only supports ONE major hop per upgrade (e.g. 31 -> 32). Don't skip majors.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+  when: not (upgrade_local_run | default(false) | bool)
+
+- name: Nextcloud upgrade (PITR auto-rollback)
+  hosts: all
+  become: true
+  vars:
+    upgrade_confirm: ""
+    nextcloud_upgrade_version: ""
+    upgrade_keep_old: true          # keep pre-rollback data dir by default (safety)
+    force_rollback: false           # DRILL: roll back at the end even on success
+    upgrade_health_retries: 60      # health/status poll attempts (x5s); lower for drills
+    _biz: postgres-business
+    _occ: ["docker", "exec", "-u", "www-data", "nextcloud", "php", "occ"]
+    _immadm: ["docker", "exec", "immich-server", "immich-admin"]
+    _snap_dir: "{{ backup_dump_dir }}/upgrade"
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that:
+          - upgrade_confirm | default('') == 'YES'
+          - (nextcloud_upgrade_version | default('')) | length > 0
+          - nextcloud_upgrade_version != nextcloud_version
+        fail_msg: >-
+          Need -e nextcloud_upgrade_version=<tag> (current is {{ nextcloud_version }})
+          and -e upgrade_confirm=YES
+
+    - name: Reconcile versions with the host
+      ansible.builtin.include_tasks: tasks/adopt_host_versions.yml
+
+    - name: Record the current version for rollback
+      ansible.builtin.set_fact:
+        _rollback_version: "{{ nextcloud_version }}"
+        _target_major: "{{ nextcloud_upgrade_version | regex_replace('[-.].*$', '') }}"
+
+    # ---- QUIESCE BOTH APPS (immich write-freeze + nextcloud maintenance) --------------
+    - name: Quiesce immich via its native maintenance mode (stays up, rejects writes)
+      ansible.builtin.command:
+        argv: "{{ _immadm + ['enable-maintenance-mode'] }}"
+      changed_when: true
+
+    - name: Nextcloud into maintenance mode (freeze for a clean PITR anchor)
+      ansible.builtin.command:
+        argv: "{{ _occ + ['maintenance:mode', '--on'] }}"
+      changed_when: true
+
+    # ---- PITR ANCHOR ------------------------------------------------------------------
+    - name: Capture the PITR anchor time (UTC, from the business instance itself)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ _biz }}", psql, -U, "{{ postgres_business_user }}", -tAc,
+               "select to_char(now() at time zone 'utc','YYYY-MM-DD HH24:MI:SS')"]
+      register: _anchor
+      changed_when: false
+
+    - name: Set the anchor fact (+00) and force a WAL switch so it is archived
+      ansible.builtin.set_fact:
+        _pitr_target: "{{ _anchor.stdout | trim }}+00"
+
+    - name: Force a WAL switch (guarantee the anchor segment reaches the archive)
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ _biz }}", psql, -U, "{{ postgres_business_user }}", -c, "select pg_switch_wal()"]
+      changed_when: false
+
+    # ---- PRE-UPGRADE CONFIG SNAPSHOT (tiny; restored on rollback) ----------------------
+    - name: Ensure snapshot dir
+      ansible.builtin.file:
+        path: "{{ _snap_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Snapshot the nextcloud config dir (pre-upgrade)
+      ansible.builtin.command:
+        argv: [tar, -czf, "{{ _snap_dir }}/nextcloud-config-pre-{{ _rollback_version }}.tgz",
+               -C, "{{ nextcloud_html_dir }}", config]
+      changed_when: true
+
+    # ---- UPGRADE (block) with automatic PITR ROLLBACK (rescue) -------------------------
+    - name: Upgrade
+      block:
+        - name: Let the new image manage its own upgrade — maintenance back off
+          ansible.builtin.command:
+            argv: "{{ _occ + ['maintenance:mode', '--off'] }}"
+          changed_when: true
+
+        # NOTE: group_vars is NOT bumped here. The redeploy uses the -e value via the
+        # var override below, so the file need not change for the run. We persist the
+        # new version to group_vars only AFTER every verify passes (and only when we
+        # keep it, i.e. not a force_rollback drill) — see "Persist ..." further down.
+        # That way a failed/rolled-back upgrade never leaves a stale version in the file,
+        # and the rescue path needs no revert.
+        - name: Redeploy nextcloud with the new image (entrypoint runs the DB upgrade)
+          ansible.builtin.include_role:
+            name: compose_stack
+          vars:
+            stack: nextcloud
+            nextcloud_version: "{{ nextcloud_upgrade_version }}"
+
+        - name: Wait until nextcloud is installed and OUT of maintenance (upgrade finished)
+          ansible.builtin.command:
+            argv: "{{ _occ + ['status', '--output=json'] }}"
+          register: _st
+          until: >-
+            _st.rc == 0
+            and (_st.stdout | from_json).installed | default(false)
+            and not ((_st.stdout | from_json).maintenance | default(true))
+          retries: "{{ upgrade_health_retries | default(60) }}"
+          delay: 5
+          changed_when: false
+
+        - name: Verify the reported version is the new major
+          ansible.builtin.assert:
+            that:
+              - (_st.stdout | from_json).versionstring is match('^' ~ _target_major ~ '\\.')
+            fail_msg: "occ reports {{ (_st.stdout | from_json).versionstring }}, expected {{ _target_major }}.x"
+
+        - name: Verify apps load (occ works post-upgrade)
+          ansible.builtin.command:
+            argv: "{{ _occ + ['app:list'] }}"
+          register: _apps
+          changed_when: false
+          failed_when: _apps.rc != 0
+
+        - name: Verify the DB is readable (users present)
+          ansible.builtin.command:
+            argv: "{{ _occ + ['user:list'] }}"
+          register: _users
+          changed_when: false
+          failed_when: (_users.stdout_lines | length) == 0
+
+        - name: Verify HTTP serves (status.php via the local upstream)
+          ansible.builtin.command:
+            argv: [curl, -sf, -H, "Host: {{ nextcloud_hostname }}",
+                   "http://127.0.0.1:{{ nextcloud_port }}/status.php"]
+          register: _http
+          changed_when: false
+          failed_when: >-
+            _http.rc != 0 or ('"installed":true' not in (_http.stdout | regex_replace('\\s', '')))
+
+        - name: Upgrade verified
+          ansible.builtin.debug:
+            msg: "Nextcloud upgraded {{ _rollback_version }} -> {{ nextcloud_upgrade_version }} ({{ (_st.stdout | from_json).versionstring }}). Verified."
+
+        # Persist the new version ONLY now — after every check passed and only if we
+        # are keeping it (a force_rollback drill undoes the upgrade, so it must not).
+        # Nothing to revert on failure/drill: the file was never touched before here.
+        - name: Persist nextcloud_version to group_vars (verified upgrade, kept)
+          ansible.builtin.lineinfile:
+            path: "{{ inventory_dir }}/group_vars/all/nextcloud.yml"   # next to the inventory (private config repo)
+            regexp: '^nextcloud_version:'
+            line: 'nextcloud_version: "{{ nextcloud_upgrade_version }}"'
+          delegate_to: localhost
+          become: false
+          when: not (force_rollback | default(false) | bool)
+
+        - name: Record the deployed version on the host
+          ansible.builtin.include_tasks: tasks/record_version.yml
+          vars:
+            rec_service: nextcloud
+            rec_var: nextcloud_version
+            rec_file: nextcloud.yml
+            rec_value: "{{ nextcloud_upgrade_version }}"
+            rec_previous: "{{ _rollback_version }}"
+          when: not (force_rollback | default(false) | bool)
+
+        # ---- force_rollback DRILL: undo the (successful) upgrade on purpose -----------
+        - name: force_rollback — roll the just-upgraded environment back (drill)
+          ansible.builtin.include_tasks: tasks/nextcloud_rollback.yml
+          when: force_rollback | default(false) | bool
+
+        - name: Drill complete
+          ansible.builtin.debug:
+            msg: "force_rollback drill complete — nextcloud rolled back to {{ _rollback_version }} (business restored to {{ _pitr_target }})."
+          when: force_rollback | default(false) | bool
+
+      rescue:
+        - name: Upgrade FAILED — starting PITR rollback
+          ansible.builtin.debug:
+            msg: >-
+              Nextcloud upgrade failed. Rolling the business instance back to {{ _pitr_target }},
+              restoring the pre-upgrade config + {{ _rollback_version }} image.
+
+        - name: Roll back (shared steps — same as the force_rollback drill)
+          ansible.builtin.include_tasks: tasks/nextcloud_rollback.yml
+
+        - name: Roll-back complete — fail the play so the outcome is unmistakable
+          ansible.builtin.fail:
+            msg: >-
+              Nextcloud upgrade to {{ nextcloud_upgrade_version }} FAILED and was rolled back
+              to {{ _rollback_version }} (business instance restored to {{ _pitr_target }}).
+              Investigate before retrying.
+
+      always:
+        - name: Resume immich (leave its maintenance mode) — runs whatever happened above
+          ansible.builtin.command:
+            argv: "{{ _immadm + ['disable-maintenance-mode'] }}"
+          changed_when: true
+          failed_when: false

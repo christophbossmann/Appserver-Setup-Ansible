@@ -1,0 +1,23 @@
+# Caddy route for Nextcloud — PUBLIC (external). Deliberately NO forward-auth:
+# desktop/mobile sync + CalDAV/CardDAV clients authenticate against Nextcloud
+# itself (app passwords) and would break behind an SSO redirect. Browser SSO
+# happens inside Nextcloud via the user_oidc app (Authentik).
+caddy_route_nextcloud:
+  name: nextcloud
+  hostname_label: nextcloud
+  caddy_upstream: "127.0.0.1:{{ nextcloud_port }}"
+  caddy_extra: |
+    # HSTS — Nextcloud admin overview wants Strict-Transport-Security >= 15552000s.
+    header Strict-Transport-Security "max-age=15552000; includeSubDomains"
+    # DAV client bootstrapping (Nextcloud admin-check complains otherwise).
+    redir /.well-known/carddav /remote.php/dav/ 301
+    redir /.well-known/caldav /remote.php/dav/ 301
+
+# Read-only raw WebDAV over the data dir — INTERNAL only (mark webdav_nextcloud:
+# internal in caddy_services). This is the RAW volume for inspection; normal WebDAV
+# is Nextcloud's own /remote.php/dav on the public route above.
+caddy_route_webdav_nextcloud:
+  name: webdav-nextcloud
+  depends_service: nextcloud   # webdav sidecar of the nextcloud stack (intent-aware post-check)
+  hostname_label: webdav-nextcloud
+  caddy_upstream: "127.0.0.1:{{ nextcloud_webdav_port }}"

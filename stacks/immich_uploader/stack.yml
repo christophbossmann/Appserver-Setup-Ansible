@@ -1,0 +1,18 @@
+# Per-stack settings for compose_stack (see roles/compose_stack/defaults/main.yml).
+compose_mode: "0600"   # compose file contains the JWT secret
+networks:
+  - backend            # to reach immich-server internally
+
+# The server clones the private repo itself and builds from it — the
+# application code never enters this ansible repo. Repo location comes from
+# group_vars/all/immich_uploader.yml; token: read-only fine-grained PAT from
+# the vault. src/ is 0750: the token ends up in src/.git/config.
+git_repo: "https://x-access-token:{{ vault_github_token_immich_uploader }}@{{ immich_uploader_git_repo }}"
+git_version: "{{ immich_uploader_git_version }}"
+build: true
+pull: false            # build-only services; base images are pulled by the build
+dirs:
+  - { path: src, mode: "0750" }
+
+health_url: "http://127.0.0.1:{{ immich_uploader_port }}/"
+status_msg: "Uploader UI: https://{{ svc_edge_host['immich_uploader'] }} (backend talks to immich-server internally)"

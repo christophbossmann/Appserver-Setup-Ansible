@@ -1,0 +1,22 @@
+services:
+  headplane:
+    container_name: headplane
+    image: {{ headplane_image }}
+    restart: unless-stopped
+    environment:
+      HEADPLANE_CONFIG_PATH: /etc/headplane/config.yaml
+    volumes:
+      - {{ headplane_data_dir }}/config:/etc/headplane
+      - {{ headplane_data_dir }}/data:/var/lib/headplane
+      # Read headscale's live config (settings view) — READ-ONLY.
+      - {{ headscale_data_dir }}/config/config.yaml:/etc/headscale/config.yaml:ro
+    ports:
+      # Loopback only; HOST Caddy fronts it at headplane.{{ internal_host }}
+      # (tailscale-bound + Authentik forward-auth).
+      - "127.0.0.1:{{ headplane_port }}:3000"
+    networks:
+      - backend        # reach headscale by container name (http://headscale:8080)
+
+networks:
+  backend:
+    external: true

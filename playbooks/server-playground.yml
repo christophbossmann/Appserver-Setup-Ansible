@@ -11,12 +11,15 @@
 #   - host_vars/<host>.yml              (global_host, internal_host, acme_dns config)
 #
 # Usage:
-#   ansible-playbook -i inventory.ini playbooks/server-playground.yml --limit myserver
+#   ansible-playbook playbooks/server-playground.yml --limit myserver
 #
 # Idempotent, safe to re-run. The caddy role re-renders the FULL Caddyfile from
 # whatever proxy_routes_* are loaded this run, so run it with the vars of every
 # service that should stay routed on this host (here: base + playground).
 # =============================================================================
+
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
 
 - name: Claude Playground
   hosts: all
@@ -36,3 +39,9 @@
     - { role: cloudflared, tags: [caddy, cloudflared] }          # tunnel ingress (when cloudflared_manage_public_hostnames=true)
     - { role: cloudflare_dns, tags: [caddy, cloudflare_dns] }    # CNAME -> <tunnel-id>.cfargotunnel.com (when cloudflare_manage_dns_records=true)
     - { role: caddy_post_check, tags: [caddy, caddy_post_check] }
+  post_tasks:
+    # hardening stops apt-daily(-upgrade) for the play — bring automatic updates back.
+    - name: Re-start apt background timers
+      # import (static), not include: only then do the inner tasks inherit 'always'
+      ansible.builtin.import_tasks: tasks/apt_timers_restore.yml
+      tags: [always]

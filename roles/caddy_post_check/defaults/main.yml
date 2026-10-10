@@ -5,8 +5,26 @@ caddy_post_check_enabled: true
 caddy_post_check_retries: 20
 caddy_post_check_delay: 3
 caddy_post_check_timeout: 10
-caddy_post_check_validate_certs: true
+# Default true. Only skip validation when the ACME CA is LE STAGING (untrusted test root
+# on purpose) — Buypass/ZeroSSL and LE prod are browser-trusted, so validate those.
+caddy_post_check_validate_certs: "{{ 'staging' not in (caddy_acme_ca | default('')) }}"
 caddy_post_check_follow_redirects: safe
+
+# Intent-aware gating: only check a route whose backing service was actually deployed in
+# THIS run. Each service role registers itself in `deployed_services` (see compose_stack and
+# the dedicated roles); a route names its service via `depends_service` (default: route name).
+# This makes partial/tagged deploys clean — a service you didn't deploy is skipped — WITHOUT
+# hiding a real failure: a service that ran but whose backend is down still registered, so its
+# route IS checked and fails. Set false to check every enabled route regardless (old behavior).
+caddy_post_check_require_deployed: true
+
+# Internal (.int) DNS integrity check. The HTTP checks run FROM THIS HOST and can FALSE-GREEN
+# on internal names: if headscale's .int extra_records are missing, the name resolves to
+# 127.0.0.1 and the host's OWN Caddy answers 200 on loopback — while real clients get
+# connection-refused. When true, additionally assert each internal name resolves to THIS
+# host's tailscale IP (via MagicDNS), not loopback/public — the only signal that catches
+# missing extra_records. Set false on hosts whose .int names are served differently.
+caddy_post_check_internal_dns: true
 caddy_post_check_status_codes:
   - 200
   - 301

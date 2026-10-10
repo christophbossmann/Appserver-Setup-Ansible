@@ -1,0 +1,63 @@
+---
+# Post-stack bootstrap for the (dev/playground) Supabase: instance-level SQL that
+# the compose stack's first-boot init doesn't cover on ALREADY-initialized hosts.
+# Everything here must be idempotent — it runs on every deploy.
+#
+# pg_cron: the supabase/postgres image ships it preloaded (shared_preload_libraries
+# + cron.database_name=postgres are upstream defaults), but the EXTENSION is not
+# created. Creating it here means scheduled jobs (cron.schedule) work out of the
+# box for the playground agent (via SUPABASE_DB_URL as postgres) — on live hosts
+# AND on a fresh rebuild.
+
+- name: Check whether pg_cron is installed
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - supabase-db
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -tAc
+      - "select 1 from pg_extension where extname = 'pg_cron'"
+  register: _supa_pgcron
+  changed_when: false
+  # Tolerate the DB still starting right after the stack task (first boot runs
+  # migrations for minutes); retry instead of failing the play.
+  until: _supa_pgcron.rc == 0
+  retries: 12
+  delay: 10
+
+- name: Enable the pg_cron extension (idempotent)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - supabase-db
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -tAc
+      - "create extension if not exists pg_cron"
+  when: (_supa_pgcron.stdout | trim) != '1'
+  register: _supa_pgcron_create
+  changed_when: true
+
+- name: Verify cron.schedule is callable
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - supabase-db
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -tAc
+      - "select count(*) >= 0 from cron.job"
+  changed_when: false

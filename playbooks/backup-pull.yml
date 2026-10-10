@@ -1,0 +1,48 @@
+---
+# On-demand LOCAL backup pull: run each selected job's pre-dump on the server, then
+# rsync its paths down to the controller (this machine). Uses the SAME job set as the
+# cloud backup (group_vars/all/backup.yml: backup_jobs), so local + cloud cover the
+# same apps and stay in sync.
+#
+#   # everything (all enabled jobs):
+#   ansible-playbook playbooks/backup-pull.yml --limit <host>
+#   # a subset — pick apps:
+#   ansible-playbook playbooks/backup-pull.yml --limit <host> -e backup_only=immich
+#   ansible-playbook playbooks/backup-pull.yml --limit <host> -e backup_only=nextcloud,authentik
+#
+#   # WITHOUT the big media originals (DB dumps + local app data only; skips the Storage
+#   # Box originals behind the immich library/upload symlinks):
+#   ansible-playbook playbooks/backup-pull.yml --limit <host> -e backup_pull_originals=false
+#   # A full pull (default) FOLLOWS those symlinks and DOES include the box originals.
+#
+# Files land in ./backups/<host>/<app>/ next to the repo (gitignored). rsync pull =
+# incremental, restartable, fit for many GB (never use fetch for this).
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+
+- name: Pull selected app backups to the controller
+  hosts: servers
+  become: true
+  vars:
+    # Base dir for local backups. Override with backup_pull_dir (group_vars/host_vars/-e)
+    # to land them off the WSL ext4 (which grows on C:) — e.g. /mnt/d/backup for D:\backup.
+    backup_pull_dest: "{{ backup_pull_dir | default(playbook_dir ~ '/../backups') }}/{{ inventory_hostname }}"
+    # -e backup_only=immich (comma-sep) | full | all. Default = every enabled job.
+    backup_only: "full"
+    _want: "{{ (backup_only | string | lower | replace(' ', '')).split(',') }}"
+  tasks:
+    - name: Pull each selected job (pre-dump -> rsync paths -> post)
+      ansible.builtin.include_tasks: pull_backup_job.yml
+      loop: "{{ backup_jobs }}"
+      loop_control:
+        loop_var: job
+        label: "{{ job.name }}"
+      when:
+        - (job.enabled | default(true)) | bool
+        - ('full' in _want) or ('all' in _want) or (job.name in _want)
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Local backup at {{ backup_pull_dest }}/ (apps: {{ backup_only }}).
+          Each app in its own subdir (db.dump + data).

@@ -1,0 +1,70 @@
+---
+# Make {{ _dom.path }} a btrfs subvolume @{{ _dom.name }} with a flat
+# @{{ _dom.name }}_snapshots (mounted at <path>/.snapshots) + a snapper config
+# (daily timeline, kept {{ data_snapshot_timeline_daily }} days) + nodatacow on the
+# DB subdirs. One idempotent shell block — safe to re-run (each step is guarded).
+- name: "storage[{{ _dom.name }}]: subvolume + snapper + nodatacow (idempotent)"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    NAME='{{ _dom.name }}'
+    MP='{{ _dom.path }}'
+    DAILY='{{ data_snapshot_timeline_daily }}'
+    SUBDIRS='{{ _dom.subdirs | default([]) | join(" ") }}'
+    NODATACOW='{{ _dom.nodatacow | default([]) | join(" ") }}'
+    SNAP='{{ (_dom.snapshot | default(true) | bool) | ternary("yes", "no") }}'   # no = subvolume only
+    DEV="$(findmnt -no SOURCE / | sed 's/\[.*//')"
+    RUUID="$(findmnt -no UUID /)"
+    changed=0
+
+    # 1) subvolume @NAME, mounted at MP (via fstab)
+    if ! mountpoint -q "$MP"; then
+      TLM="$(mktemp -d)"
+      mount -o subvolid=5 "$DEV" "$TLM"
+      [ -d "$TLM/@$NAME" ]            || { btrfs subvolume create "$TLM/@$NAME" >/dev/null; changed=1; }
+      if [ "$SNAP" = yes ]; then
+        [ -d "$TLM/@${NAME}_snapshots" ] || { btrfs subvolume create "$TLM/@${NAME}_snapshots" >/dev/null; changed=1; }
+      fi
+      umount "$TLM"; rmdir "$TLM"
+      grep -qE "[[:space:]]${MP}[[:space:]]" /etc/fstab \
+        || { echo "UUID=$RUUID $MP btrfs defaults,subvol=@$NAME 0 0" >> /etc/fstab; changed=1; }
+      mkdir -p "$MP"
+      mountpoint -q "$MP" || { mount "$MP"; changed=1; }
+    fi
+
+    # 2) snapper config NAME with a FLAT .snapshots (@NAME_snapshots), daily/DAILY-day timeline
+    #    (skipped for snapshot: false domains, e.g. the self-pruning PITR archive)
+    if [ "$SNAP" = yes ] && ! snapper list-configs 2>/dev/null | awk 'NR>2{print $1}' | grep -qx "$NAME"; then
+      umount "$MP/.snapshots" 2>/dev/null || true
+      [ -e "$MP/.snapshots" ] && { btrfs subvolume delete "$MP/.snapshots" >/dev/null 2>&1 || rmdir "$MP/.snapshots" 2>/dev/null || true; }
+      snapper -c "$NAME" create-config "$MP"
+      snapper -c "$NAME" set-config \
+        TIMELINE_CREATE=yes TIMELINE_LIMIT_HOURLY=0 TIMELINE_LIMIT_DAILY="$DAILY" \
+        TIMELINE_LIMIT_WEEKLY=0 TIMELINE_LIMIT_MONTHLY=0 TIMELINE_LIMIT_YEARLY=0
+      # flatten: drop the nested .snapshots create-config made, mount the separate one
+      btrfs subvolume delete "$MP/.snapshots" >/dev/null 2>&1 || true
+      grep -qE "[[:space:]]${MP}/.snapshots[[:space:]]" /etc/fstab \
+        || echo "UUID=$RUUID $MP/.snapshots btrfs defaults,subvol=@${NAME}_snapshots 0 0" >> /etc/fstab
+      mkdir -p "$MP/.snapshots"
+      mountpoint -q "$MP/.snapshots" || mount "$MP/.snapshots"
+      chmod 750 "$MP/.snapshots"
+      changed=1
+    fi
+
+    # 3) create the declared subdirs (bind-mount sources must exist beforehand)
+    for sd in $SUBDIRS; do mkdir -p "$MP/$sd"; done
+
+    # 4) nodatacow on the DB subdirs — chattr +C on the EMPTY dir before the DB writes
+    for sd in $NODATACOW; do
+      mkdir -p "$MP/$sd"
+      if ! lsattr -d "$MP/$sd" 2>/dev/null | cut -d' ' -f1 | grep -q C; then
+        chattr +C "$MP/$sd" 2>/dev/null || true
+        changed=1
+      fi
+    done
+
+    [ "$changed" = 1 ] && echo CHANGED || echo OK
+  args:
+    executable: /bin/bash
+  register: _stor_dom
+  changed_when: "'CHANGED' in (_stor_dom.stdout | default(''))"
+  check_mode: false

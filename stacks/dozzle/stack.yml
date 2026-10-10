@@ -1,0 +1,13 @@
+---
+# compose_stack settings for Dozzle. See roles/compose_stack/defaults/main.yml.
+
+dir: /opt/dozzle
+
+health_cmd: "docker exec dozzle /dozzle healthcheck"
+health_retries: 10
+health_delay: 3
+
+status_msg: >-
+  Dozzle up at https://dozzle.{{ internal_host }} (Authentik SSO, admins).
+  Live container status, logs and restart buttons; historical metrics live in
+  Grafana ("Docker" dashboard, cAdvisor-fed).

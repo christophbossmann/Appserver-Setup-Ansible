@@ -1,0 +1,74 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/acme_dns.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# =============================================================================
+# Self-hosted acme-dns — DNS-01 challenge relay, replaces the public (demo)
+# auth.acme-dns.io. Used because the DNS provider (Manitu) has no usable API:
+# a one-time CNAME per domain delegates only _acme-challenge to acme-dns, then
+# Caddy sets the challenge TXT via the acme-dns HTTP API — no registrar API needed.
+#
+# HARDENED split (only the read path is public):
+#   - DNS server (:53)  -> PUBLIC, bound to the host's public IP (Let's Encrypt
+#     queries it from the internet). acme-dns is AUTHORITATIVE-ONLY for its own
+#     zone (no recursion -> no amplification) and serves only challenge TXT.
+#   - HTTP API (register/update = the WRITE path) -> 127.0.0.1 ONLY (Caddy reaches
+#     it via loopback). The dangerous part is never exposed.
+#
+# Enable: compose_stack line in server-all.yml + point caddy_acme_dns_api_url at
+# http://127.0.0.1:{{ acme_dns_api_port }} (host_vars). Needs a one-time NS
+# delegation of acme_dns_domain to this host at the registrar (+ glue A).
+# =============================================================================
+acme_dns_image: "joohoi/acme-dns:v1.0"
+# MUST match the compose_stack base dir (= /opt/<stack>, underscore) so the rendered
+# config.cfg and the volume mount point at the same path.
+acme_dns_data_dir: /opt/acme_dns
+
+# The zone acme-dns is authoritative for — NS-delegated to this host at the registrar.
+# Derived from global_host so it is ENVIRONMENT-scoped (dev -> acme.dev.<domain>,
+# prod -> acme.prod.<domain>), matching the per-host design (each env its own acme-dns).
+# The _acme-challenge CNAMEs point at <uuid>.<this zone>.
+acme_dns_domain: "acme.{{ global_host }}"
+# Hostname of THIS nameserver (used in SOA/NS). Deliberately DISTINCT from the zone
+# (not self-referential) so the delegation is unambiguous: the registrar gets an A
+# record for THIS name + an NS record `<zone> -> this name`. Lives OUTSIDE the
+# delegated zone (a sibling under global_host), so no in-zone glue is needed.
+acme_dns_ns_hostname: "ns-acme.{{ global_host }}"
+# SOA contact (an email written as a DNS name: admin@example.com).
+acme_dns_ns_admin: "admin.example.com"
+
+# Public IP the DNS server binds to. Inventory `ansible_host` is the source of truth
+# for these hosts. Bound explicitly (NOT 0.0.0.0) so it does not collide with
+# systemd-resolved's 127.0.0.53:53 stub. MUST equal the glue A record.
+acme_dns_public_ip: "{{ ansible_host }}"
+
+# Loopback API port on the host that Caddy talks to (HTTP, localhost only).
+acme_dns_api_port: 8081
+
+# Close the /register endpoint entirely: accounts are provisioned DECLARATIVELY
+# (acme_dns_bootstrap inserts them into the DB), never via /register, and Caddy only
+# uses /update. So nobody can create accounts here — defense-in-depth on top of the
+# API already being loopback-only. Set false only if you ever need /register again.
+acme_dns_disable_registration: true
+
+# --- Declarative accounts (the self-hosting advantage) -----------------------
+# One account per cert domain. username + subdomain are CHOSEN here (fixed,
+# readable) instead of random API-assigned uuids — so nothing has to be captured
+# or backed up: acme_dns_bootstrap creates any MISSING account directly in the
+# acme-dns DB (bcrypt hash) and generates Caddy's creds file from this same list.
+# A rebuild re-creates them from YAML -> same subdomains -> the registrar CNAMEs
+# never change. Each domain's CNAME: _acme-challenge.<cert_domain> IN CNAME
+# <subdomain>.{{ acme_dns_domain }}.
+# Generate your own with `uuidgen` — the ids below are placeholders.
+# NOTE: acme-dns REQUIRES username + subdomain to be UUIDs (it validates the format
+# and rejects anything else). So these are fixed, once-generated random UUIDs — the
+# declarative point stands (defined here, in git; created if missing), the ids just
+# aren't human-readable. The CNAME target is <subdomain-uuid>.{{ acme_dns_domain }}.
+acme_dns_accounts:
+  - cert_domain: "{{ global_host }}"     # dev.example.com   (*.dev wildcard)
+    username: "00000000-0000-4000-8000-000000000001"
+    subdomain: "00000000-0000-4000-8000-000000000002"
+    password: "{{ vault_acme_dns_dev_password }}"
+  - cert_domain: "{{ internal_host }}"   # int.dev.example.com (*.int.dev)
+    username: "00000000-0000-4000-8000-000000000003"
+    subdomain: "00000000-0000-4000-8000-000000000004"
+    password: "{{ vault_acme_dns_int_password }}"

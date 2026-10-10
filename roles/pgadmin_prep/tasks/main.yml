@@ -1,0 +1,30 @@
+---
+# Restrict pgadmin's bridge networks to the ones that ACTUALLY exist at deploy time.
+#
+# pgadmin joins OTHER stacks' DB networks (authentik_default, supabase_default, …, via
+# pgadmin_extra_networks) so you can browse all DBs from one UI. On a PARTIAL deploy —
+# e.g. a business host that never runs supabase — some of those networks don't exist, and
+# a compose `external: true` network that is missing fails the container at `up`. Filtering
+# to existing networks makes pgadmin fail-soft: it bridges whatever is actually deployed,
+# with no per-host pgadmin_extra_networks override. (Stack order guarantees the owners —
+# authentik, supabase — run before pgadmin, so their nets exist by now if selected.)
+- name: List existing docker networks
+  ansible.builtin.command: docker network ls --format '{{ "{{.Name}}" }}'
+  register: _pg_nets
+  changed_when: false
+  check_mode: false
+
+- name: Compute kept / dropped pgadmin bridge networks
+  ansible.builtin.set_fact:
+    _pg_kept: "{{ pgadmin_extra_networks | default([]) | selectattr('name', 'in', _pg_nets.stdout_lines) | list }}"
+    _pg_dropped: "{{ (pgadmin_extra_networks | default([]) | map(attribute='name') | list) | difference(_pg_nets.stdout_lines) }}"
+
+- name: Apply the fail-soft bridge-network list
+  ansible.builtin.set_fact:
+    pgadmin_extra_networks: "{{ _pg_kept }}"
+
+- name: Show which DB networks pgadmin will bridge
+  ansible.builtin.debug:
+    msg: >-
+      pgadmin bridges: {{ (_pg_kept | map(attribute='name') | list) or ['(none)'] }}
+      | dropped (not deployed here): {{ _pg_dropped or ['(none)'] }}

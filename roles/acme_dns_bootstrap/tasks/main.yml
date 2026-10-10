@@ -1,0 +1,62 @@
+---
+# =============================================================================
+# acme_dns_bootstrap — DECLARATIVE acme-dns accounts.
+#
+# The accounts are defined in acme_dns_accounts (group_vars/all/acme_dns.yml):
+# username + subdomain are CHOSEN (fixed) and the password lives in the vault.
+# This role:
+#   1. creates any MISSING account directly in the acme-dns sqlite DB (bcrypt) —
+#      acme-dns' /register API can only hand out RANDOM ids, so declaring fixed
+#      ones needs a direct insert. Idempotent: existing accounts are untouched.
+#   2. derives caddy_acme_dns_seed_credentials from the SAME list (one source of
+#      truth), so the caddy role writes /etc/caddy/acmedns.json (root:caddy 0640)
+#      with the matching creds + server_url = the local acme-dns API.
+#
+# Runs only where the acme_dns stack is deployed. Rebuild-safe by construction:
+# accounts are re-created from YAML -> same subdomains -> the registrar CNAMEs
+# never change (no db backup/restore, no captured random ids).
+# =============================================================================
+- name: acme-dns declarative account bootstrap
+  when: acme_dns_accounts | default([]) | length > 0
+  block:
+    - name: Copy the account-reconcile script to the server
+      ansible.builtin.copy:
+        src: ensure_accounts.py
+        dest: /usr/local/bin/acme-dns-ensure-accounts.py
+        mode: "0755"
+
+    - name: Ensure declared accounts exist in the acme-dns DB (insert if missing)
+      # Accounts (with plaintext keys) piped via STDIN — no temp file on disk.
+      ansible.builtin.command:
+        cmd: python3 /usr/local/bin/acme-dns-ensure-accounts.py {{ acme_dns_data_dir }}/data/acme-dns.db -
+        stdin: "{{ acme_dns_accounts | to_json }}"
+      register: _acme_dns_reconcile
+      changed_when: "'CHANGED' in _acme_dns_reconcile.stdout"
+      no_log: true
+
+    - name: Restart acme-dns so it picks up newly inserted accounts
+      ansible.builtin.command: docker restart acme-dns
+      when: _acme_dns_reconcile.changed
+      changed_when: true
+
+    # One source of truth: the Caddy acme-dns creds come from the same account list.
+    # The caddy role seeds /etc/caddy/acmedns.json from this on a fresh server; the
+    # migration on an existing server replaces the old file (see the migration steps).
+    - name: Derive caddy_acme_dns_seed_credentials from the declared accounts
+      # lookup('template') on a JSON body already returns a dict here (Ansible
+      # auto-parses), so NO from_json.
+      ansible.builtin.set_fact:
+        caddy_acme_dns_seed_credentials: "{{ lookup('template', 'seed_credentials.json.j2') }}"
+      no_log: true
+
+    - name: acme-dns bootstrap summary (+ the CNAMEs to set at the registrar)
+      ansible.builtin.debug:
+        msg: >-
+          acme-dns reconcile: {{ _acme_dns_reconcile.stdout | default('') | trim }}.
+          Registrar CNAMEs:
+          {{ acme_dns_accounts
+             | map('combine', {})
+             | map(attribute='cert_domain') | list }}
+          ->
+          {{ acme_dns_accounts
+             | map(attribute='subdomain') | map('regex_replace', '^(.*)$', '\\1.' ~ acme_dns_domain) | list }}

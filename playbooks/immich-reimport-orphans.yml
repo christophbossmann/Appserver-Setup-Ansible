@@ -1,0 +1,23 @@
+---
+# Re-import Immich originals that are on disk (Storage Box) but missing from the DB — e.g.
+# photos uploaded AFTER the dump a restore came from. They are imported as normal uploads of
+# their owner (taken from the path library/<user>/…), so Immich shows them again with EXIF
+# date, faces and thumbnails. Albums/favourites of those assets are not recoverable.
+# Details: playbooks/tasks/immich_reimport_orphans.yml. The "Originals not in DB" panel on
+# the Immich Grafana dashboard tells you when this is needed.
+#
+#   # dry run (default): list orphans per user, nothing is moved
+#   ansible-playbook playbooks/immich-reimport-orphans.yml --limit <host>
+#   # import
+#   ansible-playbook playbooks/immich-reimport-orphans.yml --limit <host> -e immich_reimport_confirm=YES
+#
+# Also callable right after a restore: immich-restore-local.yml -e immich_restore_reimport_orphans=true
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+
+- name: Re-import orphaned Immich originals
+  hosts: servers
+  become: true
+  tasks:
+    - name: Re-import
+      ansible.builtin.import_tasks: tasks/immich_reimport_orphans.yml

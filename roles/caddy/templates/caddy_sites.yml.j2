@@ -3,6 +3,18 @@
 {% if route.caddy_upstream | default('') %}
   caddy_upstream: "{{ route.caddy_upstream }}"
 {% endif %}
+{% if route.caddy_forward_auth | default(false) | bool %}
+  caddy_forward_auth: true
+{% endif %}
+{% if route.caddy_forward_auth_except_paths | default([]) | length > 0 %}
+  caddy_forward_auth_except_paths: {{ route.caddy_forward_auth_except_paths | to_yaml | trim }}
+{% endif %}
+{% if route.caddy_allow_paths | default([]) | length > 0 %}
+  caddy_allow_paths: {{ route.caddy_allow_paths | to_yaml | trim }}
+{% endif %}
+{% if route.caddy_path_proxies | default([]) | length > 0 %}
+  caddy_path_proxies: {{ route.caddy_path_proxies | to_json }}
+{% endif %}
 {% if route.caddy_tls_mode is defined %}
   caddy_tls_mode: "{{ route.caddy_tls_mode }}"
 {% endif %}

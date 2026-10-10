@@ -1,0 +1,108 @@
+---
+# =============================================================================
+# headscale_int_dns — DYNAMIC self-hosted internal DNS records for Headscale.
+#
+# Headscale extra_records are EXACT names only (no wildcard: the Tailscale client
+# resolver that answers 100.100.100.100 matches ExtraRecords by exact host name
+# and never wildcard-expands them — verified 2026-09-26). So instead of a static,
+# drift-prone hand-maintained list, we DERIVE one record per INTERNAL service
+# from the SAME source Caddy uses:
+#     hostname = caddy_route_<svc>.hostname_label + '.' + internal_host
+#     for every caddy_services entry whose profile == 'internal'
+# pointed at THIS host's own Headscale IP (the address its .int Caddy routes bind
+# to via tailscale0). Result is published as headscale_dns_extra_records, consumed
+# by stacks/headscale/configs/config.yaml.j2.
+#
+# Runs BEFORE the headscale compose_stack (so the fact is set when config.yaml
+# renders). Gated on this host actually running headscale. Correct in every state:
+#   - not cut over yet (node still on Tailscale cloud, or tailscale down) -> the
+#     node IP is NOT inside headscale_ipv4_prefix -> records stay EMPTY (feature
+#     off until cutover), so a headscale client never gets an unreachable IP.
+#   - after cutover -> node IP is in-prefix -> full list, auto-tracking caddy_services.
+#
+# Escape hatch: set headscale_dns_records_auto=false to skip this and hand-manage
+# headscale_dns_extra_records in host_vars instead.
+# =============================================================================
+
+- name: Derive Headscale internal (.int) DNS records
+  when:
+    - "'headscale' in (caddy_services | default({}))"
+    - headscale_dns_records_auto | default(true) | bool
+  block:
+    # This host's current tailnet IPv4 = what its tailscale0-bound Caddy routes
+    # listen on. Only meaningful once it is in our OWN headscale range.
+    - name: Get this host's tailnet IPv4 (wait for an in-prefix IP when required)
+      ansible.builtin.command: tailscale ip -4
+      register: _hs_tailscale_ip
+      changed_when: false
+      check_mode: false   # read-only query; --check needs the real state
+      failed_when: false
+      # On the CONVERGENCE pass (headscale_int_dns_require_ip=true, run right AFTER
+      # tailscale_enrol) the node has just joined and `tailscale ip -4` can lag a few
+      # seconds — retry until it reports an IP inside this host's headscale prefix, so the
+      # records are derived in the SAME run. On the FIRST pass (before enrol; require_ip
+      # false) `until` is satisfied immediately -> one shot, no waiting (empty is correct,
+      # feature off until cutover).
+      retries: "{{ headscale_int_dns_ip_retries | default(40) }}"
+      delay: "{{ headscale_int_dns_ip_delay | default(3) }}"
+      until: >-
+        (not (headscale_int_dns_require_ip | default(false) | bool))
+        or (((_hs_tailscale_ip.stdout_lines | default([]) | first | default(''))
+             | ansible.utils.ipaddr(headscale_ipv4_prefix)) | default('', true) | length > 0)
+
+    - name: Decide the Headscale node IP (empty unless in this host's headscale prefix)
+      ansible.builtin.set_fact:
+        # ipaddr(<prefix>) returns the address when it is inside the network, else
+        # false -> `| default('', true)` normalises non-member/empty to "".
+        _hs_node_ip: >-
+          {{ ((_hs_tailscale_ip.stdout_lines | default([]) | first | default(''))
+              | ansible.utils.ipaddr(headscale_ipv4_prefix)) | default('', true) }}
+
+    # On the CONVERGENCE pass (require_ip=true) the node has just enrolled and MUST have an
+    # in-prefix IP by now (tailscale_enrol waits for it). If it is still empty, fail LOUDLY
+    # here rather than rendering empty extra_records and letting caddy_post_check fail three
+    # roles later with a confusing INT_DNS_MISMATCH.
+    - name: Assert the node has an in-prefix headscale IP (convergence pass)
+      ansible.builtin.assert:
+        that:
+          - (_hs_node_ip | default('') | length) > 0
+        fail_msg: >-
+          headscale_int_dns_require_ip=true but this host has no IP inside
+          {{ headscale_ipv4_prefix }} (tailscale ip -4 =
+          '{{ _hs_tailscale_ip.stdout | default('') | trim }}'). The .int records would be
+          EMPTY. Ensure tailscale_enrol completed (node registered into its headscale).
+        quiet: true
+      when: headscale_int_dns_require_ip | default(false) | bool
+
+    # Load ALL per-role/per-stack route definitions on the controller (same glob
+    # as roles/caddy/tasks/resolve_routes.yml — headscale runs BEFORE caddy, so we
+    # cannot rely on caddy having resolved them yet). Defines caddy_route_<svc>.
+    - name: Discover per-role and per-stack Caddy route files (controller)
+      ansible.builtin.find:
+        paths:
+          - "{{ role_path }}/.."           # roles/<role>/defaults/caddy_route.yml
+          - "{{ role_path }}/../../stacks"   # stacks/<stack>/caddy_route.yml (repo-relative, NOT inventory_dir: the inventory lives in the private repo)
+        patterns: "caddy_route.yml"
+        recurse: true
+      delegate_to: localhost
+      run_once: true
+      become: false
+      register: _hs_route_files
+
+    - name: Load Caddy route definitions (for hostname_label)
+      ansible.builtin.include_vars: "{{ item.path }}"
+      loop: "{{ _hs_route_files.files }}"
+      loop_control:
+        label: "{{ item.path | regex_replace('.*/(roles|stacks)/', '\\1/') }}"
+
+    - name: Build headscale_dns_extra_records from the internal services
+      ansible.builtin.set_fact:
+        headscale_dns_extra_records: >-
+          {{ lookup('template', 'extra_records.yml.j2') | from_yaml | default([], true) }}
+
+    - name: Show the derived internal DNS records
+      ansible.builtin.debug:
+        msg: >-
+          {{ (headscale_dns_extra_records | length) }} internal .int record(s)
+          -> {{ _hs_node_ip | default('(none: host not on its headscale net yet)') }}
+          : {{ headscale_dns_extra_records | map(attribute='name') | list }}

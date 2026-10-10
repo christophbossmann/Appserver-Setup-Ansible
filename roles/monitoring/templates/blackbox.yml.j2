@@ -1,0 +1,15 @@
+# Managed by Ansible (roles/monitoring) — blackbox_exporter modules.
+modules:
+  # "Is the route alive?" — Caddy + backend answer over valid TLS. Redirects are NOT
+  # followed (we probe the route itself, not the SSO login it may redirect to), and
+  # auth-gated answers (401/403) or a 404 on "/" (API-only hosts, path allowlists) count
+  # as UP. 5xx / timeouts / TLS errors count as DOWN.
+  https_up:
+    prober: http
+    timeout: 10s
+    http:
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      no_follow_redirects: true
+      fail_if_not_ssl: true
+      valid_status_codes: [200, 201, 204, 301, 302, 303, 307, 308, 401, 403, 404, 405]

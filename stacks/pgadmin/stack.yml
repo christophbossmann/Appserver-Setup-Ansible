@@ -6,6 +6,8 @@ dirs:
   - { path: data, owner: "5050", group: "5050" }
 configs:
   - { src: configs/servers.json.j2, dest: servers.json }
+  # config_local.py carries the OAuth2 client secret -> 0640, owned by the pgAdmin user.
+  - { src: configs/config_local.py.j2, dest: config_local.py, mode: "0640" }
 health_url: "http://127.0.0.1:{{ pgadmin_port }}/misc/ping"
 status_msg: >-
   Dashboard: http://{{ ansible_host }}:{{ pgadmin_port }} —

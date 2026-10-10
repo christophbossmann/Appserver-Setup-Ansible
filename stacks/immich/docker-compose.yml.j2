@@ -1,0 +1,183 @@
+services:
+  # One-shot init against the SHARED postgres instance (stacks/postgres), run
+  # as the instance superuser. Creates the least-privilege setup for immich:
+  #   1. role {{ immich_db_user }} (LOGIN, no superuser) — password kept in
+  #      sync with the vault on every recreate
+  #   2. database {{ immich_db_name }} OWNED by that role
+  #   3. the extensions immich's migrations expect, pre-created as superuser
+  #      (vchord is untrusted — the immich role could not create it itself;
+  #      immich runs CREATE EXTENSION IF NOT EXISTS and finds them present)
+  #   4. REVOKE CONNECT on the n8n DB for non-superusers — a compromised
+  #      immich cannot even connect to it
+  immich-db-init:
+    image: {{ postgres_image }}
+    container_name: immich-db-init
+    restart: "no"
+    environment:
+      PGPASSWORD: "{{ immich_db_admin_password | default(postgres_password) }}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until pg_isready -h {{ immich_db_host | default('postgres') }} -U {{ immich_db_admin_user | default(postgres_user) }}; do sleep 2; done
+        PSQL="psql -h {{ immich_db_host | default('postgres') }} -U {{ immich_db_admin_user | default(postgres_user) }} -v ON_ERROR_STOP=1"
+        $$PSQL -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ immich_db_user }}'" | grep -q 1 \
+          || $$PSQL -d postgres -c "CREATE ROLE {{ immich_db_user }} LOGIN"
+        $$PSQL -d postgres -c "ALTER ROLE {{ immich_db_user }} WITH LOGIN PASSWORD '{{ immich_db_password }}'"
+        $$PSQL -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='{{ immich_db_name }}'" | grep -q 1 \
+          || createdb -h {{ immich_db_host | default('postgres') }} -U {{ immich_db_admin_user | default(postgres_user) }} -O {{ immich_db_user }} {{ immich_db_name }}
+        $$PSQL -d postgres -c "ALTER DATABASE {{ immich_db_name }} OWNER TO {{ immich_db_user }}"
+        for ext in 'vchord CASCADE' unaccent cube earthdistance pg_trgm; do
+          $$PSQL -d {{ immich_db_name }} -c "CREATE EXTENSION IF NOT EXISTS $$ext"
+        done
+        $$PSQL -d postgres -c "REVOKE CONNECT ON DATABASE {{ (immich_db_host | default('postgres') == 'postgres') | ternary(postgres_db, postgres_business_db) }} FROM PUBLIC"
+
+  immich-server:
+    image: {{ immich_image }}
+    container_name: immich-server
+    restart: unless-stopped
+    depends_on:
+      immich-db-init:
+        condition: service_completed_successfully
+      immich-redis:
+        condition: service_started
+{% if immich_server_mem_reservation | default('') | length > 0 %}
+    # memory.low — kernel reclaims/swaps other containers first (see group_vars/all/immich.yml;
+    # only effective together with system.slice MemoryLow from roles/immich_prep).
+    mem_reservation: "{{ immich_server_mem_reservation }}"
+{% endif %}
+{% if immich_server_mem_limit | default('') | length > 0 %}
+    mem_limit: "{{ immich_server_mem_limit }}"
+{% if not (immich_server_swap | default(true) | bool) %}
+    # == mem_limit -> zero swap for this container (swapped heap = UI hangs).
+    memswap_limit: "{{ immich_server_mem_limit }}"
+{% endif %}
+{% endif %}
+    ports:
+      - "127.0.0.1:{{ immich_port }}:2283"
+    volumes:
+      - {{ immich_upload_dir }}:/data
+{% if immich_originals_external | default(false) %}
+      # Originals live on the Storage Box: /data/library (and /upload) are symlinks to the
+      # box path, so the box is mounted at the SAME absolute path here (rslave = receive the
+      # host's rclone mount). Without this the container can't resolve the symlink target.
+      - {{ immich_storagebox_root }}:{{ immich_storagebox_root }}:rslave
+{% endif %}
+      - /etc/localtime:/etc/localtime:ro
+{% if immich_oidc_enabled | default(false) %}
+      # Authentik OIDC config (read-only). NOTE: with IMMICH_CONFIG_FILE set, the
+      # ENTIRE Immich system config comes from this file and the admin UI
+      # settings become read-only — everything not listed uses defaults.
+      - ./immich-config.json:/config/immich-config.json:ro
+{% endif %}
+    environment:
+      DB_HOSTNAME: "{{ immich_db_host | default('postgres') }}"
+      DB_USERNAME: "{{ immich_db_user }}"
+      DB_PASSWORD: "{{ immich_db_password }}"
+      DB_DATABASE_NAME: "{{ immich_db_name }}"
+      # Named immich-redis (not "redis") to avoid DNS collisions on the shared
+      # backend network.
+      REDIS_HOSTNAME: immich-redis
+      TZ: "{{ immich_timezone }}"
+{% if immich_telemetry_enabled | default(false) | bool %}
+      # Prometheus metrics: API on :8081, microservices/jobs on :8082 (container ports,
+      # NOT published — scraped by roles/monitoring over the backend network).
+      IMMICH_TELEMETRY_INCLUDE: all
+{% endif %}
+{% if immich_oidc_enabled | default(false) %}
+      IMMICH_CONFIG_FILE: /config/immich-config.json
+{% endif %}
+    # Keep the image's healthcheck CMD but stretch the interval — each run
+    # spawns a full node process; 30s across the whole stack was a measurable
+    # share of dockerd/runc CPU load. start_interval: probe every 5s during the
+    # start_period, so the container turns `healthy` seconds after it's up instead of
+    # sitting in `starting` until the first 120s probe (restore/upgrade/deploy waits
+    # on `healthy`). start_period is generous for long startup migrations.
+    healthcheck:
+      interval: 120s
+      start_period: 300s
+      start_interval: 5s
+
+  # Service name immich-machine-learning on purpose: immich-server's default
+  # ML URL is http://immich-machine-learning:3003.
+  immich-machine-learning:
+    image: {{ immich_ml_image }}
+    container_name: immich-machine-learning
+    restart: unless-stopped
+{% if immich_ml_mem_limit | default('') | length > 0 %}
+    # Cap ML RAM (host protection on small nodes, e.g. 8GB): a runaway model load gets the
+    # container OOM-killed + restarted instead of pressuring the whole host. Bump
+    # immich_ml_mem_limit if ML restarts mid-processing. Empty = no limit.
+    mem_limit: "{{ immich_ml_mem_limit }}"
+{% endif %}
+    volumes:
+      - immich-model-cache:/cache
+    # The image's healthcheck starts a PYTHON interpreter each run (seen at
+    # ~300% CPU for a second) — every 30s that is real load for a container
+    # that mostly idles. Keep the CMD, stretch the interval; probe fast only while
+    # starting (same reason as immich-server).
+    healthcheck:
+      interval: 300s
+      start_period: 120s
+      start_interval: 5s
+
+  immich-redis:
+    image: {{ immich_redis_image }}
+    container_name: immich-redis
+    restart: unless-stopped
+    healthcheck:
+      test: redis-cli ping || exit 1
+      interval: 60s
+      timeout: 5s
+      retries: 3
+{% if immich_webdav_enabled | default(false) %}
+
+  # Read-only raw WebDAV over the upload dir — inspection/spot-recovery of the
+  # originals only. The :ro bind AND --read-only both block writes (writing here
+  # would corrupt Immich's library state). Loopback-only; reach it via the INTERNAL
+  # Caddy route webdav-immich.int.<host> (Tailscale) with an Authentik login
+  # (webdav-immich-users, LDAP bind via the outpost). Runs as root purely to READ
+  # files of any owner — it cannot modify anything (read-only mount).
+  immich-webdav:
+    image: "{{ 'rclone-ldap:local' if immich_webdav_ldap | default(false) else 'rclone/rclone:latest' }}"
+{% if immich_webdav_ldap | default(false) %}
+    pull_policy: never   # rclone-ldap:local is built locally (roles/rclone_ldap_image)
+{% endif %}
+    container_name: immich-webdav
+    restart: unless-stopped
+    user: "0:0"
+    command: >
+      serve webdav {{ '' if immich_webdav_ldap | default(false) else '/data' }}
+      --addr :8888
+      --read-only
+{% if immich_webdav_ldap | default(false) %}
+      --auth-proxy /usr/local/bin/auth-proxy.sh
+{% else %}
+      --user {{ immich_webdav_user }}
+      --pass {{ immich_webdav_password }}
+{% endif %}
+      --dir-cache-time {{ immich_webdav_cachetime }}
+{% if immich_webdav_ldap | default(false) %}
+    environment:
+      # WebDAV login = an Authentik user in webdav-immich-users (LDAP bind).
+      LDAP_BASE_DN: "{{ immich_webdav_ldap_base_dn }}"
+{% endif %}
+    volumes:
+      - {{ immich_upload_dir }}:/data:ro
+{% if immich_originals_external | default(false) %}
+      # Same box path (read-only here) so the :ro webdav sidecar can resolve the library/
+      # symlink onto the Storage Box.
+      - {{ immich_storagebox_root }}:{{ immich_storagebox_root }}:ro,rslave
+{% endif %}
+    ports:
+      # Loopback only — reach it via the internal Caddy route or an SSH tunnel.
+      - "127.0.0.1:{{ immich_webdav_port }}:8888"
+{% endif %}
+
+volumes:
+  immich-model-cache:
+
+networks:
+  default:
+    name: backend
+    external: true

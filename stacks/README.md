@@ -75,7 +75,7 @@ caddy_services:
 **5. Deploy:**
 
 ```bash
-ansible-playbook -i inventory.ini playbooks/server-n8n.yml --limit myserver --tags immich,caddy
+ansible-playbook playbooks/server-all.yml --limit myserver --tags immich,caddy
 ```
 
 ## Operations
@@ -88,3 +88,48 @@ ansible-playbook -i inventory.ini playbooks/server-n8n.yml --limit myserver --ta
 - **Recreate semantics:** containers are force-recreated only when the
   rendered compose file or a config file actually changed; otherwise
   `docker compose up -d` is a no-op.
+
+## Raw volume inspection over WebDAV (read-only, VPN + Authentik)
+
+Both `immich` and `nextcloud` ship an optional **read-only** WebDAV sidecar that
+mounts the raw data volume `:ro` for inspection / spot-recovery — browse the actual
+files without going through the app. It is **not** the way to *write* files (that
+would corrupt the app's own bookkeeping); the `:ro` bind and rclone `--read-only`
+both enforce that.
+
+| Stack | Sidecar | Mounts (`:ro`) | Internal URL | Loopback |
+|---|---|---|---|---|
+| immich | `immich-webdav` | `{{ immich_upload_dir }}` | `webdav-immich.int.<host>` | `127.0.0.1:8890` |
+| nextcloud | `nextcloud-webdav` | `{{ nextcloud_data_dir }}` | `webdav-nextcloud.int.<host>` | `127.0.0.1:8891` |
+
+Same pattern as `n8n-webdav` / `playground-webdav`:
+- **Image** `rclone-ldap:local` (built by `roles/rclone_ldap_image`), runs
+  `rclone serve webdav --read-only --auth-proxy` as root purely to *read* files of
+  any owner — the read-only mount blocks all writes.
+- **Reachable only over Tailscale** — the route is marked `internal` in
+  `caddy_services` (host_vars), so it lands under the `*.int.<host>` wildcard bound
+  to `tailscale0`. Not exposed publicly.
+- **Auth = Authentik LDAP.** Login is an Authentik user in `webdav-<app>-users`
+  (or any admin). The `auth-proxy.sh` binds `cn=<user>,ou=users,<base_dn>` against
+  the LDAP outpost; the provider + group come from `authentik_ldap_apps` /
+  `authentik_groups` in `group_vars/all/authentik.yml`.
+
+**Toggle:** `immich_webdav_enabled` / `nextcloud_webdav_enabled` (group_vars).
+Basic-auth instead of LDAP: set `*_webdav_ldap: false` (uses `*_webdav_user/password`).
+
+**Mount (Windows example):**
+```
+net use Z: https://webdav-immich.int.example.com/ /user:<authentik-user> *
+```
+Windows caching gotcha (same as the other int routes): if a stale login sticks,
+`cmdkey /delete:webdav-immich.int.<host>` then re-map.
+
+### Nextcloud's native WebDAV (read-write, cache-safe)
+
+For **normal** file access to Nextcloud use its own WebDAV, not the raw sidecar —
+it keeps the DB file cache (`oc_filecache`) consistent:
+
+```
+https://nextcloud.<host>/remote.php/dav/files/<user>/
+```
+Log in with an **app password** (Settings → Security), not the SSO password.

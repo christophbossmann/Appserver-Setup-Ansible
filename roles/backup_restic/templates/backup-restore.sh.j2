@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Managed by Ansible (roles/backup_restic). SELECTIVE per-app restore — you pick
+# what comes back. Files are restored to a STAGING dir (never straight over live
+# data); DB restore is printed for you to run explicitly (it is destructive).
+#
+#   backup-restore list                      # all snapshots (tag = app)
+#   backup-restore list <app>                # snapshots for one app
+#   backup-restore files <app> [snapshotID]  # restore that app's files -> staging
+#   backup-restore db    <app> [snapshotID]  # restore only the DB dump -> staging + print pg_restore
+#
+# Apps are independent restic snapshots (tags), so restoring 'nextcloud' never
+# touches 'authentik' and vice versa.
+set -uo pipefail
+set -a; . /etc/restic/env; set +a
+
+STAGING=/opt/backups/restore
+cmd="${1:-}"; app="${2:-}"; snap="${3:-latest}"
+
+case "$cmd" in
+  list)
+    if [ -n "$app" ]; then restic snapshots --tag "$app"; else restic snapshots; fi
+    ;;
+  files)
+    [ -z "$app" ] && { echo "usage: backup-restore files <app> [snapshotID]"; exit 1; }
+    dest="$STAGING/$app"
+    mkdir -p "$dest"
+    echo ">> restoring '$app' files (snapshot $snap) -> $dest"
+    restic restore "$snap" --tag "$app" --target "$dest"
+    echo
+    echo "Restored under $dest. Review, then copy what you want into place, e.g.:"
+    echo "  rsync -a $dest/<...>/  <live path>/"
+    echo "For the DB, run:  backup-restore db $app $snap"
+    ;;
+  db)
+    [ -z "$app" ] && { echo "usage: backup-restore db <app> [snapshotID]"; exit 1; }
+    dest="$STAGING/$app"
+    mkdir -p "$dest"
+    restic restore "$snap" --tag "$app" --include "*/db.dump" --target "$dest"
+    dump=$(find "$dest" -name db.dump | head -1)
+    [ -z "$dump" ] && { echo "no db.dump in this snapshot"; exit 1; }
+    echo
+    echo "DB dump restored to: $dump"
+    echo "DESTRUCTIVE restore — run manually when you are sure:"
+    case "$app" in
+      nextcloud)
+        echo "  docker exec -u www-data nextcloud php occ maintenance:mode --on"
+        echo "  cat '$dump' | docker exec -i postgres pg_restore -U {{ postgres_user }} -d {{ nextcloud_db_name }} --clean --if-exists"
+        echo "  docker exec -u www-data nextcloud php occ maintenance:mode --off"
+        ;;
+      authentik)
+        echo "  cat '$dump' | docker exec -i authentik-postgres pg_restore -U authentik -d authentik --clean --if-exists"
+        echo "  docker restart authentik-server authentik-worker"
+        ;;
+      *)
+        echo "  cat '$dump' | docker exec -i <db-container> pg_restore -U <user> -d <db> --clean --if-exists"
+        ;;
+    esac
+    ;;
+  *)
+    echo "usage: backup-restore {list [app] | files <app> [snap] | db <app> [snap]}"
+    echo "apps: {% for j in backup_jobs %}{{ j.name }} {% endfor %}"
+    exit 1
+    ;;
+esac

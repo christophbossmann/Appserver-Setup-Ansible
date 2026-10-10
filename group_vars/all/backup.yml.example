@@ -1,0 +1,148 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/backup.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# Cloud backup (roles/backup_restic): restic repository on a PUBLIC CLOUD
+# provider (OneDrive/pCloud/... — provider-agnostic via rclone), client-side
+# encrypted, deduplicated, with retention. Runs as a nightly systemd timer.
+#
+# ENABLING (one-time, interactive OAuth):
+#   1. On any machine with a browser:  rclone authorize "onedrive"  (or "pcloud")
+#   2. Paste the resulting remote section as [cloudbackup] into
+#      vault_rclone_backup_conf (group_vars/all/vault.yml — see the docs there).
+#   3. Set backup_cloud_enabled: true (host_vars or here) and deploy
+#      --tags backup. restic init happens automatically.
+backup_cloud_enabled: false
+
+backup_rclone_remote: cloudbackup
+# One repo per host — restores stay unambiguous.
+backup_restic_repository: "rclone:{{ backup_rclone_remote }}:restic-{{ inventory_hostname }}"
+backup_restic_password: "{{ vault_restic_password }}"
+
+backup_timer_oncalendar: "*-*-* 03:30:00"
+
+backup_keep_daily: 7
+backup_keep_weekly: 4
+backup_keep_monthly: 6
+
+# Local staging dir for DB dumps ON THE SERVER (also what backup-pull.yml fetches).
+backup_dump_dir: /opt/backups
+
+# backup-pull.yml: FOLLOW external symlinks when pulling (rsync --copy-unsafe-links), so
+# immich's ORIGINALS — which live on the Storage Box behind the library/upload symlinks —
+# are INCLUDED in a full local backup. Without this a pull silently skips them (rsync
+# doesn't follow symlinks) and your photos would NOT be backed up. Default true = complete.
+# For a quick pull of just the DB dumps + local app data (skip the big box originals):
+#   ansible-playbook ... playbooks/backup-pull.yml --limit <host> -e backup_pull_originals=false
+backup_pull_originals: true
+
+# Immich derived data in the backup (both are regenerable, so this is about restore cost):
+# - thumbs/ (small: ~5-10% of the originals). Kept by default: without it a restore needs a
+#   full "Generate Thumbnails -> All", which re-reads EVERY original over the Storage Box
+#   mount and burns CPU for hours on a small host (that mass read is what hung the old
+#   rclone mount). With it the grid works right after the restore.
+# - encoded-video/ is NOT just transcodes: Immich also stores the clips it extracts from
+#   motion photos there (<id>-MP.mp4) as the ORIGINALS of the hidden motion assets — they
+#   are not on the Storage Box. Excluding it lost 49 clips on the last restore (motion
+#   photos stopped moving). Regenerable via "Extract Metadata", but a restore should be
+#   complete right away. Since HEVC is accepted (immich_accepted_video_codecs) the dir holds
+#   almost only those clips (~3 GB on PROD), so ON by default.
+# immich-restore-local.yml restores each of them only when the backup actually has it.
+backup_immich_thumbs: true
+backup_immich_encoded_video: true
+
+# Base dir ON THE CONTROLLER where backup-pull.yml lands local backups (and where the
+# *-restore-local.yml playbooks read them from). Default = <repo>/backups (WSL ext4,
+# which grows on C:). Set to a Windows drive via its WSL mount to keep C: free —
+# e.g. D:\backup = /mnt/d/backup. Unset it (or comment out) to use the repo default.
+# backup_pull_dir: /mnt/d/backup   # e.g. a Windows drive via WSL; unset = <repo>/backups
+
+# Should the Authentik DB be part of the backup? With DECLARATIVE users +
+# uid-mapping = preferred_username, an SSO login re-attaches to the NC account by
+# USERNAME (not the authentik `sub`), so a rebuilt/declarative authentik keeps
+# working WITHOUT restoring its DB. Keep it on as cheap insurance for
+# non-declarative UI users / MFA enrolments / tokens; turn off if you rely purely
+# on declarative provisioning. Either way, RESTORE is always selective per app.
+backup_include_authentik: true
+backup_include_immich: true
+
+# App selection: which jobs run. Default 'full' = every enabled job. Override at
+# runtime to back up a subset:
+#   local pull : -e backup_only=immich            (or comma-sep: nextcloud,authentik)
+#   cloud (host): backup-run immich nextcloud     (no args / "full" / "all" = every job)
+# The nightly systemd timer always runs the full set.
+backup_only: "full"
+
+# Job list — each job is an INDEPENDENT restic snapshot (tag = job name), so you
+# restore per app (backup-restore files <app>). `enabled` (default true) gates a
+# job. Extend with more services (n8n, supabase, ...) as needed.
+#
+# CONVENTION: stage every DB dump in a dir named `<app>-db` (NOT `<app>`). The
+# local pull (backup-pull.yml) rsyncs each `path` into a dest subdir named after
+# the source BASENAME; if a data path shares that basename (e.g. immich_upload_dir
+# basename is `immich`), both land in the same dest subdir and the second rsync's
+# `--delete` wipes the dump. A distinct `<app>-db` basename makes that impossible.
+backup_jobs:
+  - name: nextcloud
+    pre:
+      - "docker exec -u www-data nextcloud php occ maintenance:mode --on"
+      - "mkdir -p {{ backup_dump_dir }}/nextcloud-db"
+      - "docker exec {{ nextcloud_db_host | default('postgres') }} pg_dump -U {{ nextcloud_db_admin_user | default(postgres_user) }} -Fc {{ nextcloud_db_name }} > {{ backup_dump_dir }}/nextcloud-db/db.dump"
+    paths:
+      - "{{ backup_dump_dir }}/nextcloud-db"
+      - "{{ nextcloud_data_dir }}"
+      - "{{ nextcloud_html_dir }}/config"
+    post:
+      - "docker exec -u www-data nextcloud php occ maintenance:mode --off"
+    # LOCAL PULL ONLY (backup-pull.yml): export every user's calendars/contacts as
+    # standalone, re-importable .ics/.vcf to the CONTROLLER (not kept on the server).
+    # pull_pre runs BEFORE maintenance mode (DAV returns 503 under maintenance) and
+    # stages the export in its OWN dir; pull_paths rsyncs it to the controller as a
+    # sibling of data/config (-> nextcloud/dav-export/, NOT nested in nextcloud-db/);
+    # pull_post wipes the server-side staging again. pull_paths is local-only (the
+    # cloud/restic backup ignores it — it only uses `paths`).
+    pull_pre:
+      - "/usr/local/bin/nc-dav-export {{ backup_dump_dir }}/dav-export"
+    pull_paths:
+      - "{{ backup_dump_dir }}/dav-export"
+    pull_post:
+      - "rm -rf {{ backup_dump_dir }}/dav-export"
+
+  # Authentik = the identity NC users are linked to (user_oidc matches
+  # provider+sub at LOGIN time). Restoring NC together with the same-era
+  # authentik DB keeps those links intact; a freshly re-created authentik user
+  # would get a NEW sub -> the SSO login would attach to a new/pre-provisioned
+  # account instead of erroring. (secret_key lives in the vault, blueprints are
+  # IaC — the DB dump covers users/sessions/tokens.)
+  - name: authentik
+    enabled: "{{ backup_include_authentik | default(true) }}"
+    pre:
+      - "mkdir -p {{ backup_dump_dir }}/authentik-db"
+      - "docker exec authentik-postgres pg_dump -U authentik -Fc authentik > {{ backup_dump_dir }}/authentik-db/db.dump"
+    paths:
+      - "{{ backup_dump_dir }}/authentik-db"
+
+  # Immich = your photo/video library. Two parts: the DB (albums/faces/metadata,
+  # on the business postgres, dumped with its superuser) AND the upload dir (the
+  # actual media — the big, irreplaceable part). No maintenance mode: pg_dump -Fc
+  # is transactionally consistent and the upload dir is append-mostly.
+  - name: immich
+    enabled: "{{ backup_include_immich | default(true) }}"
+    # NOTE: the DB dump is staged in a dir named `immich-db`, NOT `immich`. The
+    # local pull (backup-pull.yml) rsyncs each path into a dest subdir named after
+    # the source BASENAME; immich_upload_dir's basename is already `immich`, so a
+    # dump dir also named `immich` would land in the SAME dest subdir and the
+    # photo rsync's `--delete` would wipe the dump. Distinct basenames avoid that.
+    pre:
+      - "mkdir -p {{ backup_dump_dir }}/immich-db"
+      - "docker exec {{ immich_db_host | default('postgres') }} pg_dump -U {{ immich_db_admin_user | default(postgres_user) }} -Fc {{ immich_db_name }} > {{ backup_dump_dir }}/immich-db/db.dump"
+    paths:
+      - "{{ backup_dump_dir }}/immich-db"
+      - "{{ immich_upload_dir }}"
+    # Always skipped: .snapshots/ (btrfs snapshot store at the @immich_data root) and
+    # backups/ (Immich's OWN internal DB dumps, redundant with our pg_dump above).
+    # thumbs/ + encoded-video/ are regenerable but toggleable (backup_immich_thumbs /
+    # backup_immich_encoded_video below) — see there why thumbs are kept by default.
+    excludes: >-
+      {{ ['.snapshots/', 'backups/']
+         + ([] if backup_immich_thumbs | bool else ['thumbs/'])
+         + ([] if backup_immich_encoded_video | bool else ['encoded-video/']) }}

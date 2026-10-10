@@ -21,23 +21,20 @@ tailscale_auth_key: ""
 # Extra args for `tailscale up` (e.g. "--advertise-exit-node" or "--accept-routes").
 tailscale_extra_args: ""
 
-# --- State import (auto) ----------------------------------------------------
-# Path on the CONTROLLER to a tailscaled.state backup. If a file exists here it
-# is imported onto the server automatically (so the node keeps its identity
-# without a new auth key) — UNLESS the server is already logged in (a live login
-# always wins, no relogin) or tailscale_reauth_force is true. Defaults to the
-# same path the export step writes to, so the role round-trips its own backup.
-# Set to "" to disable auto-import.
-tailscale_state_file: "~/.ansible/tailscale-state/{{ inventory_hostname }}.state"
+# Control server this client connects to. Empty (default) = Tailscale's cloud
+# (login.tailscale.com) — the current, unchanged behaviour. Set to a self-hosted
+# Headscale URL (e.g. "https://headscale.{{ global_host }}") to point THIS host's
+# tailscale client at that control server instead. The headscale stack (the host
+# running its OWN controller) is a separate building block; this knob only decides
+# where the client joins. Switching control servers needs a matching authkey and
+# usually tailscale_reauth_force=true.
+tailscale_login_server: ""
 
-# --- State export (default ON) ----------------------------------------------
-# After the run, fetch the live tailscaled.state back to the controller so you
-# always have a current backup. Set to false to disable.
-tailscale_export_state: true
-
-# Destination on the controller for the exported state (flat file, per host).
-tailscale_state_export_path: "~/.ansible/tailscale-state/{{ inventory_hostname }}.state"
-
-# Backward-compat override: if set, used as the export destination instead of
-# tailscale_state_export_path.
-tailscale_state_backup_path: ""
+# NOTE: this role no longer backs up / restores the node's tailscaled.state
+# identity (removed 2026-09-27). On a rebuild the node re-enrols via an auth key
+# — for a self-hosted, co-located Headscale that is the cheap standard path and a
+# changed IP self-heals (headscale_int_dns + Caddy tailscale0 bind derive from the
+# live IP). Bring the mechanism back only for a control server that is NOT
+# co-located / not yours (Tailscale cloud, remote Headscale, dev<->prod cross-join).
+# The full removed implementation + how to reintroduce it lives in
+# docs/tailscale-identity-backup.md.

@@ -1,0 +1,41 @@
+# Caddy route for Supabase — loaded by the caddy role's resolver, selected per
+# host via caddy_services (supabase: external).
+#
+# Kong serves BOTH the Studio UI and the API under one hostname. Exposure model:
+# PUBLIC = Studio only (Authentik SSO); the API is NOT usable publicly. We achieve
+# that by forward-authing the WHOLE host: the browser (Studio) carries the Authentik
+# cookie and reaches everything, while external programmatic clients (API key, no
+# cookie) get bounced to the Authentik login -> public API effectively closed.
+# A hard 403 on the API paths is deliberately NOT used — Studio's own browser calls
+# some of those paths, so it would break the UI.
+# Apps/playgrounds use Supabase via the INTERNAL docker network (Kong container),
+# never this public route. Kong's dashboard basic-auth is disabled (configs/api/
+# kong.yml) since Authentik now fronts the UI; Kong stays loopback-only behind Caddy.
+# (The generic caddy_forward_auth_except_paths feature stays available for other
+# routes that DO want key-authed paths public — just not here.)
+caddy_route_supabase:
+  name: supabase
+  hostname_label: supabase
+  caddy_upstream: "127.0.0.1:{{ supabase_kong_http_port }}"
+  caddy_forward_auth: true
+
+# Dedicated API host: supabase-api.<host>. Exposes ONLY the client API prefixes
+# (Kong enforces key-auth + ACL + RLS); everything else — crucially Studio (/) —
+# returns 404 here. This is what external playground apps use as their SUPABASE_URL.
+# The database itself is never reachable; only Kong's API is. Studio stays on
+# supabase.<host> (SSO). Select per host via caddy_services (supabase_api: external).
+caddy_route_supabase_api:
+  name: supabase_api
+  depends_service: supabase   # same Kong upstream as the supabase stack (intent-aware post-check)
+  hostname_label: supabase-api
+  caddy_upstream: "127.0.0.1:{{ supabase_kong_http_port }}"
+  # GET / is 404 by design here (Studio hidden; only the API prefixes pass) — tell
+  # the post-check that 404 is the healthy response for this host's root.
+  healthcheck_status_codes: [404]
+  caddy_allow_paths:
+    - /rest/*
+    - /auth/*
+    - /storage/*
+    - /realtime/*
+    - /functions/*
+    - /graphql/*

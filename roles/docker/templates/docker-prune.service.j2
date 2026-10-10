@@ -1,0 +1,12 @@
+# Managed by Ansible (roles/docker). Removes images NO container (running or stopped)
+# uses and build cache, both only when older than {{ docker_prune_keep_hours }}h.
+# Volumes are never touched.
+[Unit]
+Description=Prune unused docker images and build cache
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker image prune --all --force --filter "until={{ docker_prune_keep_hours }}h"
+ExecStart=/usr/bin/docker builder prune --all --force --filter "until={{ docker_prune_keep_hours }}h"

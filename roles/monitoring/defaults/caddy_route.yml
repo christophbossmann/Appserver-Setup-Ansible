@@ -1,5 +1,15 @@
 # Caddy route for grafana (lives in the monitoring role) — loaded explicitly by caddy.
 caddy_route_grafana:
   name: grafana
+  depends_service: monitoring   # deployed by the monitoring role (intent-aware post-check)
   hostname_label: grafana
   caddy_upstream: "127.0.0.1:3000"
+  # "Start new scan" button on the Vulnerabilities dashboard: same-origin POST to
+  # /hooks/trivy-scan, handed to the loopback-only webhook service (roles/monitoring),
+  # whose single hook can do exactly one thing: start trivy-metrics.service.
+  caddy_extra: |
+    {% if (monitoring_trivy_enabled | default(true)) and (monitoring_scan_button_enabled | default(true)) %}
+    handle /hooks/* {
+        reverse_proxy 127.0.0.1:{{ monitoring_webhook_port | default(9777) }}
+    }
+    {% endif %}

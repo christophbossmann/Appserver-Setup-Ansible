@@ -1,0 +1,409 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/authentik.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# Authentik (self-hosted IdP/SSO) config. Secrets in group_vars/all/vault.yml
+# (vault_authentik_*). Images follow the <name>_image convention -> auto-collected
+# by playbooks/preload-images.yml. Pins from the upstream goauthentik compose the
+# stack was derived from; bump deliberately (check ghcr.io/goauthentik/server).
+
+# === Images ===
+# Server, worker and LDAP outpost must run the SAME version -> one variable for all three.
+# Upgrade with playbooks/authentik-upgrade.yml (PITR rollback), not by editing this.
+authentik_version: "2026.5.5"
+authentik_server_image:   "ghcr.io/goauthentik/server:{{ authentik_version }}"
+authentik_postgres_image: "postgres:16-alpine"
+# Host LOOPBACK port for admin access to the Authentik DB (local pgAdmin via SSH tunnel).
+# 127.0.0.1-only; apps keep talking to it over the docker network. Follows the port scheme
+# (5432=shared, 5433=supabase-pooler, 5434=business). Empty = not published.
+authentik_postgres_port: 5435
+
+# === Public URL ===
+authentik_public_url: "https://{{ svc_edge_host['authentik'] }}"
+
+# === Host bind (loopback; Caddy fronts it at authentik.<global_host>) ===
+authentik_http_port: 9000
+
+# === Data (host binds under the 'authentik' data domain, see group_vars/all/storage.yml) ===
+# On btrfs these live in the @authentik subvolume -> excluded from system rollback +
+# independently snapshottable. Was Docker named volumes; now host binds so the data is in
+# the subvolume. Postgres (postgres:16-alpine) chowns its own dir on first init.
+authentik_pg_data_dir:    "{{ data_root_authentik }}/db"      # nodatacow (chattr +C via data_storage)
+authentik_data_dir:       "{{ data_root_authentik }}/data"
+authentik_certs_dir:      "{{ data_root_authentik }}/certs"
+authentik_templates_dir:  "{{ data_root_authentik }}/templates"
+
+# === LDAP outpost (for clients that speak LDAP, not OIDC — e.g. WebDAV) ===
+# ONE outpost container (goauthentik/ldap) serves MULTIPLE providers — one per app,
+# each on its OWN base_dn. Access model per provider:
+#   - WITH `group`  -> only that group may bind (Authentik enforces it at bind time)
+#   - WITHOUT group -> ANY Authentik user may bind = generic credential check /
+#     "password oracle". Expose deliberately (sensitive).
+# The direct-bind uses the provider's `authorization_flow` (NOT authentication_flow!)
+# = our MFA-free ldap-bind-flow. The outpost token is fetched by
+# roles/authentik_bootstrap (a blueprint can't expose it).
+authentik_ldap_enabled: true
+authentik_ldap_image: "ghcr.io/goauthentik/ldap:{{ authentik_version }}"
+authentik_ldap_bind_port: 3389
+authentik_ldap_bind_port_ssl: 6636
+authentik_ldap_outpost_name: "LDAP"
+# Host addresses the LDAP ports publish on. Container-to-container always works via
+# the docker network (authentik-ldap:3389). Add the host's TAILSCALE IP in host_vars
+# to reach LDAP from the tailnet. NEVER 0.0.0.0 on a public host — Docker bypasses ufw.
+authentik_ldap_bind_addresses:
+  - "127.0.0.1"
+authentik_ldap_apps:
+  - { name: webdav-n8n,        base_dn: "dc=n8n,dc=ldap,dc=example,dc=com",        group: webdav-n8n-users }
+  - { name: webdav-playground, base_dn: "dc=playground,dc=ldap,dc=example,dc=com", group: webdav-playground-users }
+  - { name: webdav-immich,     base_dn: "dc=immich,dc=ldap,dc=example,dc=com",     group: webdav-immich-users }
+  - { name: webdav-nextcloud,  base_dn: "dc=nextcloud,dc=ldap,dc=example,dc=com",  group: webdav-nextcloud-users }
+  # No group -> every Authentik user can bind (generic credential check, for testing).
+  - { name: all-users,         base_dn: "dc=all,dc=ldap,dc=example,dc=com" }
+
+# Admins always keep access: bind the admin group to EVERY group-gated LDAP app as a
+# SECOND policy binding. The app policy engine is ANY-mode, so a user in the app's own
+# group OR in the admin group may bind — admins get WebDAV without being added to each
+# webdav-*-users group. (Group hierarchy can't express this: a group has only ONE parent,
+# so authentik Admins can't be a child of every webdav group.) search_group stays the
+# app's group — admins may bind (all the auth-proxy needs) but not enumerate users.
+authentik_ldap_admin_access: true
+authentik_ldap_admin_group: "authentik Admins"
+
+# === Groups (access control) ===
+# Extra groups created declaratively via the blueprint. Bind a group to apps
+# through each app's `access_groups:` (below) to grant ONLY those apps — members
+# are NOT admins, so every other app (which stays admins-only) remains off-limits.
+# "authentik Admins" always keeps access to everything.
+#
+# TWO different things, don't confuse them:
+#  - The group OBJECTS here are ADD-ONLY: removing one from this list does NOT delete
+#    it (blueprints don't prune) — list it under authentik_groups_absent to remove it.
+#  - GROUP MEMBERSHIP of users in authentik_users is synced by roles/authentik_bootstrap
+#    per the authentik_fullsync flag (below): ADDITIVE by default (declared groups
+#    added, UI/extra groups kept), or exact-match with authentik_fullsync=true. Service
+#    accounts' groups stay blueprint-managed (always exact).
+authentik_groups:
+  - immich-users
+  - immich-admins             # -> emits immich_role=admin (Immich sets isAdmin on login)
+  - pg-users                  # who may open pg1-5 (humans + the playwright-bot service account)
+  - webdav-n8n-users          # may bind to the n8n WebDAV via LDAP
+  - webdav-playground-users   # may bind to the playground WebDAV via LDAP
+  - webdav-immich-users       # may bind to the read-only Immich-upload WebDAV
+  - webdav-nextcloud-users    # may bind to the read-only Nextcloud-data WebDAV
+  - nextcloud-users           # may log into Nextcloud (normal user)
+  - nextcloud-admins          # Nextcloud ADMIN (mapped to NC group `admin` via the
+                              # nextcloud provider's group_map) WITHOUT Authentik
+                              # superuser. is_superuser stays false -> zero Authentik power.
+  - headplane-users           # may LOG IN to the Headplane UI (Headscale web UI) as a
+                              # non-admin: gets Headplane role `viewer` (read-only + own
+                              # pre-auth keys). Admins reach it anyway (admins_only).
+  - headplane-admins          # -> emits headplane_role=admin (full Headplane admin:
+                              # manage users/machines/keys). Upgrade path: add a person here.
+
+# Groups to DELETE (blueprints don't prune, so renaming/removing a group leaves the
+# old one — with its bindings — behind). List obsolete names here to remove them +
+# their policy bindings declaratively.
+authentik_groups_absent:
+  - playground-access         # renamed to pg-users
+  - webdav-users              # split into webdav-n8n-users / webdav-playground-users
+
+# === Forward-auth applications (declarative SSO config via Authentik Blueprint) ===
+# Each entry auto-creates a Proxy Provider (forward_single) + Application and
+# binds it to the embedded outpost — no UI clicking. Keep in sync with the
+# routes that carry `caddy_forward_auth: true`. `hostname` MUST equal the exact
+# Caddy hostname (scheme added automatically). Add a service here + set the route
+# flag, re-run --tags authentik,caddy, done.
+authentik_forward_auth_apps:
+  # Label-Override (playwright_mcp -> playwright) sitzt in svc_edge_label (service_hosts.yml).
+  - { name: playwright, display_name: "Playwright MCP", hostname: "{{ svc_edge_host.get('playwright_mcp', '') }}" }
+  # Container dashboard (live logs + restart buttons) — admins only.
+  - { name: dozzle, display_name: "Dozzle", hostname: "{{ svc_edge_host.get('dozzle', '') }}" }
+  # (headplane moved to native OIDC — see authentik_oauth_apps below; no forward-auth.)
+  # Supabase Studio UI (the API prefixes bypass forward-auth — see the supabase
+  # caddy_route's caddy_forward_auth_except_paths). External host -> global_host.
+  - { name: supabase, display_name: "Supabase Studio", hostname: "{{ svc_edge_host.get('supabase', '') }}" }
+  # Playground deployments pg1-5: SSO instead of basic_auth. Access = admins +
+  # the pg-users group (which contains playwright-bot). cookie_domain =
+  # global_host so ONE login covers all pgN (and the other *.prod forward-auth apps).
+  - { name: pg1, display_name: "Playground pg1", hostname: "{{ svc_edge_host.get('pg1', '') }}", cookie_domain: "{{ global_host }}", access_groups: [pg-users] }
+  - { name: pg2, display_name: "Playground pg2", hostname: "{{ svc_edge_host.get('pg2', '') }}", cookie_domain: "{{ global_host }}", access_groups: [pg-users] }
+  - { name: pg3, display_name: "Playground pg3", hostname: "{{ svc_edge_host.get('pg3', '') }}", cookie_domain: "{{ global_host }}", access_groups: [pg-users] }
+  - { name: pg4, display_name: "Playground pg4", hostname: "{{ svc_edge_host.get('pg4', '') }}", cookie_domain: "{{ global_host }}", access_groups: [pg-users] }
+  - { name: pg5, display_name: "Playground pg5", hostname: "{{ svc_edge_host.get('pg5', '') }}", cookie_domain: "{{ global_host }}", access_groups: [pg-users] }
+
+# === MFA (stacks/authentik/blueprints/mfa.yaml.j2) ============================
+# true: every interactive Authentik login needs a second factor. A user without one is
+# walked through the setup on the next login (authenticator app/TOTP or passkey/security
+# key) and cannot log in without it. Not affected: LDAP binds (WebDAV), API tokens, and
+# members of authentik_mfa_exempt_group — service accounts below are added automatically
+# (mfa_exempt: false on an entry opts it back in). Lost factor: an admin removes the
+# user's device in the UI, or on the host:
+#   docker exec authentik-server ak create_recovery_key 10 <username>
+authentik_mfa_enforce: true
+authentik_mfa_exempt_group: mfa-exempt
+# Title of the Authentik instance: login page + the name authenticator apps show for the TOTP
+# entry ("<title>: <username>"). Set it per host (host_vars) so PROD/DEV entries differ;
+# unset = Authentik's default "authentik".
+# authentik_branding_title: "Homelab PROD"
+
+# === Service accounts (non-interactive logins, e.g. Playwright testing pgN) ===
+# Created declaratively (blueprint) + their password is set via the Authentik API
+# by roles/authentik_bootstrap (blueprints can't set passwords). Put them in
+# the groups that grant the app access they need. playwright-bot logs into the
+# Authentik form so Playwright can reach the SSO-gated pgN apps.
+authentik_service_accounts:
+  - { username: playwright-bot, name: "Playwright Bot", email: "playwright-bot@{{ global_host }}", password: "{{ vault_authentik_playwright_password }}", groups: [pg-users, webdav-n8n-users, webdav-playground-users] }
+
+# Profile-sync mode for HUMAN users (authentik_users) — NOT service accounts:
+#   false (default) = ADDITIVE: declared groups + attributes + avatar are added/merged
+#                     onto the live account; nothing already there (extra groups, extra
+#                     attributes, a UI-set avatar) is removed.
+#   true            = FULLSYNC for ALL humans: the profile is set to EXACTLY the
+#                     declaration — groups and attributes become exactly what is listed
+#                     (+ avatar), so UI-added groups/attributes are removed. The
+#                     PASSWORD is NEVER touched either way. Service accounts unaffected.
+#   "Bob" or "Bob,Carol" (CLI) / [Bob, Carol] (yaml) = FULLSYNC only for those
+#                     users; everyone else stays additive. (comma form is split for you)
+# Applied by roles/authentik_bootstrap. Turn on per-run only when you want the takeover:
+#   ansible-playbook … --tags authentik -e authentik_fullsync=true
+#   ansible-playbook … --tags authentik -e authentik_fullsync=Bob,Carol
+authentik_fullsync: false
+
+# Password overwrite (independent of fullsync — fullsync NEVER touches passwords).
+# Human passwords are INITIAL-ONLY by default: set once, then never overwritten so a
+# user's self-chosen password is safe. authentik_passwordsync forces a re-set from the
+# vault, OVERWRITING the current password — normally undesired, useful for a forced
+# reset. Accepts:
+#   false (default) = never overwrite
+#   true            = overwrite ALL humans that declare a `password`
+#   "Bob" or "Bob,Carol" (CLI) / [Bob, Carol] (yaml) = overwrite ONLY those
+#                     usernames (surgical) — the comma form is split for you.
+# Service accounts are always convergent (overwritten every run) regardless.
+#   ansible-playbook … --tags authentik -e authentik_passwordsync=Bob
+#   ansible-playbook … --tags authentik -e authentik_passwordsync=Bob,Carol
+authentik_passwordsync: false
+
+# === Human users (declarative, reproducible on re-rollout) ===
+# The blueprint CREATES them (username/name/email) and NEVER deletes them (blueprints
+# don't prune; removing an entry here leaves the Authentik account untouched). GROUPS,
+# attributes and avatar are synced by roles/authentik_bootstrap per authentik_fullsync
+# above (additive by default). Password = INITIAL ONLY: roles/authentik_bootstrap
+# sets `password` just once, when the account has no usable password yet — a user who
+# has since set their own is never overwritten. Omit `password` to have them self-set
+# via SSO / an Authentik recovery link.
+# Groups drive app access (e.g. immich-users, pg-users). Add real people here:
+authentik_users:
+  # Alice = human ADMIN account: member of the built-in "authentik Admins"
+  # group -> full Authentik superuser + access to every app AND all WebDAV shares
+  # (the LDAP admin binding covers WebDAV).
+  # IMPORTANT: username is CASE-SENSITIVE and must match the existing account
+  # EXACTLY ("Alice", capital C). A mismatch does NOT update the real user — it
+  # silently creates a DUPLICATE (learned the hard way: a lowercase `alice`
+  # entry created a second account while the real login stayed `Alice`).
+  # Password is INITIAL-ONLY: the existing password stays untouched on the
+  # live server; the vault value applies only on a fresh rebuild.
+  # nextcloud-admins gives him NC admin via the group claim (needed now that the
+  # Nextcloud app is group-gated + login-restricted — superuser does NOT bypass an
+  # app's access binding, so he must be a member of a bound group to get in).
+  #
+  # Optional profile fields, all applied by roles/authentik_bootstrap (GET+merge+PATCH,
+  # so they coexist and survive re-runs):
+  #   avatar     = image file in <private config>/avatars/ (png/jpg, ~128px; authentik_avatar_dir) ->
+  #                attributes.picture -> also the OIDC `picture` claim -> Nextcloud photo.
+  #   attributes = phone / birthdate (YYYY-MM-DD) / website / locale (e.g. "de" -> NC
+  #                language) / and the address, either as a plain `address` string OR
+  #                as structured parts: street / locality (=Ort) / postal_code / country
+  #                (the scope mapping composes a formatted line for NC's single address
+  #                field). Emitted via ansible-profile-extended, pulled into the
+  #                Nextcloud profile by user_oidc on login.
+  # Re-run `--tags authentik` after changing either (empty/omitted = nothing pushed).
+  - username: Alice
+    name: "Alice"
+    email: "admin@example.com"
+    groups: ["authentik Admins", "nextcloud-admins", "immich-admins", "webdav-immich-users", "webdav-nextcloud-users", "headplane-admins"]
+    password: "{{ vault_authentik_user_alice_password }}"
+    avatar: alice.jpg
+    attributes:
+      phone: "+49 30 5550 0101"
+      birthdate: "1990-01-01"
+      # Structured address: Ort (locality) is its own field. The scope mapping composes
+      # a formatted line from these for Nextcloud's single address field. (A plain
+      # `address: "..."` string still works too — see Bob/Carol.)
+      street: "Musterstraße 1"
+      locality: "Musterstadt"          # Ort
+      region: "Musterland"            # Bundesland
+      postal_code: "12345"
+      country: "Deutschland"
+      website: "https://example.com"
+      locale: "de"                 # -> Nextcloud language
+
+  - username: Bob
+    name: "Bob"
+    email: "bob@example.com"
+    groups: ["nextcloud-admins", "immich-admins", "headplane-users"]
+    password: "{{ vault_authentik_user_other_password }}"
+    avatar: bob.jpg
+    attributes:
+      phone: "+49 30 5550 0102"
+      birthdate: "1960-02-02"
+      street: "Beispielweg 2"
+      locality: "Beispielstadt"
+      region: "Musterland"
+      postal_code: "23456"
+      country: "Deutschland"
+      locale: "de"
+      
+  - username: Carol
+    name: "Carol"
+    email: "carol@example.com"
+    groups: ["nextcloud-users", "immich-users", "headplane-users"]
+    password: "{{ vault_authentik_user_other_password }}"
+    avatar: carol.jpg
+    attributes:
+      phone: "+49 30 5550 0103"
+      birthdate: "1962-03-03"
+      street: "Beispielweg 2"
+      locality: "Beispielstadt"
+      region: "Musterland"
+      postal_code: "23456"
+      country: "Deutschland"
+      locale: "de"
+      
+  - username: Dave
+    name: "Dave"
+    #email: "dave@example.com"
+    groups: ["nextcloud-users"]
+    password: "{{ vault_authentik_user_other_password }}"
+    #avatar: alice.jpg
+    attributes:
+      phone: "+49 30 5550 0104"
+      birthdate: "1940-04-04"
+      street: "Hauptstraße 4"
+      locality: "Beispieldorf"
+      region: "Musterland"
+      postal_code: "34567"
+      country: "Deutschland"
+      locale: "de"
+#   - { username: anna, name: "Anna", email: "anna@example.com", groups: [immich-users] }
+#   - { username: ben,  name: "Ben",  email: "ben@example.com",  groups: [immich-users, pg-users], password: "{{ vault_authentik_user_ben_password }}" }
+
+# === Native OIDC applications (OAuth2 provider + app auto-created via blueprint) ===
+# For apps that speak OpenID Connect (grafana, komodo, immich, pgadmin) — real
+# SSO, no forward-auth. client_id is a readable slug; the secret lives in the
+# vault (vault_authentik_oauth_<name>_secret) and is shared with the app's own
+# OIDC config. redirect_uris must match what the app sends back.
+authentik_oauth_apps:
+  - name: grafana
+    display_name: "Grafana"
+    client_id: grafana
+    client_secret: "{{ vault_authentik_oauth_grafana_secret }}"
+    launch_url: "https://{{ svc_edge_host['grafana'] }}/"
+    redirect_uris:
+      - "https://{{ svc_edge_host['grafana'] }}/login/generic_oauth"   # folgt caddy_services-Profil (die EINE Stelle)
+  - name: immich
+    display_name: "Immich"
+    client_id: immich
+    client_secret: "{{ vault_authentik_oauth_immich_secret }}"
+    # These groups get access IN ADDITION to admins. immich-users can use Immich
+    # but no other app. Immich autoRegisters them on first login; role_claim below
+    # decides admin-vs-user. immich-admins also needs access (it's a separate group).
+    access_groups: [immich-users, immich-admins]
+    # Immich v3 roleClaim: emit `immich_role` = "admin" for members of immich-admins,
+    # else "user". Immich sets isAdmin from it on EVERY OAuth login (so no local
+    # account needs to pre-exist — autoRegister + admin in one login). The Immich
+    # config must set "roleClaim": "immich_role" (stacks/immich/configs).
+    role_claim: { claim: immich_role, admin_group: immich-admins }
+    # Immich ist DOPPELT exponiert: der SHARE-Endpunkt nutzt IMMER die public Route
+    # (svc_edge_host['immich']), das volle Immich folgt dem Profil von immich_int
+    # (svc_edge_host['immich_int'] -> immich.int solange internal). Beide über den
+    # Helper (immich_int -> Label 'immich', s. svc_edge_label in service_hosts.yml).
+    # Portal tile points at the FULL app (the public host only serves shares now).
+    launch_url: "https://{{ svc_edge_host['immich_int'] }}/"
+    redirect_uris:
+      # SHARE/public host — kept for the mobile OAuth redirect; browser login on
+      # the public host is blocked by the Caddy allowlist anyway. IMMER public.
+      - "https://{{ svc_edge_host['immich'] }}/auth/login"
+      - "https://{{ svc_edge_host['immich'] }}/user-settings"
+      - "https://{{ svc_edge_host['immich'] }}/api/oauth/mobile-redirect"
+      # Full app (folgt immich_int-Profil, aktuell Tailscale) — "Login with Authentik"
+      # über diesen Host braucht diese registriert (redirect = browser origin).
+      - "https://{{ svc_edge_host['immich_int'] }}/auth/login"
+      - "https://{{ svc_edge_host['immich_int'] }}/user-settings"
+      - "https://{{ svc_edge_host['immich_int'] }}/api/oauth/mobile-redirect"
+  - name: komodo
+    display_name: "Komodo"
+    client_id: komodo
+    client_secret: "{{ vault_authentik_oauth_komodo_secret }}"
+    redirect_uris:
+      - "https://{{ svc_edge_host.get('komodo', '') }}/auth/oidc/callback"     # komodo is internal -> komodo.int.<host>
+  - name: headplane
+    display_name: "Headplane"
+    client_id: headplane
+    client_secret: "{{ vault_authentik_oauth_headplane_secret }}"
+    # Headscale web UI — internal. Native OIDC (replaces the old forward-auth +
+    # proxy_auth, which headplane 0.7.1 ignored). headplane mounts its app under
+    # /admin, so the OIDC callback is /admin/oidc/callback (verified from the
+    # authorize redirect_uri headplane actually sends). role_claim drives the Headplane
+    # role per login (config role_claim: headplane_role): headplane-admins -> admin,
+    # everyone else -> viewer. Upgrading a person = add to headplane-admins (declarative).
+    # Alice is in headplane-admins (emits admin; he's the sticky owner regardless).
+    access_groups: [headplane-users, headplane-admins]
+    role_claim: { claim: headplane_role, admin_group: headplane-admins, admin_value: admin, member_value: viewer }
+    launch_url: "https://{{ svc_edge_host['headplane'] }}/admin"
+    redirect_uris:
+      - "https://{{ svc_edge_host['headplane'] }}/admin/oidc/callback"
+      # RP-initiated logout target (headplane use_end_session -> Authentik end_session
+      # validates post_logout_redirect_uri against the provider's redirect_uris).
+      - "https://{{ svc_edge_host['headplane'] }}/admin/login"
+  - name: nextcloud
+    display_name: "Nextcloud"
+    client_id: nextcloud
+    client_secret: "{{ vault_authentik_oauth_nextcloud_secret }}"
+    # Access is group-gated (NOT admins-only): only members of nextcloud-users /
+    # nextcloud-admins may reach Nextcloud. admins_only:false removes the
+    # authentik-Admins-only binding, so being an Authentik superuser alone no
+    # longer grants NC access (Alice is in nextcloud-admins, see above).
+    admins_only: false
+    access_groups: [nextcloud-users, nextcloud-admins]
+    # group_map: translate Authentik group -> emitted `groups` claim value.
+    # nextcloud-admins -> `admin` = the literal Nextcloud admin group (so NC admin
+    # is granted by Authentik group membership, without Authentik superuser).
+    # user_oidc provisions these into NC groups on login (see nextcloud_bootstrap;
+    # a whitelist regex keeps unrelated groups like immich-users out of Nextcloud).
+    group_map:
+      nextcloud-admins: admin
+      nextcloud-users: nextcloud-users
+    # Pull extended profile (phone/birthdate/address) from Authentik user
+    # attributes into the Nextcloud profile on login (see nextcloud_bootstrap).
+    profile_attributes: true
+    launch_url: "https://{{ svc_edge_host['nextcloud'] }}/"
+    redirect_uris:
+      - "https://{{ svc_edge_host['nextcloud'] }}/apps/user_oidc/code"
+  - name: pgadmin
+    display_name: "pgAdmin"
+    client_id: pgadmin
+    client_secret: "{{ vault_authentik_oauth_pgadmin_secret }}"
+    # admins_only stays true (default): only Authentik admins can use pgAdmin for
+    # now. When you add more DB users, set admins_only: false here (or bind a group).
+    redirect_uris:
+      - "https://{{ svc_edge_host.get('pgadmin', '') }}/oauth2/authorize"
+
+# Base of Authentik's OIDC endpoints (apps derive authorize/token/userinfo from it).
+authentik_oidc_issuer_base: "https://{{ svc_edge_host['authentik'] }}/application/o"
+
+# === Avatars (declarative profile photos) ===
+# Avatar MODE only (tenant-wide): attributes.picture with initials fallback; the
+# picture also flows as the OIDC `picture` claim -> Nextcloud profile photo.
+# The actual per-user image is declared on the user itself, via
+# authentik_users[].avatar (see above) — one source of truth per person.
+authentik_avatars_mode: "attributes.picture,initials"
+
+# === Bootstrap admin (akadmin), applied on first start only ===
+authentik_bootstrap_email: "akadmin@{{ global_host }}"
+
+# === SMTP (optional; email for password resets / notifications) ===
+# Benign defaults = no outbound mail. Point at a real relay to enable.
+authentik_smtp_host: "localhost"
+authentik_smtp_port: 25
+authentik_smtp_user: ""
+authentik_smtp_use_tls: false
+authentik_smtp_from: "authentik@{{ global_host }}"

@@ -1,0 +1,10 @@
+[Unit]
+Description=PostgreSQL PITR base backup + retention
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pg-pitr-backup
+Nice=15
+IOSchedulingClass=idle

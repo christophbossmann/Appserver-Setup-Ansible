@@ -1,11 +1,13 @@
 # Caddy route for this stack — loaded explicitly by the caddy role.
-# basic_auth hash lives in group_vars/all/vault.yml (generate a new one with
-# `caddy hash-password`).
+#
+# SSO PILOT: this route is protected by Authentik forward-auth (the server's
+# embedded outpost) instead of basic_auth. It needs a matching Proxy Provider +
+# Application for playwright.<internal_host> configured in Authentik and assigned
+# to the embedded outpost. To fall back to basic_auth, drop caddy_forward_auth
+# and restore the basic_auth block (plaintext: vault_basicauth_playwright, bcrypt at render).
 caddy_route_playwright_mcp:
   name: playwright-mcp
+  depends_service: playwright_mcp   # stack dir name (underscore) — intent-aware post-check
   hostname_label: playwright
   caddy_upstream: "127.0.0.1:6080"
-  caddy_extra: |
-    basic_auth {
-      admin {{ vault_basicauth_hash_playwright }}
-    }
+  caddy_forward_auth: true

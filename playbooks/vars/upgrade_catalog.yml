@@ -1,0 +1,120 @@
+---
+# Catalog of everything that can be upgraded with one of the upgrade playbooks — the single
+# place that says HOW each service is upgraded. Used by
+#   - playbooks/stack-upgrade.yml         (the generic playbook reads its entry from here)
+#   - playbooks/tasks/adopt_host_versions.yml / record_version.yml (version reconciliation)
+#   - roles/local_upgrade                 (renders it for the on-host trigger + the confirm page)
+#
+# Per service:
+#   playbook   which playbook upgrades it
+#   arg        the -e variable that playbook takes the target version in
+#   images     image repositories the service runs (maps a row of the "Update overview per
+#              image" dashboard to the service; the first one names the version)
+#   var        the Ansible variable that holds the version (or the whole image reference)
+#   value      how `var` is built from a version tag (default: the tag itself)
+#   file       group_vars/all/<file> of the PRIVATE config the version is persisted to
+#   --- only for playbook: stack-upgrade.yml ---
+#   stack      compose_stack name to redeploy            } exactly one of the two
+#   role       role to re-run (monitoring)               }
+#   containers containers that must be running the new image afterwards
+#   state_paths host dirs holding file-based state (sqlite …): the containers are stopped
+#              and the dirs copied (reflink) before the upgrade and put back on a rollback.
+#              Not for postgres-backed apps — those have their own playbook with PITR.
+upgrade_catalog:
+  # --- database-backed: dedicated playbooks with PITR anchor + automatic rollback ---------
+  immich:
+    playbook: immich-upgrade.yml
+    arg: immich_upgrade_version
+    images: [ghcr.io/immich-app/immich-server, ghcr.io/immich-app/immich-machine-learning]
+    var: immich_version
+    file: immich.yml
+  nextcloud:
+    playbook: nextcloud-upgrade.yml
+    arg: nextcloud_upgrade_version
+    images: [nextcloud]
+    var: nextcloud_version
+    file: nextcloud.yml
+  authentik:
+    playbook: authentik-upgrade.yml
+    arg: authentik_upgrade_version
+    images: [ghcr.io/goauthentik/server, ghcr.io/goauthentik/ldap]
+    var: authentik_version
+    file: authentik.yml
+
+  # --- no database of their own: the generic playbook (new image -> verify -> old image) ---
+  grafana:
+    playbook: stack-upgrade.yml
+    images: [grafana/grafana]
+    var: grafana_version
+    file: monitoring.yml
+    role: monitoring
+    containers: [grafana]
+  prometheus:
+    playbook: stack-upgrade.yml
+    images: [prom/prometheus]
+    var: prometheus_version
+    file: monitoring.yml
+    role: monitoring
+    containers: [prometheus]
+  node_exporter:
+    playbook: stack-upgrade.yml
+    images: [prom/node-exporter]
+    var: node_exporter_version
+    file: monitoring.yml
+    role: monitoring
+    containers: [node-exporter]
+  blackbox_exporter:
+    playbook: stack-upgrade.yml
+    images: [prom/blackbox-exporter]
+    var: blackbox_exporter_version
+    file: monitoring.yml
+    role: monitoring
+    containers: [blackbox]
+  postgres_exporter:
+    playbook: stack-upgrade.yml
+    images: [quay.io/prometheuscommunity/postgres-exporter]
+    var: postgres_exporter_version
+    file: monitoring.yml
+    role: monitoring
+    containers: []          # one container per postgres instance (pg-exporter-<name>) — verified by the role's own start
+  cadvisor:
+    playbook: stack-upgrade.yml
+    images: [ghcr.io/google/cadvisor]
+    var: cadvisor_version
+    file: monitoring.yml
+    role: monitoring
+    containers: [cadvisor]
+  dozzle:
+    playbook: stack-upgrade.yml
+    images: [amir20/dozzle]
+    var: dozzle_version
+    file: dozzle.yml
+    stack: dozzle
+    containers: [dozzle]
+  headplane:
+    playbook: stack-upgrade.yml
+    images: [ghcr.io/tale/headplane]
+    var: headplane_image
+    value: "ghcr.io/tale/headplane:{v}"
+    file: headplane.yml
+    stack: headplane
+    containers: [headplane]
+  # --- file-based state: generic playbook + state copy --------------------------------------
+  headscale:
+    playbook: stack-upgrade.yml
+    images: [ghcr.io/juanfont/headscale]
+    var: headscale_image
+    value: "ghcr.io/juanfont/headscale:{v}"
+    file: headscale.yml
+    stack: headscale
+    containers: [headscale]
+    state_paths: ["{{ headscale_data_dir | default('/opt/headscale') }}/data"]   # sqlite db + node keys of the tailnet
+  acme_dns:
+    playbook: stack-upgrade.yml
+    images: [joohoi/acme-dns]
+    var: acme_dns_image
+    value: "joohoi/acme-dns:{v}"
+    file: acme_dns.yml
+    stack: acme_dns
+    containers: [acme-dns]
+    state_paths: ["{{ acme_dns_data_dir | default('/opt/acme_dns') }}/data"]     # sqlite db with the registered ACME accounts

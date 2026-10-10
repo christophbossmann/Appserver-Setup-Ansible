@@ -1,0 +1,176 @@
+---
+# Declarative user PROFILE sync for the humans in authentik_users: groups + attributes
+# (phone/birthdate/address/website) + avatar (attributes.picture -> also the OIDC
+# `picture` claim -> Nextcloud photo). Applied HERE (not in the user blueprint) because
+# a blueprint would REPLACE the whole field on every apply — we want a choice:
+#
+#   default (additive):        declared groups/attributes are ADDED / merged onto the
+#                              live values; nothing already there is removed.
+#   authentik_fullsync=true:   the profile is fully synced to the declaration — groups
+#                              and attributes are set to EXACTLY what is declared
+#                              (+ avatar), so UI-added groups/attrs are removed.
+#                              EXCEPTION: the password is never touched here, and this
+#                              only affects authentik_users (HUMANS). Service accounts
+#                              are managed by the blueprint + authentik_service_accounts
+#                              and are unaffected.
+#
+#   ansible-playbook ... --tags authentik -e authentik_fullsync=true
+#
+# The avatar/attribute picture must live in attributes (data: URI) — the tenant avatar
+# MODE below makes Authentik render it and emit it as the OIDC picture claim.
+
+- name: Set the tenant avatar mode (attributes.picture -> OIDC picture claim)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - authentik-postgres
+      - psql
+      - -U
+      - authentik
+      - -d
+      - authentik
+      - -c
+      - "update authentik_tenants_tenant set avatars = '{{ authentik_avatars_mode }}' where avatars is distinct from '{{ authentik_avatars_mode }}'"
+  register: _ak_tenant_avatars
+  changed_when: "'UPDATE 1' in _ak_tenant_avatars.stdout"
+  when: not ansible_check_mode
+
+# --- avatars: slurp the files and build a username -> data:URI map ------------------
+- name: Read avatar images (base64)
+  ansible.builtin.slurp:
+    src: "{{ authentik_avatar_dir | default(inventory_dir ~ '/avatars') }}/{{ item.avatar }}"   # photos are personal data: private config, never this repo
+  register: _ak_av_files
+  loop: "{{ authentik_users | default([]) | selectattr('avatar', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.avatar }}"
+  delegate_to: localhost
+  become: false
+
+- name: Build username -> avatar data-URI map
+  ansible.builtin.set_fact:
+    _av_map: >-
+      {{ _av_map | default({}) | combine({
+           item.item.username:
+             ('data:' ~ ('image/jpeg' if item.item.avatar is search('\\.jpe?g$') else 'image/png')
+              ~ ';base64,' ~ item.content) }) }}
+  loop: "{{ _ak_av_files.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.username }}"
+  no_log: true
+
+# --- resolve groups (name -> pk) and each declared user ----------------------------
+- name: Fetch all Authentik groups
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ authentik_http_port }}/api/v3/core/groups/?page_size=1000"
+    headers:
+      Authorization: "Bearer {{ vault_authentik_bootstrap_token }}"
+  register: _ak_groups
+  when: not ansible_check_mode
+
+- name: Build group name -> pk map
+  ansible.builtin.set_fact:
+    _grp_map: "{{ _grp_map | default({}) | combine({item.name: item.pk}) }}"
+  loop: "{{ _ak_groups.json.results | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not ansible_check_mode
+
+- name: Resolve each declared user (id + current attributes + current groups)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ authentik_http_port }}/api/v3/core/users/?username={{ item.username }}"
+    headers:
+      Authorization: "Bearer {{ vault_authentik_bootstrap_token }}"
+  register: _ak_user
+  loop: "{{ authentik_users | default([]) }}"
+  loop_control:
+    label: "{{ item.username }}"
+  until: (_ak_user.json.results | default([])) | length > 0
+  retries: 10
+  delay: 3
+  failed_when: false          # tolerant: a not-yet-created user must not abort the run
+  when: not ansible_check_mode
+  no_log: true
+
+# Fullsync selector — same shape as authentik_passwordsync: false | true | "Bob" |
+# "Bob,Carol" (CLI, comma-split) | [Bob, Carol] (yaml). Fullsync then applies
+# ONLY to the selected users; everyone else stays additive.
+- name: Normalize the fullsync selector
+  ansible.builtin.set_fact:
+    _fs_all: "{{ ((authentik_fullsync | default(false)) is boolean) and (authentik_fullsync | default(false) | bool) }}"
+    _fs_users: >-
+      {{ [] if ((authentik_fullsync | default(false)) is boolean)
+         else ((authentik_fullsync.split(',') | map('trim') | select | list) if (authentik_fullsync is string)
+               else (authentik_fullsync | list)) }}
+
+# --- attributes (+ avatar picture): additive merge, or full replace for fullsync users
+- name: Sync user attributes (+ avatar)   {{ '[fullsync=' ~ (_fs_users if not (_fs_all | bool) else 'ALL') ~ ']' }}
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ authentik_http_port }}/api/v3/core/users/{{ _uid }}/"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ vault_authentik_bootstrap_token }}"
+    body_format: json
+    body:
+      attributes: "{{ _desired }}"
+    status_code: [200]
+  vars:
+    _found: "{{ (_ak_user.results[_idx].json.results | default([])) }}"
+    _user: "{{ _found[0] | default({}) }}"
+    _uid: "{{ _user.pk | default('') }}"
+    _cur: "{{ _user.attributes | default({}) }}"
+    _declared: >-
+      {{ (item.attributes | default({})) | combine({'picture': _av_map[item.username]})
+         if (item.username in (_av_map | default({}))) else (item.attributes | default({})) }}
+    _fs: "{{ (_fs_all | bool) or (item.username in _fs_users) }}"
+    _desired: "{{ _declared if (_fs | bool) else (_cur | combine(_declared)) }}"
+  loop: "{{ authentik_users | default([]) }}"
+  loop_control:
+    label: "{{ item.username }}"
+    index_var: _idx
+  when:
+    - not ansible_check_mode
+    - (_found | length) > 0
+    - _desired != _cur
+  changed_when: true      # only runs when _desired != _cur, i.e. a real change
+  no_log: true            # PII (phone/address) + large picture data URI
+
+# --- groups: additive union, or exactly-declared for fullsync users -----------------
+- name: Sync user groups   {{ '[fullsync=' ~ (_fs_users if not (_fs_all | bool) else 'ALL') ~ ']' }}
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ authentik_http_port }}/api/v3/core/users/{{ _uid }}/"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ vault_authentik_bootstrap_token }}"
+    body_format: json
+    body:
+      groups: "{{ _desired_g }}"
+    status_code: [200]
+  vars:
+    _found: "{{ (_ak_user.results[_idx].json.results | default([])) }}"
+    _user: "{{ _found[0] | default({}) }}"
+    _uid: "{{ _user.pk | default('') }}"
+    _cur_g: "{{ _user.groups | default([]) }}"
+    _decl_g: "{{ item.groups | default([]) | select('in', _grp_map | default({})) | map('extract', _grp_map | default({})) | list }}"
+    _fs: "{{ (_fs_all | bool) or (item.username in _fs_users) }}"
+    _desired_g: "{{ _decl_g if (_fs | bool) else ((_cur_g + _decl_g) | unique) }}"
+  loop: "{{ authentik_users | default([]) }}"
+  loop_control:
+    label: "{{ item.username }}"
+    index_var: _idx
+  when:
+    - not ansible_check_mode
+    - (_found | length) > 0
+    - (_desired_g | sort) != (_cur_g | sort)
+  changed_when: true      # only runs when the group set actually differs
+  no_log: true
+
+- name: Warn about declared groups that don't exist (typo?)
+  ansible.builtin.debug:
+    msg: "User {{ item.username }}: declared group(s) not found in Authentik: {{ item.groups | default([]) | reject('in', _grp_map | default({})) | list }}"
+  loop: "{{ authentik_users | default([]) }}"
+  loop_control:
+    label: "{{ item.username }}"
+  when:
+    - not ansible_check_mode
+    - (item.groups | default([]) | reject('in', _grp_map | default({})) | list) | length > 0

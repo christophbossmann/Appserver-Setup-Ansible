@@ -1,0 +1,8 @@
+# Caddy route for Dozzle — internal (tailscale) + Authentik forward-auth.
+# Needs the matching entry in authentik_forward_auth_apps (blueprint creates the
+# proxy provider/application). Access = admins only (no access_groups).
+caddy_route_dozzle:
+  name: dozzle
+  hostname_label: dozzle
+  caddy_upstream: "127.0.0.1:{{ dozzle_port }}"
+  caddy_forward_auth: true

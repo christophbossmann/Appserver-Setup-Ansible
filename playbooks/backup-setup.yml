@@ -1,0 +1,187 @@
+---
+# Guided cloud-backup (rclone remote) setup. Two ways to provide the login:
+#
+#  A) INTERACTIVE, in-playbook (-e rclone_interactive=true): rclone runs the OAuth
+#     on the CONTROLLER; we print the auth URL, you open it + approve, and the play
+#     continues automatically. Needs rclone on this machine. onedrive by default;
+#     override with -e rclone_backend=pcloud etc.
+#
+#  B) FILE (-e rclone_conf_path=~/cloudbackup.conf): paste in a section you made
+#     earlier with `rclone config ; rclone config show cloudbackup > file`.
+#
+# Either way it validates the remote, writes it to <host>, inits the restic repo.
+# The remote MUST be named 'cloudbackup'. Reproducibility: also put the section in
+# vault_rclone_backup_conf + backup_cloud_enabled: true (this play reminds you).
+#
+#   ansible-playbook playbooks/backup-setup.yml --limit <host> -e rclone_interactive=true
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+
+- name: Guided cloud-backup setup
+  hosts: servers
+  become: true
+  gather_facts: false
+  vars:
+    rclone_conf_path: "{{ lookup('env', 'RCLONE_CONF_PATH') | default('', true) }}"
+    rclone_interactive: false
+    rclone_backend: onedrive
+    _authlog: /tmp/rclone-auth-{{ inventory_hostname }}.log
+  tasks:
+    - name: Instructions only (no mode chosen)
+      when:
+        - not (rclone_interactive | bool)
+        - rclone_conf_path | trim | length == 0
+      block:
+        - ansible.builtin.debug:
+            msg:
+              - "Choose ONE:"
+              - "  Interactive:  ansible-playbook … --limit {{ inventory_hostname }} -e rclone_interactive=true"
+              - "  From a file:  rclone config (name it 'cloudbackup') ; rclone config show cloudbackup > ~/cloudbackup.conf"
+              - "                then re-run with -e rclone_conf_path=~/cloudbackup.conf"
+        - ansible.builtin.meta: end_play
+
+    # ---------- A) interactive OAuth on the controller ----------
+    - name: Interactive login
+      when: rclone_interactive | bool
+      delegate_to: localhost
+      become: false
+      block:
+        - name: Require rclone on the controller
+          ansible.builtin.command: rclone version
+          changed_when: false
+
+        - name: Start rclone OAuth in the background (prints URL, does not auto-open)
+          ansible.builtin.shell:
+            cmd: "rclone authorize {{ rclone_backend }} > {{ _authlog }}.out 2> {{ _authlog }}"
+          async: 600
+          poll: 0
+          register: _rclone_job
+          environment:
+            BROWSER: "true"   # /bin/true -> rclone won't launch a browser, only prints the URL
+
+        - name: Wait for the auth URL
+          ansible.builtin.shell: "grep -oiE 'https?://[^[:space:]]+' {{ _authlog }} | head -1"
+          register: _authurl
+          until: _authurl.stdout | length > 0
+          retries: 40
+          delay: 1
+          changed_when: false
+
+        - name: ">>> OPEN THIS URL, log in + approve, then leave it — the play continues automatically"
+          ansible.builtin.debug:
+            msg:
+              - "============================================================"
+              - "Open in your browser and approve access:"
+              - "{{ _authurl.stdout }}"
+              - "Waiting for you to finish… (do not stop the play)"
+              - "============================================================"
+
+        - name: Wait until you have authenticated (rclone finishes on its own)
+          ansible.builtin.async_status:
+            jid: "{{ _rclone_job.ansible_job_id }}"
+          register: _rclone_done
+          until: _rclone_done.finished
+          retries: 120
+          delay: 5
+
+        - name: Read the token rclone produced
+          ansible.builtin.slurp:
+            src: "{{ _authlog }}.out"
+          register: _token_raw
+
+        - name: Create the 'cloudbackup' remote from the token
+          ansible.builtin.command:
+            argv:
+              - rclone
+              - config
+              - create
+              - cloudbackup
+              - "{{ rclone_backend }}"
+              - token
+              - "{{ (_token_raw.content | b64decode) | regex_search('\\{.*\\}', multiline=True) }}"
+              - drive_type
+              - personal
+          changed_when: true
+
+        - name: Verify the remote works
+          ansible.builtin.command: "rclone lsd cloudbackup:"
+          register: _lsd
+          changed_when: false
+          failed_when: false
+
+        - name: Fail clearly if the remote is not usable (e.g. drive selection needed)
+          ansible.builtin.assert:
+            that: _lsd.rc == 0
+            fail_msg: >-
+              rclone could not use 'cloudbackup:' non-interactively (rc={{ _lsd.rc }}).
+              This backend likely needs an interactive drive choice. Use the wrapper
+              instead: scripts/cloud-backup-login.sh {{ inventory_hostname }}
+
+        - name: Export the finished section
+          ansible.builtin.command: rclone config show cloudbackup
+          register: _cfg_show
+          changed_when: false
+
+    # ---------- B) from a file ----------
+    - name: Read the rclone config from a file
+      ansible.builtin.slurp:
+        src: "{{ rclone_conf_path }}"
+      register: _cfg_file
+      delegate_to: localhost
+      become: false
+      when:
+        - not (rclone_interactive | bool)
+        - rclone_conf_path | trim | length > 0
+
+    - name: Settle on the config content
+      ansible.builtin.set_fact:
+        _cloudbackup_conf: "{{ _cfg_show.stdout if (rclone_interactive | bool) else (_cfg_file.content | b64decode) }}"
+
+    - name: Sanity-check the [cloudbackup] section
+      ansible.builtin.assert:
+        that: "'[cloudbackup]' in _cloudbackup_conf"
+        fail_msg: "No [cloudbackup] section — the remote must be named exactly 'cloudbackup'."
+
+    # ---------- common: push to the server + init restic ----------
+    - name: Deploy backup tooling/scripts (no repo init yet)
+      ansible.builtin.import_role:
+        name: backup_restic
+      vars:
+        backup_cloud_enabled: false
+
+    - name: Write the rclone remote onto the server
+      ansible.builtin.copy:
+        content: "{{ _cloudbackup_conf }}"
+        dest: /root/.config/rclone/rclone.conf
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Verify the remote from the server
+      ansible.builtin.shell: |
+        set -a; . /etc/restic/env; set +a
+        rclone lsd cloudbackup: >/dev/null 2>&1 && echo OK || echo FAIL
+      args: { executable: /bin/bash }
+      register: _srv_test
+      changed_when: false
+
+    - name: Fail if unreachable from the server
+      ansible.builtin.assert:
+        that: "'OK' in _srv_test.stdout"
+        fail_msg: "rclone can't reach 'cloudbackup:' from the server — token wrong/expired?"
+
+    - name: Initialize the restic repository
+      ansible.builtin.shell: |
+        set -a; . /etc/restic/env; set +a
+        restic snapshots >/dev/null 2>&1 || restic init
+      args: { executable: /bin/bash }
+      register: _restic_init
+      changed_when: "'created restic repository' in (_restic_init.stdout + _restic_init.stderr)"
+
+    - name: Success
+      ansible.builtin.debug:
+        msg:
+          - "✅ 'cloudbackup' works, restic repo ready on {{ inventory_hostname }}."
+          - "Make it permanent: paste this section into vault_rclone_backup_conf and"
+          - "set backup_cloud_enabled: true, then --tags backup. Run now: systemctl start backup-restic.service"

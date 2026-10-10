@@ -1,0 +1,148 @@
+---
+# Reusable PITR restore steps for ONE postgres instance (whole cluster -> target time).
+# Included by playbooks/postgres-pitr-restore.yml (manual, with a YES guard) AND by the
+# upgrade playbooks' rescue block (automatic rollback). The CALLER guarantees the inputs:
+#   pitr_instance      name from postgres_pitr_instances
+#   pitr_target_time   'YYYY-MM-DD HH:MM:SS+00'
+#   pitr_keep_old      keep the pre-restore data dir (default: false -> delete once verified)
+#   pitr_base          specific base backup dir (default: newest taken before the target)
+# Requires become: true at play level. A NEW timeline starts after recovery — the caller
+# should take a fresh base backup afterwards (/usr/local/bin/pg-pitr-backup <name>).
+- name: Resolve the instance
+  ansible.builtin.set_fact:
+    _inst: "{{ postgres_pitr_instances | selectattr('name', 'equalto', pitr_instance) | first }}"
+
+- name: Inspect the container for its data dir on the host
+  ansible.builtin.command: "docker inspect {{ _inst.container }}"
+  register: _insp
+  changed_when: false
+
+- name: Resolve data dir
+  ansible.builtin.set_fact:
+    _datadir: "{{ (_insp.stdout | from_json)[0].Mounts | selectattr('Destination', 'equalto', '/var/lib/postgresql/data') | map(attribute='Source') | first }}"
+
+- name: Pick the base backup (newest taken before the target, unless pitr_base given)
+  ansible.builtin.shell: |
+    set -e
+    if [ -n "{{ pitr_base | default('') }}" ]; then echo "{{ pitr_base | default('') }}"; exit 0; fi
+    TGT=$(date -u -d "{{ pitr_target_time }}" +%Y%m%d-%H%M%S)
+    PICK=$(ls -1 "{{ _inst.host_archive }}/base" | sort | awk -v t="$TGT" '$0 <= t' | tail -1)
+    [ -z "$PICK" ] && PICK=$(ls -1 "{{ _inst.host_archive }}/base" | sort | head -1)
+    echo "$PICK"
+  register: _base_pick
+  changed_when: false
+
+- name: Plan
+  ansible.builtin.debug:
+    msg: >-
+      Restoring {{ _inst.container }} (data dir {{ _datadir }}) from base backup
+      {{ _base_pick.stdout | trim }} up to {{ pitr_target_time }}. Current data dir
+      will be moved to {{ _datadir }}-pre-pitr-*.
+
+- name: Stop the container
+  ansible.builtin.command: "docker stop {{ _inst.container }}"
+  changed_when: true
+
+- name: Move the current data dir aside (kept only until the restore is verified)
+  ansible.builtin.shell: |
+    set -e
+    OLD="{{ _datadir }}-pre-pitr-$(date +%Y%m%d-%H%M%S)"
+    mv "{{ _datadir }}" "$OLD"
+    mkdir -p "{{ _datadir }}"
+    echo "$OLD"
+  register: _oldmove
+  changed_when: true
+
+- name: Extract the base backup + its WAL into the fresh data dir (ownership preserved)
+  ansible.builtin.shell: |
+    set -e
+    B="{{ _inst.host_archive }}/base/{{ _base_pick.stdout | trim }}"
+    tar -xzf "$B/base.tar.gz"  -C "{{ _datadir }}"
+    mkdir -p "{{ _datadir }}/pg_wal"
+    tar -xzf "$B/pg_wal.tar.gz" -C "{{ _datadir }}/pg_wal"
+  changed_when: true
+
+# Standard PITR step (PostgreSQL docs, "Recovering Using a Continuous Archive Backup"):
+# copy the UNARCHIVED WAL from the old cluster's pg_wal into the new one. With a long
+# archive_timeout the newest changes sit in the current, not-yet-archived segment — without
+# this a "5 minutes ago" target would silently stop at the last archived segment. Recovery
+# reads pg_wal before restore_command, and stops at recovery_target_time anyway. -n: never
+# overwrite what the base backup brought. Works for a crashed instance too.
+- name: Carry over unarchived WAL from the old data dir
+  ansible.builtin.shell: |
+    set -e
+    OLD="{{ _oldmove.stdout | trim }}/pg_wal"
+    [ -d "$OLD" ] || { echo "no old pg_wal"; exit 0; }
+    n=0
+    for f in "$OLD"/*; do
+      b=$(basename "$f")
+      case "$b" in
+        [0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]|*.history)
+          [ -e "{{ _datadir }}/pg_wal/$b" ] || { cp -p "$f" "{{ _datadir }}/pg_wal/$b"; n=$((n+1)); } ;;
+      esac
+    done
+    echo "carried over $n WAL file(s)"
+  register: _walcarry
+  changed_when: "'carried over 0' not in _walcarry.stdout"
+
+# restore_command handles BOTH archive formats: gzip'd segments (<name>.gz, current
+# archive_command) and plain ones (archived before compression was introduced). A missing
+# file makes cp fail -> non-zero exit, which postgres expects when it probes for e.g.
+# timeline .history files. For a MANUAL PITR use this same restore_command.
+- name: Append recovery settings to postgresql.auto.conf (keep base-backup settings)
+  ansible.builtin.blockinfile:
+    path: "{{ _datadir }}/postgresql.auto.conf"
+    marker: "# {mark} PITR restore (pitr_restore.yml)"
+    block: |
+      restore_command = 'if [ -f /archive/wal/%f.gz ]; then gzip -dc /archive/wal/%f.gz > %p; else cp /archive/wal/%f %p; fi'
+      recovery_target_time = '{{ pitr_target_time }}'
+      recovery_target_action = '{{ pitr_target_action | default("promote") }}'
+
+- name: Signal archive recovery + fix ownership/mode of the data dir
+  ansible.builtin.shell: |
+    set -e
+    D="{{ _datadir }}"
+    touch "$D/recovery.signal"
+    OWN=$(stat -c %u:%g "$D/PG_VERSION")
+    chown -R "$OWN" "$D"
+    chmod 700 "$D"
+  changed_when: true
+
+- name: Start the container (postgres replays WAL to the target, then promotes)
+  ansible.builtin.command: "docker start {{ _inst.container }}"
+  changed_when: true
+
+- name: Wait for the instance to accept connections
+  ansible.builtin.command:
+    argv: [docker, exec, "{{ _inst.container }}", pg_isready, -U, "{{ _inst.user }}"]
+  register: _ready
+  until: _ready.rc == 0
+  retries: 60
+  delay: 5
+  changed_when: false
+
+- name: Wait until recovery is DONE (promoted out of recovery to the target)
+  ansible.builtin.command:
+    argv: [docker, exec, "{{ _inst.container }}", psql, -U, "{{ _inst.user }}", -tAc, "SELECT pg_is_in_recovery()"]
+  register: _inrec
+  until: (_inrec.stdout | default('t') | trim) == 'f'
+  retries: 60
+  delay: 5
+  changed_when: false
+
+- name: Remove the pre-restore data dir (restore verified OK)
+  ansible.builtin.file:
+    path: "{{ _oldmove.stdout | trim }}"
+    state: absent
+  when: not (pitr_keep_old | default(false) | bool)
+
+- name: Take a fresh base backup on the new timeline (PITR anchor for future restores)
+  ansible.builtin.command: "/usr/local/bin/pg-pitr-backup {{ _inst.name }}"
+  changed_when: true
+
+- name: Restore done
+  ansible.builtin.debug:
+    msg: >-
+      PITR restore complete — {{ _inst.container }} recovered to {{ pitr_target_time }}.
+      {{ 'Pre-restore data dir kept at ' ~ (_oldmove.stdout | trim) if (pitr_keep_old | default(false) | bool) else 'Pre-restore data dir removed.' }}
+      A fresh base backup was taken on the new timeline.

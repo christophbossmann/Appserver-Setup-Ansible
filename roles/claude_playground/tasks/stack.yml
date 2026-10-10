@@ -81,7 +81,51 @@
     group: "{{ playground_ctl_user }}"
     mode: "0664"
 
+# Seed /workspace/supabase (config, example RLS migration, scripts, README) so the
+# agent can manage schema migrations against the dev Supabase. Idempotent, never
+# overwrites agent-edited files.
+- name: Scaffold the supabase project in the workspace
+  ansible.builtin.import_tasks: supabase_scaffold.yml
+  when: playground_supabase_enabled | default(false) | bool
+
 # --- Compose stack -----------------------------------------------------------
+# Isolated network shared only with playwright-mcp, so the AI runtime can use the
+# Playwright MCP endpoint WITHOUT joining backend (no path to postgres/n8n/…).
+# Created here too (not only by the playwright_mcp stack) so a playground-only
+# run still has it before claude-ctl's compose references it as external.
+- name: Ensure the playground-mcp network exists (claude-ctl <-> playwright-mcp)
+  ansible.builtin.command: docker network create playground-mcp
+  register: _pg_mcp_net
+  changed_when: _pg_mcp_net.rc == 0
+  failed_when: false   # rc != 0 -> already exists
+  when:
+    - playground_playwright_mcp_enabled | default(true)
+    - not ansible_check_mode
+
+# The compose references the supabase network as external -> it must already exist
+# (the supabase stack creates it). Fail early with a clear message instead of a
+# cryptic compose error.
+- name: Check the supabase network exists (claude-ctl joins it for direct DB access)
+  ansible.builtin.command: "docker network inspect {{ playground_supabase_network }}"
+  register: _supa_net
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when:
+    - playground_supabase_db_direct | default(false) | bool
+    - not ansible_check_mode
+
+- name: Fail early if the supabase network is missing
+  ansible.builtin.fail:
+    msg: >-
+      playground_supabase_db_direct=true but docker network
+      '{{ playground_supabase_network }}' does not exist. Deploy the supabase stack
+      first (it creates that network), or set playground_supabase_db_direct: false.
+  when:
+    - playground_supabase_db_direct | default(false) | bool
+    - not ansible_check_mode
+    - _supa_net.rc != 0
+
 - name: Render docker-compose (rootless / no helper, no host docker.sock)
   ansible.builtin.template:
     src: docker-compose.yml.j2
@@ -99,6 +143,37 @@
   register: _compose_up
   changed_when: "_compose_up.stderr is search('Started|Creating|Created|Recreating|Recreated|Built')"
   when: not ansible_check_mode
+
+# --- Verify the supabase agent wiring (acceptance criteria) ------------------
+# Runs inside claude-ctl: tooling present, all SUPABASE_* vars set, and the direct
+# DB connection actually works (DDL-capable). Prints no secret values (only presence
+# checks + `select 1`). Retries: the container was just (re)built/started.
+- name: Verify supabase agent tooling + env + DB reachability (inside claude-ctl)
+  ansible.builtin.command:
+    cmd: >-
+      docker exec claude-ctl bash -lc '
+        supabase --version >/dev/null && echo "supabase: ok";
+        psql --version >/dev/null && echo "psql: ok";
+        : "${SUPABASE_SERVICE_ROLE_KEY:?service_role missing}" "${SUPABASE_DB_URL:?db_url missing}" && echo "env: ok";
+        psql "$SUPABASE_DB_URL" -tAc "select 1" >/dev/null && echo "db: ok"'
+  register: _supa_verify
+  changed_when: false
+  failed_when: _supa_verify.rc != 0
+  retries: 6
+  delay: 5
+  until: _supa_verify.rc == 0
+  when:
+    - playground_supabase_enabled | default(false) | bool
+    - playground_supabase_db_direct | default(false) | bool
+    - not ansible_check_mode
+
+- name: Supabase agent verification result
+  ansible.builtin.debug:
+    msg: "{{ _supa_verify.stdout_lines | default(['(skipped)']) }}"
+  when:
+    - playground_supabase_enabled | default(false) | bool
+    - playground_supabase_db_direct | default(false) | bool
+    - not ansible_check_mode
 
 # --- Optional: force a fresh login (drops stored credentials) ----------------
 # The confirmation pause runs FIRST and doubles as the interactivity guard:

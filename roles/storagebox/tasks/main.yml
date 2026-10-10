@@ -1,0 +1,198 @@
+---
+# Mount the Storage Box via rclone (SFTP) as a systemd service. No-op unless
+# storagebox_enabled=true on this host. See defaults/main.yml for the rationale.
+- name: Storage Box mount
+  when: storagebox_enabled | bool
+  block:
+    - name: Assert Storage Box connection is configured
+      ansible.builtin.assert:
+        that:
+          - storagebox_host | length > 0
+          - storagebox_user | length > 0
+          - storagebox_ssh_private_key | length > 0
+        fail_msg: >-
+          storagebox_enabled=true but storagebox_host/user or the SSH key
+          (vault_storagebox_ssh_private_key) is missing. Set them in host_vars/vault.
+        quiet: true
+
+    - name: Install FUSE (+ distro rclone when no upstream version is pinned)
+      ansible.builtin.apt:
+        name: "{{ ['fuse3'] + ([] if storagebox_rclone_version | length > 0 else ['rclone']) }}"
+        state: present
+        update_cache: true
+
+    - name: Install pinned upstream rclone
+      when: storagebox_rclone_version | length > 0
+      block:
+        - name: Read installed rclone version
+          ansible.builtin.shell: "rclone version 2>/dev/null | head -1 || true"
+          register: _sb_rclone_ver
+          changed_when: false
+          check_mode: false
+
+        - name: Read dpkg architecture (facts may not be gathered)
+          ansible.builtin.command: dpkg --print-architecture
+          register: _sb_arch
+          changed_when: false
+          check_mode: false
+
+        # dpkg directly (not apt deb=): the upstream .deb has no dependencies, and this
+        # keeps the install working even when apt's resolver is wedged by an unrelated
+        # half-installed package.
+        - name: Download + install rclone v{{ storagebox_rclone_version }}
+          when: ('v' ~ storagebox_rclone_version) not in _sb_rclone_ver.stdout.split()
+          block:
+            - name: Download rclone .deb
+              ansible.builtin.get_url:
+                url: "https://downloads.rclone.org/v{{ storagebox_rclone_version }}/rclone-v{{ storagebox_rclone_version }}-linux-{{ _sb_arch.stdout | trim }}.deb"
+                dest: /tmp/rclone-upstream.deb
+                mode: "0644"
+
+            - name: Install rclone .deb
+              ansible.builtin.command: dpkg -i /tmp/rclone-upstream.deb
+              notify: Restart storagebox mount
+
+            - name: Remove downloaded .deb
+              ansible.builtin.file:
+                path: /tmp/rclone-upstream.deb
+                state: absent
+
+    # One-time move of the VFS cache to storagebox_cache_dir. The cache can hold files NOT
+    # yet uploaded to the box ("Dirty" in vfsMeta) — so it is MOVED, never just deleted:
+    # stop the containers using the mount, stop rclone (nothing writes the cache any
+    # more), copy with reflinks (same btrfs fs: instant, no extra space), drop the old
+    # dir. The unit update below restarts rclone on the new path; it re-uploads anything
+    # dirty. The stopped containers are started again after the mount is verified.
+    - name: Move the VFS cache from a legacy location (one-time)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NEW='{{ storagebox_cache_dir }}'
+        moved=0
+        for OLD in {{ storagebox_cache_legacy_dirs | default([]) | map('quote') | join(' ') }}; do
+          [ "$OLD" != "$NEW" ] && [ -d "$OLD" ] || continue
+          if [ "$moved" = 0 ]; then
+            docker ps --format '{{ "{{.Names}}" }}' | grep -xE '{{ storagebox_dependent_containers | join("|") }}' > /run/storagebox-stopped-containers || true
+            [ -s /run/storagebox-stopped-containers ] && xargs -r docker stop < /run/storagebox-stopped-containers >/dev/null
+            systemctl stop {{ storagebox_service_name }}.service
+          fi
+          mkdir -p "$NEW"
+          cp -a --reflink=auto "$OLD"/. "$NEW"/
+          rm -rf "$OLD"
+          moved=1
+          echo "CHANGED moved $OLD -> $NEW"
+        done
+        [ "$moved" = 1 ] || echo "OK nothing to move"
+      args:
+        executable: /bin/bash
+      register: _sb_cache_move
+      changed_when: "'CHANGED' in _sb_cache_move.stdout"
+      notify: Restart storagebox mount
+
+    - name: Ensure the VFS cache directory exists (on disk, not tmpfs)
+      ansible.builtin.file:
+        path: "{{ storagebox_cache_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    # rclone --allow-other (so the immich container's uid can read the mount) needs this.
+    - name: Allow non-root access to FUSE mounts (user_allow_other)
+      ansible.builtin.lineinfile:
+        path: /etc/fuse.conf
+        regexp: '^#?\s*user_allow_other'
+        line: user_allow_other
+        state: present
+      notify: Restart storagebox mount
+
+    - name: Ensure rclone config directory exists
+      ansible.builtin.file:
+        path: "{{ storagebox_config_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install the Storage Box SSH private key
+      ansible.builtin.copy:
+        content: "{{ storagebox_ssh_private_key }}"
+        dest: "{{ storagebox_key_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      notify: Restart storagebox mount
+
+    - name: Deploy the rclone config for the Storage Box
+      ansible.builtin.template:
+        src: storagebox.conf.j2
+        dest: "{{ storagebox_config_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart storagebox mount
+
+    - name: Ensure the mountpoint exists
+      ansible.builtin.file:
+        path: "{{ storagebox_mountpoint }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy the rclone mount systemd unit
+      ansible.builtin.template:
+        src: storagebox-mount.service.j2
+        dest: "/etc/systemd/system/{{ storagebox_service_name }}.service"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart storagebox mount
+
+    - name: Enable and start the Storage Box mount
+      ansible.builtin.systemd:
+        name: "{{ storagebox_service_name }}.service"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # Apply a pending restart NOW so the checks below run against the live mount.
+    - name: Flush handlers to (re)start the mount before verifying
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait until the Storage Box is mounted
+      ansible.builtin.command: "mountpoint -q {{ storagebox_mountpoint }}"
+      register: _sb_mounted
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: _sb_mounted.rc == 0
+
+    - name: Start the containers stopped for the cache move (after the mount is back)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if [ -s /run/storagebox-stopped-containers ]; then
+          xargs -r docker start < /run/storagebox-stopped-containers >/dev/null
+          echo "CHANGED started $(tr '\n' ' ' < /run/storagebox-stopped-containers)"
+        fi
+        rm -f /run/storagebox-stopped-containers
+      args:
+        executable: /bin/bash
+      register: _sb_restart_ctr
+      changed_when: "'CHANGED' in _sb_restart_ctr.stdout"
+      when: _sb_cache_move is changed
+
+    - name: Ensure the host root path exists on the box
+      ansible.builtin.file:
+        path: "{{ storagebox_mountpoint }}/{{ storagebox_root_path }}"
+        state: directory
+        mode: "0755"
+      when: (storagebox_root_path | default('') | length) > 0
+
+    - name: Ensure declared directories exist on the box
+      ansible.builtin.file:
+        path: "{{ storagebox_mountpoint }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ storagebox_ensure_dirs | default([]) }}"
+      when: (storagebox_ensure_dirs | default([]) | length) > 0

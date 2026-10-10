@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Open a psql shell (or run a one-off: ./scripts/db-psql -c 'select 1') against the
+# remote dev DB. Uses the DDL-capable SUPABASE_DB_URL.
+set -euo pipefail
+: "${SUPABASE_DB_URL:?SUPABASE_DB_URL is not set (server/CLI-only var)}"
+exec psql "$SUPABASE_DB_URL" "$@"

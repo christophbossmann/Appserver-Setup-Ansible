@@ -1,0 +1,123 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/headscale.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# =============================================================================
+# Headscale — self-hosted Tailscale control server (PER HOST, isolated tailnet).
+#
+# Deployed as a compose_stack; ENABLE per host by adding to host_vars:
+#     caddy_services: { ..., headscale: external }
+# and the role line in playbooks/server-all.yml (tags: [headscale]).
+#
+# Official Tailscale CLIENTS point at this control server instead of the
+# Tailscale cloud:
+#     tailscale up --login-server https://headscale.<global_host> --authkey <key>
+#
+# Model here: ONE headscale per host = one ISOLATED tailnet per server. Runs in
+# PARALLEL to the existing Tailscale (Tailscale cloud stays untouched); a host
+# migrates its OWN tailscaled from the cloud to its headscale only at cutover.
+# =============================================================================
+
+# Pin to a stable release (schema is version-sensitive — config.yaml.j2 matches).
+headscale_image: "ghcr.io/juanfont/headscale:v0.29.4"
+
+# Host LOOPBACK port Caddy proxies to (container listens on 8080 internally).
+# Kept off common ports to avoid collisions; Caddy fronts it publicly on 443.
+headscale_port: 8099
+
+# Public URL of THIS host's headscale — MUST equal the Caddy route hostname and
+# be baked into every client's --login-server (so keep it stable).
+headscale_server_url: "https://{{ svc_edge_host['headscale'] }}"
+
+# --- IP ranges: DISTINCT from Tailscale so the two overlays NEVER collide -----
+# Tailscale (cloud) uses the defaults 100.64.0.0/10 + fd7a:115c:a1e0::/48. We
+# carve headscale into the TOP EDGE of CGNAT so the address spaces stay cleanly
+# apart in practice (Tailscale assigns randomly across the whole /10 → a sub-range
+# is "practically", not "hard", separated — but in the one-tailscaled-per-host
+# model a machine is only ever on ONE tailnet at a time, so it never matters).
+#
+# PER-HOST + DISTINCT: each host runs its OWN headscale controller = its own
+# ISOLATED tailnet. Give every host a DISTINCT, non-overlapping range in
+# host_vars/<host>.yml so a later CROSS-JOIN (one server temporarily joining
+# another's tailnet for server<->server access = dual-membership) stays
+# conflict-free. Convention (top edge of CGNAT, /20 each):
+#     dev  (myserver) -> 100.126.0.0/20
+#     prod                        -> 100.127.0.0/20   (reserved)
+# CHANGE ONLY BEFORE the first node enrols on that host (re-IP = re-enrol all nodes).
+headscale_ipv4_prefix: "100.126.0.0/20"        # default; 100.126.0.0–100.126.15.255 (4096), top edge of CGNAT, avoids 100.100.100.100
+headscale_ipv6_prefix: "fd7a:115c:a1e1::/48"   # own ULA (Tailscale uses ...a1e0::/48); also per-host overridable
+
+# --- MagicDNS ----------------------------------------------------------------
+headscale_magic_dns: true
+# base_domain MUST differ from the server_url host (headscale rejects a parent).
+headscale_dns_base_domain: "hs.internal"
+# Do NOT hijack clients' resolver — only the base_domain resolves via headscale,
+# everything else stays on the client's own DNS.
+headscale_dns_override_local: false
+headscale_dns_nameservers:
+  - "1.1.1.1"
+  - "9.9.9.9"
+
+# --- SELF-HOSTED internal DNS (DYNAMIC, auto-derived) -------------------------
+# Headscale extra_records are EXACT names only — NO wildcard (verified 2026-09-26:
+# the Tailscale client resolver behind 100.100.100.100 matches ExtraRecords by
+# exact host name; "*.int..." falls through to the forwarder). So rather than a
+# static, drift-prone list, roles/headscale_int_dns DERIVES one record per active
+# INTERNAL service (caddy_services: internal) from the SAME source Caddy uses
+# (caddy_route_<svc>.hostname_label + internal_host), pointed at THIS host's own
+# headscale IP. It runs just before the headscale stack and OVERRIDES this default
+# via set_fact. Result: the .int names track caddy_services automatically and the
+# names can be dropped from public DNS. Records stay EMPTY until the host is
+# actually cut over (its tailnet IP inside headscale_ipv4_prefix). When dev later
+# joins prod's net (2nd adapter) it gets prod's MagicDNS + prod's own records.
+headscale_dns_records_auto: true    # false -> skip the role, hand-manage the list below (host_vars)
+headscale_dns_extra_records: []     # auto-filled by roles/headscale_int_dns unless _auto is false
+
+# DERP relays: reuse Tailscale's PUBLIC relay map (no self-hosted DERP needed).
+headscale_derp_urls:
+  - "https://controlplane.tailscale.com/derpmap/default"
+
+# Persistent data on the host (sqlite db, noise key, config).
+headscale_data_dir: /opt/headscale
+
+# Reverse-proxy trust: Caddy (host systemd) reaches the container via the docker
+# bridge gateway, so trust loopback + the docker private range for X-Forwarded-*.
+headscale_trusted_proxies:
+  - "127.0.0.1/32"
+  - "172.16.0.0/12"
+
+# --- Declarative provisioning (roles/headscale_bootstrap) ---------------------
+# Users to create. Per user, a REUSABLE pre-auth key is created ONCE and cached
+# on the controller under headscale_keys_dir (create-if-no-cached-file → re-runs
+# never spam new keys). A headplane API key is created + cached the same way.
+headscale_users:
+  # Service account owning INFRASTRUCTURE nodes (this host itself, when it enrols
+  # as a client of its own Headscale). Independent of any person — never logs into
+  # Headplane, so no email. Enrol the server with THIS user's pre-auth key
+  # (headscale_server_enrol_user below).
+  - server
+  # People — own their client devices; get an email so Headplane auto-links their
+  # Authentik SSO identity (see headscale_user_emails).
+  - alice
+  - bob
+  - carol
+
+# Which user's pre-auth key the SERVER uses to enrol itself into its own Headscale
+# (the node then belongs to this service account, not a person).
+headscale_server_enrol_user: server
+
+# Per-user email — set on `users create` so HEADPLANE auto-links the SSO (Authentik)
+# identity to the matching Headscale user (Headplane matches by email; without it
+# the admin has to pick the user manually on first login). MUST equal the user's
+# Authentik email. Only applied at CREATE time (headscale has no CLI to update an
+# existing user's email). Service accounts (server) get no email.
+headscale_user_emails:
+  alice: "admin@example.com"
+  bob: "bob@example.com"
+  carol: "carol@example.com"
+
+# Controller-side store for the exported keys (like the tailscale state).
+headscale_keys_dir: "~/.ansible/headscale-keys"
+# Reusable pre-auth key lifetime (long — family enrolment convenience).
+headscale_preauthkey_expiration: "8760h"     # 1 year
+# headplane API key lifetime.
+headscale_apikey_expiration: "8760h"         # 1 year

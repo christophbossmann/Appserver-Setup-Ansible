@@ -1,0 +1,158 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/immich.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# Immich (photo/video library) stack defaults — stacks/immich/.
+# Uses the SHARED postgres instance (stacks/postgres); its image includes the
+# VectorChord extension Immich requires (see group_vars/all/postgres.yml).
+# Releases: https://github.com/immich-app/immich/releases — Immich moves fast
+# and migrations are one-way; read the release notes before bumping.
+immich_version: "v3.0.2"
+immich_image: "ghcr.io/immich-app/immich-server:{{ immich_version }}"
+immich_ml_image: "ghcr.io/immich-app/immich-machine-learning:{{ immich_version }}"
+# RAM cap for the machine-learning container (Docker mem_limit). ML is idle most of the time
+# but spikes when it loads models (face recognition / CLIP). Capping it protects a small host
+# (e.g. 8GB): a runaway ML gets OOM-killed + auto-restarted instead of pressuring the whole
+# box. If ML restarts mid-processing, raise this. Empty = no limit (default on big hosts).
+immich_ml_mem_limit: "1.5g"
+# RAM guarantee for immich-server (cgroup v2 memory.low via Docker mem_reservation): the kernel
+# reclaims/swaps OTHER containers first, so Immich's Node heap stays resident — swapped-out
+# heap pages stalled the event loop (GC / first request after idle) long enough to drop the
+# web UI's websocket. roles/immich_prep also sets system.slice MemoryLow to this value; without
+# it the container's protection is capped at the parent's (0) and does nothing. Empty = off.
+immich_server_mem_reservation: "2g"
+# Hard cap for immich-server. Required for immich_server_swap=false (Docker can only zero a
+# container's swap via memswap_limit == mem_limit). Normal use is ~0.7g; bump if immich-server
+# gets OOM-killed during big imports/thumbnail runs.
+immich_server_mem_limit: "3g"
+# false = immich-server may not swap at all (memory.swap.max=0). Needs immich_server_mem_limit.
+immich_server_swap: false
+# Prometheus metrics (job queues, API, DB) on container ports 8081/8082 for the Immich
+# Grafana dashboard (roles/monitoring scrapes them over the backend network).
+immich_telemetry_enabled: true
+# Video codecs Immich plays as-is (no transcoded copy in encoded-video/). Immich's default
+# is h264 only — every HEVC phone video and motion-photo clip got a second H.264 copy
+# (~7.5 GB on PROD) and a full CPU transcode on this 4-vCPU vServer. hevc plays natively in
+# the Immich apps, Safari and Chrome/Edge (hardware decode); Firefox/Linux may not.
+# Copies that are no longer needed are removed by Immich's "Transcode Videos -> All" job.
+immich_accepted_video_codecs: [h264, hevc]
+# Pinned like the official release compose (valkey 9).
+immich_redis_image: "docker.io/valkey/valkey:9"
+
+immich_port: 2283
+# Dedicated unprivileged DB role: owns ONLY the immich database (no superuser,
+# no access to the n8n DB). The db-init sidecar pre-creates the untrusted
+# extensions as superuser, so Immich itself never needs elevated rights.
+immich_db_user: "immich"
+immich_db_password: "{{ vault_immich_db_password }}"
+immich_db_name: "immich"
+# Media library — back this up! Originals live here, not in the database.
+immich_upload_dir: "{{ data_root_business }}/immich"   # @immich_data subvolume (own btrfs subvol, kept out of rollbacks); .snapshots sits at the root, immich ignores it
+immich_timezone: "Europe/Berlin"
+
+# === Originals on the Storage Box (host-gated) ================================
+# Move the big, append-mostly ORIGINALS onto the Storage Box while thumbs/encoded-video
+# and the DB stay local (fast). Enable per host (host_vars: immich_originals_external: true)
+# — REQUIRES storagebox_enabled on that host. roles/immich_prep externalizes each listed
+# subdir of immich_upload_dir via a symlink to the box, and stacks/immich mounts the box
+# path into the container so the symlink resolves there.
+#
+# `library` = the final originals. `upload` = the staging dir immich moves new uploads FROM
+# into library; keeping both on the SAME filesystem (the box) avoids a cross-device move
+# (EXDEV). Drop `upload` to keep staging local (faster uploads) if your immich copies across
+# devices without erroring.
+immich_originals_external: false
+# Box path for immich's originals: <mount>[/<host root_path>]/immich. select drops an empty
+# root_path so it collapses to <mount>/immich when storagebox_root_path is unset.
+immich_storagebox_root: "{{ ([(storagebox_mountpoint | default('/mnt/storagebox')), (storagebox_root_path | default(''))] | select | join('/')) }}/immich"
+immich_external_subdirs: [library, upload]
+
+# === Public (external) exposure = SHARE LINKS ONLY ===========================
+# The PUBLIC route (immich.<global_host>) sits behind HTTP Basic Auth (see the
+# route's caddy_extra) AND this path allowlist: every other request 404s at Caddy,
+# so the private app + admin API are unreachable from the internet. Full access is
+# the internal route immich.int.<host> (Tailscale). Immich also enforces the share
+# key per request — this is defense-in-depth that shrinks the attack surface.
+#
+# TIGHTENED to exactly the paths the share VIEW + UPLOAD + DOWNLOAD flow uses
+# (verified empirically against a live share link on immich v3.0.2, 2026-09-26 —
+# see the sharedLink:true routes in immich's controllers). Deliberately NARROWER
+# than /api/<x>* prefixes so the ENUMERATION/BULK endpoints stay unreachable at
+# Caddy: e.g. GET /api/albums (list ALL albums) and GET /api/shared-links (list ALL
+# links) are NOT matched by /api/albums/* and the two /api/shared-links/<exact>
+# rules -> they 404 at Caddy instead of reaching immich.
+# NOTE: still re-test a real share link after a major immich upgrade (paths can move).
+immich_public_allow_paths:
+  - /_app/*                    # SPA static assets (JS/CSS/chunks)
+  - /share*                    # the public shared-link UI page
+  - /favicon.ico
+  - /manifest.webmanifest
+  - /api/server/*              # server config/features/version — SPA boot
+  - /api/shared-links/me       # resolve THIS link (key-scoped) — NOT /api/shared-links (list-all)
+  - /api/shared-links/login    # password-protected shares
+  - /api/albums/*              # album by :id + map-markers — NOT /api/albums (list-all)
+  - /api/timeline/*            # buckets/bucket = the album's asset list (key-scoped)
+  - /api/assets                # upload (POST, key-gated) — exact path only
+  - /api/assets/*              # single asset by :id: /original /thumbnail /video/playback
+  - /api/download/*            # info + archive (zip) of shared assets
+# Public base URL Immich stamps into generated share links (the external host).
+immich_external_domain: "https://{{ svc_edge_host['immich'] }}"   # public/external Immich (Shares); der interne Immich-Host bleibt bespoke (immich_int, s. authentik.yml)
+
+# === Storage template (human-readable on-disk layout) ========================
+# Reorganises ORIGINALS under library/<user>/ into a readable path. Immich prepends
+# library/<storage-label>/ automatically — with storageLabelClaim=preferred_username
+# (set in configs/immich-config.json) that label is the Authentik username, e.g.
+#   {{y}}/{{MM}}/{{filename}}  ->  library/Alice/2026/09/IMG_1234.jpg
+# The date variables use the asset's EXIF capture date (DateTimeOriginal) and fall
+# back to the file date when there is no EXIF — exactly the intended behaviour.
+# NOTE: the value is !unsafe so Ansible/Jinja does NOT try to expand Immich's own
+# {{...}} placeholders (they collide with Jinja) — it is passed through literally.
+# Albums are NOT folders (a DB relation, an asset can be in several); {{album}} in
+# the template only ever picks one album + a fallback, so we go date-based here.
+immich_storage_template_enabled: true
+immich_storage_template: !unsafe "{{y}}/{{MM}}/{{filename}}"
+
+# === Native OIDC (Authentik SSO) ===
+# Configured via the mounted config file (stacks/immich/configs/immich-config.json).
+# With autoRegister on and the app bound to "authentik Admins", the FIRST person
+# to click "Login with Authentik" becomes the Immich admin — no local account
+# needed. NOTE: setting IMMICH_CONFIG_FILE makes ALL Immich settings file-managed
+# (read-only in the UI); anything not in the file uses Immich defaults.
+immich_oidc_enabled: true
+immich_oidc_client_id: "immich"
+immich_oidc_client_secret: "{{ vault_authentik_oauth_immich_secret }}"
+immich_oidc_button_text: "Login with Authentik"
+immich_oidc_auto_register: true
+# Immich v3 roleClaim: the OIDC claim Immich reads to set admin-vs-user on EVERY
+# login (value must be "admin" or "user"). Authentik emits it via the immich app's
+# role_claim in group_vars/all/authentik.yml (members of immich-admins -> "admin").
+# => Immich admin is now driven by the immich-admins Authentik group, no local
+# account needed. (The break-glass local admin from immich_admin_bootstrap keeps a
+# password login that bypasses this, so you can never lock yourself out.)
+immich_oidc_role_claim: immich_role
+
+# Initial admin bootstrap via the API (roles/immich_bootstrap) — Immich requires
+# a local first admin, which OIDC can't create. We make it with the SAME email as
+# the Authentik user so the first "Login with Authentik" auto-links to it: your
+# Authentik identity becomes the Immich admin. The password is break-glass only.
+immich_admin_bootstrap: true
+immich_admin_email: "{{ authentik_bootstrap_email }}"     # = akadmin@<host> -> OAuth match
+# Service/admin account name — the human account (e.g. "Alice") is a separate
+# Immich user, created later via OIDC once its Authentik account exists.
+immich_admin_name: "Admin"
+
+# === Read-only raw WebDAV (inspection of the upload dir over VPN) =============
+# A rclone-webdav sidecar mounts the upload dir READ-ONLY (:ro) so you can browse
+# the raw originals for inspection/spot-restore — it is NOT Immich's app view and
+# NOT a place to write (that would corrupt Immich's library state; the :ro mount
+# enforces it). Loopback-only + INTERNAL Caddy route (webdav-immich.int.<host>,
+# Tailscale-bound) + Authentik LDAP auth (login = an Authentik user in
+# webdav-immich-users; needs authentik_ldap_apps: webdav-immich + the rclone-ldap
+# image). Mount e.g.: net use Z: https://webdav-immich.int.<host>/ /user:<authentik-user> *
+immich_webdav_enabled: true
+immich_webdav_port: 8890                 # host 127.0.0.1:<port> -> container :8888
+immich_webdav_ldap: true
+immich_webdav_ldap_base_dn: "dc=immich,dc=ldap,dc=example,dc=com"
+immich_webdav_cachetime: "5s"
+# basic_auth fallback (only used when immich_webdav_ldap is false):
+immich_webdav_user: "{{ admin_user }}"
+immich_webdav_password: "{{ vault_immich_webdav_password | default('changeme') }}"

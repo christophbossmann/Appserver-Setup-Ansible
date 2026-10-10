@@ -1,3 +1,5 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/proxy_routes.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
 # =============================================================================
 # group_vars/all/proxy_routes.yml — base wildcard-cert routes + profile docs
 #
@@ -37,6 +39,12 @@ proxy_routes_base:
   - name: wildcard_cert_internal
     hostname: "*.{{ internal_host }}"
     caddy_tls_mode: "acme_dns"
+    # MUST bind like the internal routes (tailscale): sites with a `bind` get their
+    # own listener, and the OS routes connections to the most specific socket — a
+    # bind-less catch-all on *:443 never sees tailscale-IP traffic, so an unknown
+    # *.int hostname got a TLS handshake abort (white page) instead of this 404.
+    # Cert issuance is DNS-01, so binding tailscale-only doesn't affect it.
+    caddy_bind_interfaces: "{{ route_int.caddy_bind_interfaces | default([]) }}"
 
   # Public wildcard: only issued when external routes use a Caddy-issued cert
   # (caddy_tls_mode inherit/acme_dns). On tunnel hosts (tls off) it is disabled.

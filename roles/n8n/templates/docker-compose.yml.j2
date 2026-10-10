@@ -65,22 +65,34 @@ services:
 {% endfor %}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
-      interval: 30s
+      interval: 60s
       timeout: 10s
       retries: 5
 
 {% if n8n_webdav_enabled %}
   n8n-webdav:
-    image: {{ rclone_image }}
+    image: "{{ 'rclone-ldap:local' if n8n_webdav_ldap | default(false) else rclone_image }}"
+{% if n8n_webdav_ldap | default(false) %}
+    pull_policy: never   # rclone-ldap:local is built locally (rclone_ldap_image role), never pulled
+{% endif %}
     container_name: n8n-webdav
     restart: unless-stopped
     user: "1000:1000"
     command: >
-      serve webdav /data
+      serve webdav {{ '' if n8n_webdav_ldap | default(false) else '/data' }}
       --addr :8888
+{% if n8n_webdav_ldap | default(false) %}
+      --auth-proxy /usr/local/bin/auth-proxy.sh
+{% else %}
       --user {{ n8n_webdav_user }}
       --pass {{ n8n_webdav_password }}
+{% endif %}
       --dir-cache-time {{ n8n_webdav_cachetime }}
+{% if n8n_webdav_ldap | default(false) %}
+    environment:
+      # WebDAV login = an Authentik user in webdav-n8n-users (LDAP bind via the outpost).
+      LDAP_BASE_DN: "{{ n8n_webdav_ldap_base_dn }}"
+{% endif %}
     volumes:
       - {{ n8n_brain_dir }}:/data
     ports:

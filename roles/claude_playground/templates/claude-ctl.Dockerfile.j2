@@ -11,6 +11,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 ENV DISABLE_AUTOUPDATER=1
 
+{% if playground_supabase_enabled | default(false) %}
+# --- Supabase agent tooling: PG client (psql/pg_dump) + supabase CLI -------------
+# The dev Supabase runs PostgreSQL {{ playground_supabase_pg_major | default('17') }};
+# bookworm ships client 15, so pull postgresql-client-{{ playground_supabase_pg_major | default('17') }}
+# from the PGDG repo. supabase CLI comes from its GitHub release .deb (arch-aware).
+# Pin SUPABASE_CLI_VERSION for reproducible builds; 'latest' resolves at build time.
+ARG SUPABASE_CLI_VERSION=latest
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
+    && install -d /etc/apt/keyrings \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /etc/apt/keyrings/pgdg.asc \
+    && echo "deb [signed-by=/etc/apt/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y --no-install-recommends postgresql-client-{{ playground_supabase_pg_major | default('17') }} \
+    && arch="$(dpkg --print-architecture)" \
+    && ver="${SUPABASE_CLI_VERSION}" \
+    && if [ "$ver" = "latest" ]; then ver="$(curl -fsSL https://api.github.com/repos/supabase/cli/releases/latest | jq -r .tag_name | sed 's/^v//')"; fi \
+    && curl -fsSL "https://github.com/supabase/cli/releases/download/v${ver}/supabase_${ver}_linux_${arch}.deb" -o /tmp/supabase.deb \
+    && apt-get install -y /tmp/supabase.deb \
+    && rm -f /tmp/supabase.deb \
+    && rm -rf /var/lib/apt/lists/*
+{% endif %}
+
 # Non-root user. The named volume for /home/claude persists both ~/.claude.json
 # (Claude's main config) and ~/.claude/ (credentials), so login survives rebuilds.
 RUN useradd -m -u 10001 claude \

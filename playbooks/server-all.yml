@@ -1,0 +1,170 @@
+---
+# =============================================================================
+# n8n Server: Hardening + Users + Docker + Tailscale + Postgres + n8n + Caddy
+#
+# Usage:
+#   ansible-playbook playbooks/server-all.yml --limit myserver
+# =============================================================================
+
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+
+- name: n8n Server
+  hosts: all
+  become: true
+  # No vars_files: app config lives in group_vars/all/<service>.yml (auto-
+  # loaded), secrets in group_vars/all/vault.yml (vault_* convention).
+  # Routes live centrally in group_vars/all/proxy_routes.yml (auto-loaded).
+  # Every role is tag-gated with its own name, so single services can be
+  # deployed fast (role defaults still load play-wide for skipped roles):
+  #   ansible-playbook ... --tags n8n,caddy
+  # The edge roles share the extra tag 'caddy' so one tag reruns the whole
+  # route pipeline (render + DNS + tunnel + post-check).
+  # Versions an on-host upgrade changed since the config repo was last touched are taken
+  # over BEFORE anything is deployed (else this run would quietly downgrade the service).
+  pre_tasks:
+    # import_tasks (static), NOT include_tasks: with a dynamic include the tag would apply
+    # to the include only and every task inside would be skipped on a --tags run.
+    - name: Reconcile versions with the host
+      ansible.builtin.import_tasks: tasks/adopt_host_versions.yml
+      tags: [always]
+  roles:
+    # BTRFS checkpoint snapshots bracket the deploy. The host must ALREADY be prepared
+    # for snapshots by ./btrfs-bootstrap.sh (the @-layout + snapper + grub-btrfs — a
+    # one-time, reboot-requiring setup outside Ansible; see btrfs-setup.md). On btrfs
+    # hosts (btrfs_snapshots_enable=true) a missing setup aborts here; on non-btrfs
+    # hosts (auto) every checkpoint is a safe no-op. Snapshots are ans_<phase> (ans=ansible).
+    #
+    # Data-domain subvolumes are provisioned early, bracketed by two PERMANENT anchors:
+    #   ans_pre_setup     -> @ before anything (FULL reset incl. data = roll here + wipe data subvols)
+    #   data_storage      -> creates @business / @dev / @authentik (+ fstab, on btrfs)
+    #   ans_subvols_ready -> @ with the data subvolumes in place (REINSTALL keeping data = roll here)
+    # Both anchors are permanent (never auto-pruned) and created once (skip_if_exists).
+    # At the END of the run, post_tasks additionally create a permanent per-DATA-subvolume
+    # `ans_post_install` anchor (fresh-install baseline for each data domain) — see below.
+    # ── Tag layers (compose to select a host profile; order is preserved) ──────────
+    #   base      : always-needed infra — data_storage, hardening, tailscale, users, docker
+    #   btrfs     : snapshot machinery (checkpoints + anchors). SEPARATE on purpose; whether
+    #               it actually snapshots is the VARIABLE btrfs_snapshots_enable (auto/true/false),
+    #               not the tag — on a non-btrfs host the btrfs roles no-op regardless.
+    #   caddy     : the reverse-proxy EDGE (acme_dns + caddy + cloudflare_dns/cloudflared +
+    #               post-check). SEPARATE on purpose: it is not an additive layer but the
+    #               cross-cutting edge that renders + verifies ALL of a host's caddy_services
+    #               at once, so it must run together with the services it fronts (a partial
+    #               run that includes caddy but not those services fails post-check with 502s).
+    #               Always append it to whatever layers you deploy.
+    #   platform  : shared services — authentik(SSO), monitoring, dozzle, headscale/headplane,
+    #               backup(restic+pitr)
+    #   business  : the business bundle — shared DB (postgres-business) + rclone image +
+    #               immich(+uploader) + nextcloud.
+    #               SPLIT: `immich` and `nextcloud` are each independently deployable — the
+    #               shared bits (postgres-business, rclone_ldap_image) carry the immich AND
+    #               nextcloud tags, so `--tags immich,nextcloud` gives the apps + shared DB but
+    #               NOT the uploader (business-only); `--tags business` adds it.
+    #   (dev/experimental/optional keep their own single tags: n8n, supabase, komodo,
+    #    playwright_mcp, playground, cockpit, postgres, pgadmin)
+    #    NB `pgadmin` needs `platform` (authentik net) up + a host-matched
+    #    pgadmin_extra_networks (drop supabase_default on a host without supabase); DB admin
+    #    is also possible without it via SSH tunnel to the loopback DB ports (5434/5435/…).
+    # A business host ≈  --tags base,btrfs,caddy,platform,business  (btrfs only if you want snapshots).
+    # ───────────────────────────────────────────────────────────────────────────────
+    - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_pre_setup, btrfs_snapshot_permanent: true }, tags: [btrfs] }
+    - { role: data_storage, tags: [base, btrfs, storage] }
+    - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_subvols_ready, btrfs_snapshot_permanent: true }, tags: [btrfs] }
+    - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_before_hardening }, tags: [btrfs, hardening] }
+    - { role: hardening, tags: [base, hardening] }
+    - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_after_hardening }, tags: [btrfs, hardening] }
+    - { role: tailscale, tags: [base, tailscale] }
+    - { role: users, tags: [base, users] }
+    - { role: docker, tags: [base, docker] }
+    # Storage Box mount (rclone/SFTP, host-gated by storagebox_enabled). Runs BEFORE the
+    # apps that externalize data onto it (e.g. immich originals), so the mount is up when
+    # their symlinks/binds resolve. No-op where disabled.
+    - { role: storagebox, tags: [base, storagebox, business, immich, nextcloud] }
+    # rclone+LDAP image = WebDAV --auth-proxy sidecar for immich/nextcloud (and n8n/playground).
+    # Tagged with every CONSUMER so it is built whenever one of them is selected (built once,
+    # cached; the stacks reference it with pull_policy: never). NOT in base — only built if a
+    # consumer is actually deployed.
+    - { role: rclone_ldap_image, tags: [rclone_ldap_image, business, immich, nextcloud, n8n, playground] }
+    - { role: compose_stack, vars: { stack: postgres }, tags: [postgres] }   # dev/shared instance (n8n + supabase); NOT needed by immich/nextcloud (they use postgres-business)
+    - { role: compose_stack, vars: { stack: postgres-business }, tags: [business, postgres, postgres_business, immich, nextcloud] }   # shared DB for immich+nextcloud — tagged with both so either app pulls it standalone
+    # Authentik EARLY (right after postgres creates the backend net): it is the
+    # auth foundation — every later service is immediately usable (OIDC/forward-
+    # auth/LDAP logins) the moment it comes up, and anything with a deploy-time
+    # dependency on authentik (networks, API) is ordered safely by construction.
+    - { role: compose_stack, vars: { stack: authentik }, tags: [platform, authentik] }
+    - { role: authentik_bootstrap, tags: [platform, authentik] }          # post-blueprint API setup: passwords + LDAP outpost token + human profile sync (groups/attrs/avatar)
+    # Generic compose stacks (definitions in stacks/<name>/).
+    - { role: n8n, tags: [n8n] }
+    - { role: compose_stack, vars: { stack: dozzle }, tags: [platform, dozzle] }   # container dashboard (live logs/actions)
+    - { role: headscale_int_dns, tags: [platform, headscale] }   # derive .int extra_records from caddy_services (BEFORE the stack renders config.yaml)
+    - { role: compose_stack, vars: { stack: headscale }, tags: [platform, headscale] }   # self-hosted Tailscale control server (per-host isolated tailnet)
+    - { role: headscale_bootstrap, tags: [platform, headscale] }   # declarative users + reusable pre-auth keys + headplane API key
+    - { role: tailscale_enrol, tags: [platform, headscale, tailscale] }   # co-located node self-enrols into its own headscale (loopback) BEFORE caddy -> .int binds converge in one pass (gated by tailscale_self_enrol)
+    # One-pass convergence of the self-hosted internal DNS: on a FRESH install the node
+    # is NOT enrolled when headscale_int_dns first runs (no headscale IP yet) -> empty .int
+    # extra_records. Now that tailscale_enrol has joined the node, RE-derive the records and
+    # re-render + restart headscale so .int names resolve within the SAME run. Idempotent
+    # no-op on an already-enrolled host (records unchanged -> no restart). require_ip=true:
+    # the node just enrolled, so WAIT for its tailnet IP before deriving (avoids a race
+    # where `tailscale ip -4` still lags -> empty records -> .int broken until a re-run).
+    - { role: headscale_int_dns, vars: { headscale_int_dns_require_ip: true }, tags: [platform, headscale] }
+    - { role: compose_stack, vars: { stack: headscale }, tags: [platform, headscale] }
+    - { role: compose_stack, vars: { stack: headplane }, tags: [platform, headplane] }   # headscale web UI (internal + SSO)
+    - { role: compose_stack, vars: { stack: komodo }, tags: [komodo] }
+    - { role: cockpit, tags: [cockpit] }
+    - { role: compose_stack, vars: { stack: playwright_mcp }, tags: [playwright_mcp] }
+    - { role: immich_prep, tags: [business, immich] }   # externalize originals onto the Storage Box (symlink) BEFORE the stack starts (gated by immich_originals_external)
+    - { role: compose_stack, vars: { stack: immich }, tags: [business, immich] }
+    - { role: immich_bootstrap, tags: [business, immich] }   # create the local admin (email = Authentik user) so SSO = admin
+    - { role: compose_stack, vars: { stack: immich_uploader }, tags: [business, immich_uploader] }
+    - { role: compose_stack, vars: { stack: nextcloud }, tags: [business, nextcloud] }
+    - { role: nextcloud_bootstrap, tags: [business, nextcloud] }   # occ: wire user_oidc to Authentik
+    - { role: backup_restic, tags: [platform, backup] }            # nightly cloud backup (restic over rclone; gated by backup_cloud_enabled)
+    - { role: postgres_pitr, tags: [platform, postgres_pitr, backup] }   # WAL archiving + base backups for PITR (gated by postgres_pitr_enabled, host_vars)
+    - { role: compose_stack, vars: { stack: supabase }, tags: [supabase] }
+    - { role: supabase_bootstrap, tags: [supabase] }   # idempotent instance SQL (pg_cron) — also on rebuilds
+    # pgadmin is its OWN opt-in tag (NOT part of business) — deploy with `--tags pgadmin`.
+    # Placed AFTER authentik + supabase: it joins their external networks (authentik_default,
+    # supabase_default via pgadmin_extra_networks), which only exist once those stacks have
+    # started. It is a network-bridging admin UI reaching every DB by container name, so it
+    # needs `platform` (authentik net) up, and its pgadmin_extra_networks MUST match the host's
+    # actual stacks (drop supabase_default on a host without supabase, else the container fails
+    # on the missing net). Alternative without pgadmin: local pgAdmin via SSH tunnel to the
+    # loopback DB ports (postgres_business_port 5434, authentik_postgres_port 5435, …).
+    - { role: pgadmin_prep, tags: [pgadmin] }   # fail-soft: drop bridge nets (authentik/supabase_default) that aren't deployed on this host -> no per-host override
+    - { role: compose_stack, vars: { stack: pgadmin }, tags: [pgadmin] }
+    - { role: pgadmin_servers, tags: [pgadmin] }   # import shared server defs (SSO users see them)
+    - { role: claude_playground, tags: [playground] }
+    # Monitoring AFTER every app stack: it derives scrape jobs + postgres exporters from the
+    # containers RUNNING at deploy time (immich, authentik, headscale, PITR instances) and
+    # joins their networks. Placed earlier, a fresh host came up without the immich/headscale
+    # jobs until a second run. Before caddy, which drops its probe targets into file_sd.
+    - { role: monitoring, tags: [platform, monitoring] }
+    # Self-hosted acme-dns (DNS-01 relay) — MUST be up before caddy issues certs in
+    # acme_dns mode. DNS public on :53, API loopback-only. Tagged 'caddy' so it
+    # deploys with the cert pipeline.
+    - { role: compose_stack, vars: { stack: acme_dns }, tags: [acme_dns, caddy] }
+    - { role: acme_dns_bootstrap, tags: [acme_dns, caddy] }   # declarative accounts (DB) + derive caddy creds
+    - { role: caddy, tags: [caddy] }
+    - { role: cloudflare_dns, tags: [caddy, cloudflare_dns] }
+    - { role: cloudflared, tags: [caddy, cloudflared] }
+    - { role: caddy_post_check, tags: [caddy, caddy_post_check] }
+    # Final checkpoint after the whole run completed.
+    - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_after_ansible }, tags: [btrfs] }
+
+  # After the whole deploy finishes: a PERMANENT "fresh install" anchor snapshot per
+  # DATA subvolume (ans_post_install). Extracted to keep the play lean — see the task
+  # file for the full rationale.
+  post_tasks:
+    - name: Post-install data anchor snapshots (ans_post_install)
+      ansible.builtin.include_tasks: tasks/data_post_install_anchors.yml
+      tags: [btrfs, anchors]
+
+    # hardening stops apt-daily(-upgrade) for the play — bring automatic updates back.
+    # always: harmless no-op when the timers already run (e.g. a --tags run without hardening).
+    - name: Re-start apt background timers
+      # import (static), not include: only then do the inner tasks inherit 'always'
+      ansible.builtin.import_tasks: tasks/apt_timers_restore.yml
+      tags: [always]
+

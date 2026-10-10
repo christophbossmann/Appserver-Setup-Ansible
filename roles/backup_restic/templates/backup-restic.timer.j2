@@ -1,0 +1,11 @@
+# Managed by Ansible (roles/backup_restic)
+[Unit]
+Description=Nightly restic cloud backup
+
+[Timer]
+OnCalendar={{ backup_timer_oncalendar }}
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

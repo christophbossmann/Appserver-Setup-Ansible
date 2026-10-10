@@ -1,0 +1,89 @@
+---
+# Preflight (controller only, runs BEFORE any SSH connection): a passphrase-protected
+# Ansible key must be loaded in an ssh-agent. Ansible can't ask for a key passphrase —
+# ssh then prompts per connection, mid-run, and e.g. the hardening smoke test's fresh
+# connection hangs and leaves its auto-rollback job armed. So fail fast here instead and
+# print the exact command to re-run under a one-shot agent (passphrase asked ONCE):
+#
+#   ssh-agent bash -c 'ssh-add ~/.ssh/ansible_key && ansible-playbook ...'
+#
+# Imported as the FIRST play of every server playbook. Key without a passphrase, or
+# already in a running agent -> passes silently. Key: controller_ssh_key (default
+# ~/.ssh/ansible_key, the IdentityFile in ~/.ssh/config).
+#
+# hosts: all (not localhost) — a localhost play would be SKIPPED by any --limit <host>.
+# connection: local + run_once: each check runs ONCE on the controller, never over SSH.
+- name: Preflight — SSH key usable without prompts
+  hosts: all
+  connection: local
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+  tags: [always]
+  vars:
+    _key: "{{ (controller_ssh_key | default('~/.ssh/ansible_key')) | expanduser }}"
+  tasks:
+    - name: Check whether the SSH key has a passphrase
+      ansible.builtin.command: ssh-keygen -y -P "" -f "{{ _key }}"
+      register: _pf_unprotected
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      run_once: true
+      no_log: true            # stdout would be the PUBLIC key only, but keep logs clean
+
+    - name: Passphrase-protected key — is it loaded in an ssh-agent?
+      when: _pf_unprotected.rc != 0
+      run_once: true
+      block:
+        - name: Compare the key's fingerprint with the agent's identities
+          ansible.builtin.shell: |
+            fp=$(ssh-keygen -lf "{{ _key }}.pub" | awk '{print $2}')
+            ssh-add -l 2>/dev/null | grep -qF "$fp"
+          register: _pf_in_agent
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        # Build the ready-to-paste re-run command: walk up the process tree (module python
+        # -> sh -> ansible worker) to the first ancestor running ansible-playbook and wrap
+        # its exact arguments in a one-shot agent. Quoting is done here in Python (shlex),
+        # not in Jinja.
+        - name: Prepare the re-run hint (only if the key is not in an agent)
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import os, shlex, sys
+                key = sys.argv[1]
+                pid = os.getppid()
+                while pid > 1:
+                    a = open(f"/proc/{pid}/cmdline").read().split("\0")[:-1]
+                    idx = [i for i, x in enumerate(a) if os.path.basename(x) == "ansible-playbook"]
+                    if idx:
+                        run = shlex.join(["ansible-playbook"] + a[idx[0] + 1:])
+                        break
+                    pid = int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[1])
+                else:
+                    run = "ansible-playbook <same arguments>"
+                if "'" in run:   # args need quoting themselves -> pass them via "$@"
+                    print(f"ssh-agent bash -c 'ssh-add {key} && exec \"$@\"' _ {run}")
+                else:
+                    print(f"ssh-agent bash -c 'ssh-add {key} && {run}'")
+              - "{{ controller_ssh_key | default('~/.ssh/ansible_key') }}"
+          register: _pf_cmd
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          when: _pf_in_agent.rc != 0
+
+        - name: Stop if the key is not in an agent (skipped when it is)
+          ansible.builtin.fail:
+            msg: |-
+              {{ _key }} has a passphrase but is not loaded in an ssh-agent.
+              Ansible can't ask for it — ssh would prompt per connection and the run hangs.
+              Re-run under a one-shot agent (passphrase asked ONCE, agent gone afterwards):
+
+                {{ _pf_cmd.stdout | default('') | trim or ("ssh-agent bash -c 'ssh-add ~/.ssh/ansible_key && ansible-playbook <same arguments>'") }}
+          when: _pf_in_agent.rc != 0

@@ -9,7 +9,7 @@ n8n_image: "n8nio/n8n:{{ n8n_version }}"
 # (then convert to rclone_version + composed image like above).
 rclone_image: "rclone/rclone:latest"
 n8n_port: 5678
-n8n_data_dir: /opt/n8n/data
+n8n_data_dir: "{{ data_root_dev }}/n8n"
 
 # Bind published Docker port on the host.
 # Empty = Docker default (0.0.0.0). Use 127.0.0.1 when n8n is only reached via Caddy.
@@ -51,7 +51,7 @@ n8n_fresh_install: false
 # ==========================================================
 n8n_webdav_enabled: true
 n8n_webdav_port: 8888
-n8n_webdav_user: "christoph"
+n8n_webdav_user: "{{ admin_user | default('admin') }}"
 n8n_webdav_password: "changeme"
 n8n_webdav_cachetime: "5s"
 

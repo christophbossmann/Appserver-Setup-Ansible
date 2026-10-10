@@ -1,0 +1,7 @@
+# Caddy route for Authentik — external, selected via caddy_services (authentik).
+# NO basic_auth / forward_auth: Authentik IS the login. Kong-style outpost paths
+# (/outpost.goauthentik.io/*) are served by the same upstream automatically.
+caddy_route_authentik:
+  name: authentik
+  hostname_label: authentik
+  caddy_upstream: "127.0.0.1:{{ authentik_http_port }}"

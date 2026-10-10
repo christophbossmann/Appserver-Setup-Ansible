@@ -1,0 +1,59 @@
+# EXAMPLE (sanitized) — copy to <private config repo>/group_vars/all/storage.yml and adapt.
+# Real values never go into this public repo; see QUICKSTART.md "2. Private configuration".
+---
+# === Data storage layout ======================================================
+# Persistent service data lives under logical DOMAIN roots. On btrfs with snapshots
+# enabled, each root is a separate SUBVOLUME (so a system rollback leaves data
+# untouched, and each domain can be snapshotted / rolled back on its own); on ext4
+# or with snapshots off they are plain directories. Roles ALWAYS write here,
+# regardless of filesystem — the subvolume/snapshot layer is separate and optional.
+#
+# Convention inside a domain: DB data goes in a `db/` subdir (gets nodatacow on
+# btrfs), app data in per-service subdirs.
+data_root: /srv
+
+data_root_business: "{{ data_root }}/business"       # immich + nextcloud + their DB (postgres-business)
+data_root_dev: "{{ data_root }}/dev"                 # n8n + supabase + their DB (postgres)
+data_root_authentik: "{{ data_root }}/authentik"     # authentik + its DB
+# PITR archives (WAL + base backups) of ALL postgres instances, one subdir each. Own
+# subvolume WITHOUT snapshots: the archive IS a backup, churns constantly and prunes itself
+# — inside @ (root) every system snapshot pinned GBs of deleted WAL; next to a DB's data it
+# would bloat that domain's snapshots the same way. See roles/postgres_pitr.
+pg_archive_root: "{{ data_root }}/pg-archive"
+# Disposable, high-churn caches (own subvolume WITHOUT snapshots), e.g. the rclone VFS cache.
+cache_root: "{{ data_root }}/cache"
+
+# Volumes the storage-provisioning role creates. On btrfs each entry becomes its OWN
+# subvolume (@<name> + flat @<name>_snapshots + snapper config); on ext4 they are plain
+# dirs. `subdirs` are created up front (bind-mount sources); `nodatacow` subdirs get
+# `chattr +C` BEFORE the service writes (anti-fragmentation). `snapshot` = daily timeline.
+#
+# BUSINESS is split into THREE subvolumes so the big, append-only photo library can be
+# kept OUT of a system/DB rollback (roll back db + files, keep the photos → immich stays
+# consistent because its DB then references a subset of the kept photos):
+#   business_db    -> the shared postgres-business cluster (immich + nextcloud DBs)  ROLLBACK
+#   immich_data    -> the photo library (huge, append-mostly)                        KEEP
+#   nextcloud_data -> nextcloud html + user files (coupled to the NC DB)             ROLLBACK w/ db
+# The three are SIBLING subvolumes mounted into the plain dir /srv/business (NOT nested).
+#
+# App data lives in a `data/` SUBDIR of each subvolume (db/data, immich/data) so the
+# subvolume's own `.snapshots` sits BESIDE the data, never inside it — postgres refuses to
+# start with stray entries in PGDATA, and immich dislikes them in its upload root.
+data_domains:
+  # business_db: PGDATA in a `data/` subdir so .snapshots never lands inside PGDATA
+  #   (postgres refuses to start otherwise). immich/nextcloud tolerate .snapshots at
+  #   their root (they only ever touch their own known subdirs), so no data/ wrapper.
+  - { name: business_db,    path: "{{ data_root_business }}/db",        subdirs: [data],       nodatacow: [data], snapshot: true }
+  - { name: immich_data,    path: "{{ data_root_business }}/immich",    subdirs: [],                              snapshot: true }
+  - { name: nextcloud_data, path: "{{ data_root_business }}/nextcloud", subdirs: [html, data],                    snapshot: true }
+  - { name: dev,       path: "{{ data_root_dev }}",       subdirs: [db, supabase/db, supabase/storage], nodatacow: [db, supabase/db], snapshot: true }
+  - { name: authentik, path: "{{ data_root_authentik }}", subdirs: [db],                                nodatacow: [db],              snapshot: true }
+  # snapshot: false -> subvolume only (no @..._snapshots, no snapper config). Keeps the
+  # archives out of every other subvolume's snapshots.
+  - { name: pg_archive, path: "{{ pg_archive_root }}", subdirs: [postgres, authentik, postgres-business], snapshot: false }
+  # Caches that churn constantly (rclone VFS cache of the Storage Box). Inside @ every root
+  # snapshot pinned evicted cache files; a cache needs no snapshots at all.
+  - { name: cache, path: "{{ cache_root }}", subdirs: [rclone-storagebox], snapshot: false }
+
+# Daily snapshots per data domain, kept 14 days (manual + anchor snapshots are exempt).
+data_snapshot_timeline_daily: 14

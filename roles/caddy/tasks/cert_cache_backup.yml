@@ -1,0 +1,51 @@
+---
+# Back up Caddy's certificate store to the controller — AFTER a successful run, so a later
+# wipe/rebuild can restore it (see cert_cache_restore.yml). Gated by cache_ssl_certificates
+# (default true). Best-effort: never fails the play (a missing store just means nothing to
+# cache yet — e.g. the very first run before any cert was issued).
+
+- name: Check whether Caddy has any certificates to cache
+  ansible.builtin.find:
+    paths: "{{ caddy_acme_cert_store }}/certificates"
+    patterns: "*.crt"
+    recurse: true
+  register: _caddy_cert_backup_find
+  failed_when: false
+
+- name: Back up certificate store to the controller
+  when: (_caddy_cert_backup_find.matched | default(0)) > 0
+  block:
+    - name: Create temp tarball of the certificate store (certs + ACME account)
+      ansible.builtin.shell: |
+        set -o pipefail
+        # Include the ACME `acme/` account dir alongside `certificates/` when present, so a
+        # restored host keeps its registered CA account too. This matters for CAs whose EAB
+        # keys are SINGLE-USE (e.g. Google Trust Services): without the account, a rebuild
+        # would try to re-register and need a fresh EAB key. Cert store first, account second.
+        dirs="certificates"
+        [ -d "{{ caddy_acme_cert_store }}/acme" ] && dirs="$dirs acme"
+        tar -czf "{{ _caddy_cert_backup_tmp }}" -C "{{ caddy_acme_cert_store }}" $dirs
+      args:
+        executable: /bin/bash
+      vars:
+        _caddy_cert_backup_tmp: /tmp/caddy-certs-{{ inventory_hostname }}.tgz
+      changed_when: false
+
+    - name: Ensure controller cache directory exists
+      ansible.builtin.file:
+        path: "{{ (caddy_cert_cache_dir ~ '/' ~ inventory_hostname) | expanduser }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch cert tarball to the controller cache
+      ansible.builtin.fetch:
+        src: /tmp/caddy-certs-{{ inventory_hostname }}.tgz
+        dest: "{{ (caddy_cert_cache_dir ~ '/' ~ inventory_hostname ~ '/certs.tgz') | expanduser }}"
+        flat: true
+
+    - name: Remove temp tarball on the host
+      ansible.builtin.file:
+        path: /tmp/caddy-certs-{{ inventory_hostname }}.tgz
+        state: absent

@@ -1,0 +1,42 @@
+---
+# Roll the authentik instance + images back to the pre-upgrade anchor. Included by
+# authentik-upgrade.yml from BOTH the rescue (on failure) and the force_rollback drill path.
+# Does NOT fail the play — the caller decides that. Expects play vars: _ak_containers,
+# _ak_api, _pitr_target, _rollback_version, upgrade_keep_old, upgrade_health_retries.
+- name: Stop server, worker and outpost (release the DB before the restore)
+  ansible.builtin.command: "docker stop {{ _ak_containers | join(' ') }}"
+  changed_when: true
+  failed_when: false
+
+- name: PITR the authentik instance back to the pre-upgrade anchor
+  ansible.builtin.include_tasks: pitr_restore.yml
+  vars:
+    pitr_instance: authentik
+    pitr_target_time: "{{ _pitr_target }}"
+    pitr_keep_old: "{{ upgrade_keep_old }}"
+
+# The private config needs NO revert — the version is only persisted after a verified, kept
+# upgrade. Redeploy the old image via the var override.
+- name: Redeploy authentik with the pre-upgrade image
+  ansible.builtin.include_role:
+    name: compose_stack
+  vars:
+    stack: authentik
+    authentik_version: "{{ _rollback_version }}"
+
+- name: Wait for the rolled-back authentik to be ready
+  ansible.builtin.uri:
+    url: "{{ _ak_api }}/-/health/ready/"
+    status_code: [200, 204]
+  register: _akrb
+  until: _akrb is not failed
+  retries: "{{ upgrade_health_retries | default(60) }}"
+  delay: 5
+  failed_when: false
+
+# A PITR restore starts a new timeline: take a fresh base backup so later restores have a
+# clean anchor (the nightly run would do it anyway — this just closes the gap).
+- name: Fresh base backup after the restore
+  ansible.builtin.command: /usr/local/bin/pg-pitr-backup authentik
+  changed_when: true
+  failed_when: false

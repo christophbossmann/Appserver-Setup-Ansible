@@ -1,4 +1,11 @@
 ---
+# Register this service as deployed in THIS run, so caddy_post_check checks its route(s)
+# only when the service actually ran (intent, not runtime probing). See compose_stack /
+# caddy_post_check for the rationale. Routes point here via depends_service: n8n.
+- name: Register n8n as deployed (intent-aware post-check)
+  ansible.builtin.set_fact:
+    deployed_services: "{{ (deployed_services | default([])) + ['n8n'] }}"
+
 # ==========================================================
 # Fresh install: wipe everything
 # ==========================================================

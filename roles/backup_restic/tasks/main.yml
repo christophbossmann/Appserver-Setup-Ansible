@@ -1,0 +1,96 @@
+---
+# restic-over-rclone cloud backup (provider-agnostic: OneDrive, pCloud, ... —
+# whatever remote is pasted into vault_rclone_backup_conf). Everything is
+# deployed even while backup_cloud_enabled is false, EXCEPT repo init + timer —
+# so flipping the flag + one --tags backup run activates it.
+
+- name: Install restic + rclone + rsync
+  ansible.builtin.apt:
+    name: [restic, rclone, rsync]   # rsync: for playbooks/backup-pull.yml (local pull)
+    state: present
+
+- name: Ensure config + dump directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - /root/.config/rclone
+    - "{{ backup_dump_dir }}"
+    - /etc/restic
+
+- name: Deploy rclone remote config (from the vault)
+  ansible.builtin.copy:
+    content: "{{ vault_rclone_backup_conf }}\n"
+    dest: /root/.config/rclone/rclone.conf
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: vault_rclone_backup_conf | default('') | length > 0
+
+- name: Deploy restic environment
+  ansible.builtin.copy:
+    content: |
+      RESTIC_REPOSITORY={{ backup_restic_repository }}
+      RESTIC_PASSWORD={{ backup_restic_password }}
+    dest: /etc/restic/env
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Deploy the backup runner + restore helper scripts
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0750"
+  loop:
+    - { src: backup-run.sh.j2, dest: /usr/local/bin/backup-run }
+    - { src: backup-restore.sh.j2, dest: /usr/local/bin/backup-restore }
+
+- name: Deploy systemd service + timer
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/etc/systemd/system/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: backup-restic.service.j2, dest: backup-restic.service }
+    - { src: backup-restic.timer.j2, dest: backup-restic.timer }
+  register: _backup_units
+
+- name: Reload systemd when units changed
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _backup_units.changed
+
+- name: Initialize the restic repository (idempotent)
+  ansible.builtin.shell: |
+    set -a; . /etc/restic/env; set +a
+    restic snapshots >/dev/null 2>&1 || restic init
+  args:
+    executable: /bin/bash
+  register: _restic_init
+  changed_when: "'created restic repository' in (_restic_init.stdout + _restic_init.stderr)"
+  when: backup_cloud_enabled | default(false)
+
+- name: Enable the nightly timer
+  ansible.builtin.systemd:
+    name: backup-restic.timer
+    enabled: "{{ backup_cloud_enabled | default(false) }}"
+    state: "{{ 'started' if backup_cloud_enabled | default(false) else 'stopped' }}"
+
+- name: Backup status
+  ansible.builtin.debug:
+    msg: >-
+      {% if backup_cloud_enabled | default(false) %}Cloud backup ACTIVE:
+      {{ backup_restic_repository }}, nightly {{ backup_timer_oncalendar }},
+      retention {{ backup_keep_daily }}d/{{ backup_keep_weekly }}w/{{ backup_keep_monthly }}m.
+      Manual run: systemctl start backup-restic.service{% else %}Cloud backup
+      DEPLOYED but DISABLED — authorize an rclone remote (rclone authorize
+      "onedrive"/"pcloud"), paste it into vault_rclone_backup_conf, set
+      backup_cloud_enabled: true, re-run --tags backup.{% endif %}

@@ -1,0 +1,49 @@
+---
+# compose_stack settings for Supabase. See roles/compose_stack/defaults/main.yml.
+
+dir: /opt/supabase
+
+# Volume subdirectories the compose bind-mounts (must exist before `up`).
+# NOTE: the DATA dirs (PGDATA, file storage) moved OUT to the 'dev' data domain
+# (/srv/dev/supabase/{db,storage}) — created by roles/data_storage, see storage.yml.
+# Only the config/scaffold volumes stay here in the project dir.
+dirs:
+  - volumes/api
+  - volumes/db
+  - volumes/snippets         # studio SQL snippets
+  - volumes/functions/main   # edge function entrypoint
+  - volumes/pooler
+
+# Config + init files deployed next to the compose file. env.j2 is templated
+# (secrets from the vault); the rest are vendored verbatim from upstream
+# supabase/docker so the DB init, Kong routing and pooler behave exactly as
+# upstream. compose_mode/.env mode 0600 — they carry secrets.
+configs:
+  - { src: configs/env.j2,                     dest: .env, mode: "0600" }
+  - { src: configs/api/kong.yml,               dest: volumes/api/kong.yml }
+  - { src: configs/api/kong-entrypoint.sh,     dest: volumes/api/kong-entrypoint.sh, mode: "0755" }
+  - { src: configs/db/roles.sql,               dest: volumes/db/roles.sql }
+  - { src: configs/db/jwt.sql,                 dest: volumes/db/jwt.sql }
+  - { src: configs/db/_supabase.sql,           dest: volumes/db/_supabase.sql }
+  - { src: configs/db/realtime.sql,            dest: volumes/db/realtime.sql }
+  - { src: configs/db/webhooks.sql,            dest: volumes/db/webhooks.sql }
+  - { src: configs/db/logs.sql,                dest: volumes/db/logs.sql }
+  - { src: configs/db/pooler.sql,              dest: volumes/db/pooler.sql }
+  - { src: configs/functions/main/index.ts,    dest: volumes/functions/main/index.ts }
+  - { src: configs/pooler/pooler.exs,          dest: volumes/pooler/pooler.exs }
+
+# Secrets live in the compose file? No — all via .env. But the compose is still
+# 0644-ok; nothing sensitive inline.
+
+# Kong is the gateway; once it reports healthy the stack is serving. First-time
+# start does db init + all service migrations, so give it real headroom.
+health_cmd: "docker exec supabase-kong kong health"
+health_retries: 40
+health_delay: 15
+
+status_msg: >-
+  Supabase up. Web UI + API via the supabase.<host> Caddy route (Kong on
+  127.0.0.1:{{ supabase_kong_http_port }}). Postgres pooler on
+  127.0.0.1:{{ supabase_pooler_session_host_port }} (loopback only — not
+  internet-reachable). Studio login: {{ supabase_dashboard_username }} /
+  <vault_supabase_dashboard_password>.

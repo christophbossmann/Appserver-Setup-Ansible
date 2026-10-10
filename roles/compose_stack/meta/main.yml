@@ -1,0 +1,20 @@
+---
+# allow_duplicates: run this role again even when it is listed twice in the SAME
+# play with identical parameters. Ansible otherwise DE-DUPLICATES a role invoked
+# with the same args and silently runs it only once.
+#
+# We rely on invoking `compose_stack` a second time for the SAME stack within one
+# play — specifically the one-pass internal-DNS convergence for headscale:
+#   1. compose_stack stack=headscale        (renders config.yaml BEFORE the node is
+#                                             enrolled -> extra_records: [])
+#   2. tailscale_enrol                       (node joins its headscale, gets its IP)
+#   3. headscale_int_dns require_ip=true     (re-derives the 12 .int extra_records)
+#   4. compose_stack stack=headscale AGAIN   (re-render config.yaml WITH the records
+#                                             + --force-recreate so headscale reloads)
+# Without allow_duplicates, step 4 is deduped away, the config keeps the empty
+# records from step 1, and .int names never resolve on the tailnet (post_check B
+# fails). Every other compose_stack call uses a distinct `stack`, so this only ever
+# re-enables the intended second headscale pass; the role is idempotent regardless.
+allow_duplicates: true
+
+dependencies: []

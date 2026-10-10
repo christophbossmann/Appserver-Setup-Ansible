@@ -1,0 +1,33 @@
+---
+# Build rclone-ldap:local = rclone + openldap-clients + jq + the LDAP auth-proxy
+# script, used by WebDAV services that authenticate via the Authentik LDAP outpost
+# (rclone serve webdav --auth-proxy). Rebuilds only when the context changes or the
+# image is missing.
+
+- name: Ensure rclone-ldap build context dir
+  ansible.builtin.file:
+    path: /opt/rclone-ldap
+    state: directory
+    mode: "0755"
+
+- name: Sync rclone-ldap build context
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/opt/rclone-ldap/{{ item }}"
+    mode: "0644"
+  loop:
+    - Dockerfile
+    - auth-proxy.sh
+  register: _rclone_ldap_ctx
+
+- name: Check whether rclone-ldap:local exists
+  ansible.builtin.command: docker image inspect rclone-ldap:local
+  register: _rclone_ldap_img
+  changed_when: false
+  failed_when: false
+
+- name: Build rclone-ldap:local (rclone + openldap-clients + jq + auth-proxy)
+  ansible.builtin.command:
+    cmd: docker build -t rclone-ldap:local /opt/rclone-ldap
+  changed_when: true
+  when: _rclone_ldap_ctx is changed or _rclone_ldap_img.rc != 0

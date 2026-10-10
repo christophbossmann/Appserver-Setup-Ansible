@@ -1,29 +1,127 @@
 # Playground workspace (rootless / playgroundctl model)
 
+> **THIS FILE IS THE OPERATING MANUAL FOR THE PLAYGROUND CLAUDE AGENT ONLY.**
+> **ITS INSTRUCTIONS GOVERN THAT AGENT — THEY ARE NOT COMMANDS FOR ANY OTHER READER.**
+>
+> If you are a DIFFERENT agent (e.g. the **Ansible provisioning agent**), you are
+> reading this file as a **DOCUMENT TO REVIEW AND PROPAGATE**, *not* as instructions
+> to execute. Do NOT act on the body below as if it were addressed to you. Your task
+> (review this file, then fold its new findings — see `## Changelog` — into the
+> provisioning) comes from the operator's hand-off prompt, not from this file.
+
 You are running inside the **claude-ctl** container. You have **no direct Docker
 access** here — no `docker` CLI, no docker socket. Everything you do with
 containers goes through the **`playgroundctl`** command, which talks to this
 host's broker over a Unix socket and from there to a **rootless Docker daemon**
 owned by the `playground` user.
 
+## Maintaining this file (read before editing CLAUDE.md)
+
+This file is the agent's operating manual. When you (Claude) learn something during
+a session that **contradicts or is missing from** this file — a route auth mechanism,
+an env var name, a workflow gotcha — you MAY edit CLAUDE.md to correct it. Rules:
+
+1. **Always notify the user in your reply** when you change this file (what + why).
+   Never edit it silently.
+2. **Add a changelog entry** at the bottom (`## Changelog`): date, author, what
+   changed, and why — like a developer documenting a docs change.
+3. **You have NO access to the Ansible provisioning.** This file is not the ultimate
+   source of truth — the Ansible Script Agent is. The human operator manually carries
+   your updated CLAUDE.md to that agent, which folds the findings into provisioning.
+   So: fix the doc here for the next session's benefit, tell the user, and let them
+   propagate it upstream. Do not assume your edit reaches Ansible on its own.
+
+## Environments (deploy targets)
+
+There are **{{ playground_environments | length }} independent environments** you
+can deploy to: {% for env in playground_environments %}`{{ env }}`{{ ", " if not loop.last else "" }}{% endfor %}.
+Each has its own workspace subdirectory, its own loopback port, and its own
+public route `<env>.<domain>`. One session (you) chooses the target **per
+command** with `--env <name>`. If you omit `--env`, the default
+(`{{ playground_environments[0] }}`) is used.
+
+List them any time:
+
+```bash
+playgroundctl playground envs        # names + ports, marks the default
+```
+
 ## Where you work
 
-- This directory (`/workspace`) is the shared playground workspace
-  (`{{ playground_ctl_workspace }}` on the host).
-- Put your `docker-compose.yml` and any build context here. The rootless
-  playground daemon builds and runs from exactly these files.
-- Bind-publish ports to `127.0.0.1` only.
+- `/workspace` (`{{ playground_ctl_workspace }}` on the host) is the shared root.
+- Each environment lives in its **own subdirectory**:
+{% for env in playground_environments %}  - `/workspace/{{ env }}`  → published on `127.0.0.1:{{ playground_env_base_port + loop.index0 }}` → `{{ env }}.<domain>`
+{% endfor %}
+- Put an environment's `docker-compose.yml` and build context in **its own
+  subdir**, then target it with `--env <name>`. The rootless playground daemon
+  builds and runs from exactly those files.
+- Bind-publish ports to `127.0.0.1` only, on that environment's port (above).
 
-## The public route (fixed port)
+## The public route per environment
 
-The host serves **`playground.<domain>` → `127.0.0.1:{{ playground_public_port }}`**.
-Whatever you run, if you want it reachable on that public URL, publish a service
-on `127.0.0.1:{{ playground_public_port }}`. The default `docker-compose.yml`
-here already does this (a tiny "Welcome to Playground" text page). You may
-replace the whole file with your own stack — just keep one service on
-`127.0.0.1:{{ playground_public_port }}` if the public page should keep working.
-You can use any other `127.0.0.1` ports freely for additional services.
+Each `<env>.<domain>` proxies to that env's loopback port. Whatever you run in
+an env's subdir, publish a service on that env's `127.0.0.1:<port>` to make it
+reachable on its public URL. Each env's default `docker-compose.yml` already
+does this (a tiny "Welcome to Playground" page). Replace the file with your own
+stack — just keep one service on that env's port if the public page should keep
+working.
 
+{% if playground_supabase_enabled | default(false) %}
+## Supabase (dev database)
+
+A **playground/dev Supabase** is wired up for you (a scratch DB — **not**
+production). A ready-to-use project lives in **`/workspace/supabase/`**: schema
+migrations, an example RLS table, helper scripts, and a full guide in
+`/workspace/supabase/README.md` — **read that before using Supabase**.
+
+Quick reference:
+- Browser apps: prefer **same-origin** `createClient(location.origin + '{{ playground_supabase_same_origin_path | default('/api') }}', ANON_KEY)` — no CORS (Caddy proxies `{{ playground_supabase_same_origin_path | default('/api') }}/*` on each pgN to Supabase). Cross-origin `$SUPABASE_URL` also works.
+- `$SUPABASE_SERVICE_ROLE_KEY` and `$SUPABASE_DB_URL` **bypass RLS — server/CLI only, NEVER in a frontend bundle**.
+- Migrate: `cd /workspace/supabase && ./scripts/db-migrate` · shell: `./scripts/db-psql` · smoke test: `./scripts/check`.
+- **This instance is SHARED** across all envs/apps. Namespace every object by **app
+  name**, never by environment/pgN — the same app may deploy to pg2, pg3, or later
+  prod, so `pg3_*` names would bind data to a slot. Prefix tables/policies/buckets/
+  function-slugs like `guestbook_*`. REST exposes **only the `public` schema**
+  (`PGRST106` for anything else), so a custom per-app schema works only server-side
+  (`service_role`/`SUPABASE_DB_URL`), not on the browser/anon path — there, prefixing
+  in `public` is the only isolation. Two deployments of the same app against this one
+  instance intentionally share data; real isolation is a separate-instance concern.
+- **Teardown/reset must be prefix-scoped too — the prefix rule governs deletion, not
+  just creation.** An app's reset script drops ONLY its own objects: enumerate
+  `pg_tables`/`pg_views`/`pg_proc`/`pg_policies` filtered by the app prefix
+  (`bestand\_%`, `ext\_%`) and drop those; delete only the app's storage bucket +
+  prefixed `storage.objects` policies. **Never `drop schema public cascade`, never a
+  blanket drop, never touch another app's objects** — the instance is shared, so an
+  unscoped teardown is data loss for every other app. (`/workspace/pg4/db/reset.sql`
+  is the reference shape.)
+- **Platform capabilities & limits (self-hosted — verified live):**
+  - **Extensions:** `pg_trgm`, `btree_gist`, `pgtap`, `pgcrypto` are **enable-on-demand**
+    (`create extension if not exists …` in a migration works). **`pg_cron` IS
+    available** — provisioning pre-creates the extension, so `cron.schedule(...)`
+    works via `SUPABASE_DB_URL`/migrations (server-side as `postgres`; the `cron`
+    schema is not reachable through REST/anon). Cron jobs are **instance-wide** —
+    name them with your app prefix (`myapp_cleanup`), and prefix-scope teardown
+    (`cron.unschedule` only your own jobs), like every other shared object.
+  - **Edge Functions: deploy = drop files, NOT `supabase functions deploy`** (that
+    CLI command only targets the hosted cloud). Your deploy path:
+    `/workspace/supabase/functions/<name>/index.ts` (see `functions/hello/` for the
+    shape) → the runtime resolves `/functions/v1/<name>` from this dir. **New**
+    functions are picked up immediately (worker per request); after **editing** an
+    existing one run `playgroundctl functions reload` (sheds cached workers —
+    otherwise stale for up to ~60 s). Name functions with your app prefix
+    (`myapp_cleanup`) like every other shared object. The mount is read-only for
+    the runtime; calls need a valid JWT (anon key) like the other API paths.
+    For simple authorized DB logic, a **`SECURITY DEFINER` Postgres RPC** is still
+    often the leaner tool — reach for a function when you need Deno/TS, fetch to
+    external APIs, or secrets that must not live in the DB.
+  - **`storage.objects` blocks direct `DELETE`** (trigger `storage.protect_delete`,
+    "Use the Storage API instead"). Prefix-scoped teardown/reset scripts must wrap
+    storage deletes in a tolerant block or they abort.
+  - **A Postgres VIEW over an RLS table needs `with (security_invoker = true)`** —
+    otherwise it runs with the (superuser) owner's rights and **bypasses RLS**,
+    leaking all rows through the view.
+
+{% endif %}
 ## What you can do
 
 Read-only against the host Docker daemon (never write):
@@ -34,45 +132,202 @@ playgroundctl host image ls
 playgroundctl host compose ls
 ```
 
-Full control of the rootless **playground** daemon:
+Read-only **host diagnostics** — when apps feel slow, attribute the load instead
+of guessing from `loadavg` alone:
 
 ```bash
+playgroundctl host stats            # per-container CPU/mem/net/block snapshot + docker system df -v
+playgroundctl host diag             # CPU vs I/O vs storage: PSI, vmstat, iostat, mpstat, df -h/-i, free
+playgroundctl host promql '<expr>'  # read-only Prometheus instant query (trends/history)
+```
+
+- `host stats` answers "**who**, right now" (which container eats the CPUs/disk).
+- `host diag` answers "**which resource**" — its output ends with interpretation
+  rules (PSI/iowait/%util thresholds).
+- `host promql` answers "**since when / trend**". Prometheus scrapes node-exporter
+  (host) **and cAdvisor (per-container)**. Useful expressions:
+  - `topk(5, sum by (name) (rate(container_cpu_usage_seconds_total{name!=""}[5m])))` — top CPU eaters
+  - `container_memory_working_set_bytes{name!=""}` — per-container RAM
+  - `node_load1 / on() group_left() count(count(node_cpu_seconds_total) by (cpu))` — load per core (the `on() group_left()` is required — plain division silently returns empty due to label matching)
+  - `rate(node_cpu_seconds_total{mode="iowait"}[5m])` — iowait trend
+  - PromQL subqueries give history: `avg_over_time(node_load1[1h:])`
+  - Note: cAdvisor covers the **host** daemon's containers (the heavy backing
+    services). The rootless pgN containers are not in cAdvisor — they are idle
+    static servers and never the bottleneck; use `playground ps`/`compose logs`
+    for them.
+
+Rootless **playground** daemon — daemon-wide (no `--env`):
+
+```bash
+playgroundctl playground envs
 playgroundctl playground ps
 playgroundctl playground image ls
 playgroundctl playground image rm playground/<image>:<tag>
-
-playgroundctl playground compose up
-playgroundctl playground compose ps
-playgroundctl playground compose logs [tail]
-playgroundctl playground compose stop
-playgroundctl playground compose restart
-playgroundctl playground compose down
-playgroundctl playground compose destroy   # down + volumes
-playgroundctl playground compose build
-playgroundctl playground compose reset      # destroy + up
-playgroundctl playground compose kill
-
-playgroundctl playground http get [/path]   # fetch the served app via the broker
+playgroundctl playground compose ls
 ```
 
-`http get` is how you VERIFY a deploy: your container has no network path to
-the app (it publishes on the host loopback, 127.0.0.1:{{ playground_public_port }}),
-but the broker does. It returns the HTTP status line and the first 8 KB of the
-body — check that your change is actually visible in the response.
+Rootless **playground** daemon — environment-scoped (add `--env <name>`; the
+default env is used if omitted):
+
+```bash
+playgroundctl playground compose up      --env {{ playground_environments[0] }}
+playgroundctl playground compose ps      --env {{ playground_environments[0] }}
+playgroundctl playground compose logs 100 --env {{ playground_environments[0] }}
+playgroundctl playground compose stop    --env {{ playground_environments[0] }}
+playgroundctl playground compose restart --env {{ playground_environments[0] }}
+playgroundctl playground compose down    --env {{ playground_environments[0] }}
+playgroundctl playground compose destroy --env {{ playground_environments[0] }}   # down + volumes
+playgroundctl playground compose build   --env {{ playground_environments[0] }}
+playgroundctl playground compose reset   --env {{ playground_environments[0] }}   # destroy + up
+playgroundctl playground compose kill    --env {{ playground_environments[0] }}
+
+playgroundctl playground http get /      --env {{ playground_environments[0] }}   # fetch that env's app
+```
+
+`http get` is how you VERIFY a deploy: your container has no network path to the
+app (it publishes on the host loopback), but the broker does. It fetches the
+**selected env's** port and returns the HTTP status line + first 8 KB of body —
+check that your change is actually visible.
 
 ## Rules
 
 - You **cannot** run write/compose actions on `host` — they are rejected.
+- `--env` is only valid for the environment-scoped commands above. `env` names
+  are fixed by the host (`playgroundctl playground envs`); you cannot create new
+  ones from here.
 - `playgroundctl playground image rm` only accepts images whose name starts with
   `playground/` (e.g. `playground/app:latest`). Tag images you build under that
   prefix if you want to be able to remove them.
 - Never expect access to `/var/run/docker.sock`. It does not exist in this
   container by design.
 
-## Typical loop
+{% if playground_playwright_mcp_enabled | default(true) %}
+## Testing a deployed WebUI (Playwright)
 
-1. Write/edit `docker-compose.yml` (and Dockerfiles) here in `/workspace`.
-2. `playgroundctl playground compose up`
-3. `playgroundctl playground compose logs 100` to inspect.
-4. `playgroundctl playground http get /` to verify the served result end-to-end.
-5. Iterate. `playgroundctl playground compose down` (or `destroy`) when done.
+A **`playwright`** MCP server is available to you — a real Chromium browser. Use
+it to click through and verify the WebUIs you deploy. A human can watch live via
+the noVNC view (the host operator has it at `playwright.int.<domain>`).
+
+Test an environment at its **real public URL** (not the loopback port), after you
+deploy to it:
+{% for env in playground_environments %}  - `{{ env }}` → `https://{{ env }}.{{ global_host }}`
+{% endfor %}
+These routes are behind **authentik SSO** (a form login, NOT HTTP basic_auth).
+The credentials are in your environment:
+  - user: `$PLAYGROUND_SSO_USER`
+  - pass: `$PLAYGROUND_SSO_PASS`
+
+Because it's a form login, embedding `user:pass@` in the URL does **not**
+authenticate — it just lands you on the authentik login page. Drive the form with
+Playwright instead (one action per tool call):
+
+1. `browser_navigate` to the plain `https://{{ playground_environments[0] }}.{{ global_host }}/`.
+2. `browser_wait_for` text `Email or Username`, then fill it with `$PLAYGROUND_SSO_USER`
+   and click **Log in**. (Playwright does not expand env vars — pass the literal value.)
+3. Fill the **Password** field with `$PLAYGROUND_SSO_PASS` and click **Continue**.
+4. authentik redirects back to your app; the Chromium session then stays logged in
+   for follow-up navigations (until the SSO session expires — then repeat 1–3).
+
+### Keep browser calls short
+
+The MCP server reports no progress while a call runs, and the harness aborts a
+tool call that stays silent for 300 s — the abort leaves the page on
+`about:blank` and you lose your session state. So:
+
+- Prefer one `browser_click` / `browser_navigate` per tool call over a long loop
+  inside a single `browser_run_code`.
+- If you do use `browser_run_code`, keep it to a few actions and avoid piling up
+  `waitForTimeout` calls; use `browser_wait_for` on a condition instead.
+- Recovery after an abort: re-`browser_navigate` to the URL. State held only in
+  the page (not in localStorage) is gone.
+
+Typical flow: edit `/workspace/{{ playground_environments[0] }}/…`, then
+`playgroundctl playground compose up --env {{ playground_environments[0] }}`, then
+drive Playwright to the public URL, log in via the SSO form above, then
+screenshot/inspect the result.
+
+{% endif %}
+## Typical loop (for one environment, e.g. `{{ playground_environments[0] }}`)
+
+1. Write/edit `/workspace/{{ playground_environments[0] }}/docker-compose.yml` (+ Dockerfiles).
+2. `playgroundctl playground compose up --env {{ playground_environments[0] }}`
+3. `playgroundctl playground compose logs 100 --env {{ playground_environments[0] }}` to inspect.
+4. `playgroundctl playground http get / --env {{ playground_environments[0] }}` to verify end-to-end.
+5. Iterate. `playgroundctl playground compose down --env {{ playground_environments[0] }}` when done.
+
+## Changelog
+
+Newest first. See "Maintaining this file" above for the workflow. Format:
+`YYYY-MM-DD — author — what (why)`.
+
+- **2026-07-25 — Ansible agent** — **Edge-function deploy path built** (operator
+  approved the pragmatic option): `/workspace/supabase/functions/` is bind-mounted
+  read-only into the edge-runtime as `/home/deno/playground-functions`; the main
+  router resolves it first. New `playgroundctl functions reload` (the one allowed,
+  hardcoded host mutation) sheds cached workers after edits. Runtime container got
+  cpu/mem limits. The "Edge Functions can't be deployed here" bullet is replaced by
+  the deploy instructions above. *(Why: closes the second capability gap; contained
+  by Deno sandbox + ro-mount + limits on the dev instance.)*
+- **2026-07-25 — Ansible agent** — **pg_cron enabled.** The image had it preloaded
+  all along (`shared_preload_libraries` + `cron.database_name=postgres` are upstream
+  defaults); only `create extension pg_cron` was missing. Provisioning now creates it
+  idempotently (`roles/supabase_bootstrap`, also on fresh rebuilds) — the platform-limits
+  bullet above is corrected accordingly: schedule via `cron.schedule` as `postgres`,
+  app-prefix your job names. Edge-function deploys remain unavailable (operator
+  decision pending). *(Why: operator approved enabling cron; live-verified
+  schedule/unschedule round-trip.)*
+- **2026-07-25 — Ansible agent** — Folded the 2026-07-23 entries into the
+  provisioning template AND implemented the diagnostics hand-off: new read-only
+  `playgroundctl host stats` / `host diag` / `host promql '<expr>'` commands
+  (broker-side; sysstat installed on the host), documented under "What you can do".
+  cAdvisor + the Prometheus scrape job were already provisioned in the monitoring
+  stack. *(Why: closes the "host is full but can't attribute it" gap from the live
+  diagnosis, strictly read-only via the existing broker channel.)*
+- **2026-07-23 — Claude (Opus 4.8)** — Added the **prefix-scoped teardown rule** to the
+  Supabase quick reference: on the shared instance an app's reset/reset-script must drop
+  ONLY its own prefixed objects (enumerate `pg_*` catalogs by `app\_%`/`ext\_%`), never
+  `drop schema public cascade` or a blanket drop. *(Why: user feedback — the namespacing
+  rule must govern deletion too; an unscoped teardown on the shared instance is data loss
+  for every other app. Extends the existing app-name namespacing guidance.)*
+- **2026-07-23 — Claude (Opus 4.8)** — Documented **platform capabilities & limits**
+  of the self-hosted Supabase in the Supabase quick reference (verified live while
+  deploying an app to pg4): `pg_trgm`/`btree_gist`/`pgtap`/`pgcrypto` are
+  enable-on-demand but **`pg_cron` is absent** (cron work → Database Webhooks);
+  **Edge Functions have no deploy path** here (runtime reachable, but
+  `supabase functions deploy` targets the hosted platform and files can't be placed
+  in the platform-owned runtime container) — use `SECURITY DEFINER` RPCs for
+  server-side process logic; **`storage.objects` blocks direct `DELETE`**
+  (`protect_delete`); **views over RLS tables need `security_invoker=true`** or they
+  bypass RLS. *(Why: these are provisioning-level facts — if the platform should
+  offer edge-function deploys or `pg_cron`, that's an **Ansible/Supabase-provisioning
+  decision**, not an app fix. Operator: please forward the two capability gaps —
+  edge-function deploy path and `pg_cron` — to the Ansible agent; the rest is guidance
+  for the next session.)*
+- **2026-07-22 — Ansible agent** — Folded all entries below into the Ansible
+  provisioning template (`roles/claude_playground/templates/CLAUDE.md.j2`), so
+  redeploys now preserve them. *(Why: this file is re-rendered role-owned on every
+  playground deploy; un-propagated live edits would be overwritten.)*
+- **2026-07-22 — Claude (Opus 4.8)** — Introduced this change-management workflow:
+  Claude may edit CLAUDE.md on new findings, must notify the user, and records each
+  change here; the operator forwards the file to the Ansible Script Agent (Claude has
+  no Ansible access). *(Why: keep the manual truthful across sessions and give the
+  human a clear hand-off path to provisioning.)*
+- **2026-07-22 — Claude (Opus 4.8)** — Rewrote the Playwright "Testing a deployed
+  WebUI" auth steps: routes are behind **authentik SSO** (form login), not HTTP
+  basic_auth; correct env vars are `$PLAYGROUND_SSO_USER` / `$PLAYGROUND_SSO_PASS`
+  (the `PLAYGROUND_ROUTE_BASICAUTH_*` vars are not set); embedding `user:pass@` in the
+  URL does not authenticate — the login form must be driven step by step. *(Why:
+  verified live — the documented basic_auth flow was a dead end and cost two failed
+  login attempts.)*
+- **2026-07-22 — Claude (Opus 4.8)** — Added a top banner marking this file as the
+  **playground agent's** manual only, and clarifying that any other reader (esp. the
+  Ansible agent) receives it as a document to review/propagate, not as instructions.
+  The "integrate into provisioning" task stays OUT of the file — it belongs in the
+  operator's hand-off prompt. *(Why: prevent role confusion when the file is passed to
+  a different agent; the reader's identity comes from how the file is delivered.)*
+- **2026-07-22 — Claude (Opus 4.8)** — Wrote the shared-Supabase namespacing rule
+  into the Supabase quick reference: one shared instance across all envs/apps —
+  namespace objects by **app** name (`guestbook_*`), never by environment/pgN; REST
+  exposes only the `public` schema (`PGRST106` otherwise), so per-app schema is
+  server-side only and prefixing is the sole browser-path isolation. *(Why: verified
+  live this session; prevents cross-app collisions and env-bound naming.)*

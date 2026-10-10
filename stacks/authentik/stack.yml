@@ -1,0 +1,35 @@
+---
+# compose_stack settings for Authentik (self-hosted IdP/SSO).
+# Self-contained: own Postgres. Data lives in host binds under the 'authentik' data
+# domain (/srv/authentik/* -> @authentik subvolume on btrfs; see group_vars/all/storage.yml
+# + roles/data_storage). Postgres (postgres:16-alpine) chowns its own dir on first init.
+
+dir: /opt/authentik
+
+# Bind-mounted into the containers at /blueprints/custom (see the compose).
+dirs:
+  - blueprints
+
+configs:
+  - { src: configs/env.j2, dest: .env, mode: "0600" }   # secrets
+  # Declarative SSO config (proxy providers + apps + outpost binding).
+  - { src: blueprints/forward-auth.yaml.j2, dest: blueprints/forward-auth.yaml }
+  # Declarative native-OIDC apps (OAuth2 providers + applications).
+  - { src: blueprints/oauth-apps.yaml.j2, dest: blueprints/oauth-apps.yaml }
+  # LDAP provider + outpost (for LDAP-only clients like WebDAV).
+  - { src: blueprints/ldap.yaml.j2, dest: blueprints/ldap.yaml }
+  # MFA enforcement on the default login flow (authentik_mfa_enforce, default true).
+  - { src: blueprints/mfa.yaml.j2, dest: blueprints/mfa.yaml }
+
+# Authentik exposes a readiness endpoint once migrations + server are up. First
+# start runs all DB migrations, so give it real headroom.
+health_url: "http://127.0.0.1:{{ authentik_http_port }}/-/health/ready/"
+health_status: [200, 204]
+health_retries: 40
+health_delay: 10
+
+status_msg: >-
+  Authentik up at https://authentik.<host> (server on
+  127.0.0.1:{{ authentik_http_port }}). First login: akadmin /
+  <vault_authentik_bootstrap_password> — change it in the UI. Forward-auth
+  outpost for other services: 127.0.0.1:{{ authentik_http_port }}/outpost.goauthentik.io/.

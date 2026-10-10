@@ -1,0 +1,80 @@
+---
+# Imperative bootstrap that complements the declarative LDAP config (like
+# immich_bootstrap): hand the LDAP outpost its API token so the authentik-ldap
+# container can connect. Authentik creates the token when the blueprint creates
+# the outpost; a blueprint can't expose it, so we read it via the API (bootstrap
+# token), write it to /opt/authentik/ldap-outpost.env, and restart the container
+# when it changes. Idempotent: the file only changes if the token does.
+
+- name: Wait for the LDAP outpost (the API name filter is NOT exact — filter locally)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ authentik_http_port }}/api/v3/outposts/instances/"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ vault_authentik_bootstrap_token }}"
+    status_code: [200]
+  register: _ak_ldap_outpost
+  until: >-
+    _ak_ldap_outpost.json.results | default([])
+    | selectattr('name', 'equalto', authentik_ldap_outpost_name) | list | length > 0
+  retries: 30
+  delay: 5
+  failed_when: false          # tolerant: blueprint may still be applying — re-run finishes it
+  when:
+    - authentik_ldap_enabled | default(false) | bool
+    - not ansible_check_mode
+
+- name: Select the LDAP outpost's token identifier (exact name match)
+  ansible.builtin.set_fact:
+    _ak_ldap_token_id: >-
+      {{ (_ak_ldap_outpost.json.results | default([])
+          | selectattr('name', 'equalto', authentik_ldap_outpost_name)
+          | first).token_identifier }}
+  when:
+    - authentik_ldap_enabled | default(false) | bool
+    - not ansible_check_mode
+    - (_ak_ldap_outpost.json.results | default([]) | selectattr('name', 'equalto', authentik_ldap_outpost_name) | list | length > 0)
+
+- name: Fetch the outpost token key
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ authentik_http_port }}/api/v3/core/tokens/{{ _ak_ldap_token_id }}/view_key/"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ vault_authentik_bootstrap_token }}"
+    status_code: [200]
+  register: _ak_ldap_token
+  no_log: true
+  when:
+    - authentik_ldap_enabled | default(false) | bool
+    - not ansible_check_mode
+    - _ak_ldap_token_id is defined
+
+- name: Write the LDAP outpost token env file
+  ansible.builtin.copy:
+    dest: /opt/authentik/ldap-outpost.env
+    content: "AUTHENTIK_TOKEN={{ _ak_ldap_token.json.key }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  register: _ak_ldap_env
+  no_log: true
+  when:
+    - authentik_ldap_enabled | default(false) | bool
+    - not ansible_check_mode
+    - _ak_ldap_token is defined
+    - _ak_ldap_token.json is defined
+
+# RECREATE, not `docker restart`: the token reaches the container through env_file, and
+# docker reads env files only when a container is CREATED. A plain restart kept the outpost
+# without AUTHENTIK_TOKEN — it crash-looped after every fresh install until some later
+# deploy happened to recreate it. `compose up -d` sees the changed env file and recreates.
+- name: Recreate the LDAP outpost when its token changed
+  ansible.builtin.command: docker compose up -d ldap
+  args:
+    chdir: "{{ compose_stack_base_dir | default('/opt') }}/authentik"
+  changed_when: true
+  when:
+    - authentik_ldap_enabled | default(false) | bool
+    - not ansible_check_mode
+    - _ak_ldap_env is defined
+    - _ak_ldap_env is changed

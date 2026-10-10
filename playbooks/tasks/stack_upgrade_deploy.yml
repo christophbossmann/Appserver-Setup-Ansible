@@ -1,0 +1,49 @@
+---
+# (Re)deploy the service of stack-upgrade.yml with whatever version is currently set, then
+# verify it. Used for the upgrade AND for the rollback (same checks for the old image).
+# Expects: _svc (catalog entry), _expect_tag (tag the containers must run),
+# upgrade_settle_seconds, upgrade_health_retries.
+- name: Redeploy the compose stack
+  ansible.builtin.include_role:
+    name: compose_stack
+  vars:
+    stack: "{{ _svc.stack }}"
+  when: _svc.stack is defined
+
+- name: Re-run the role
+  ansible.builtin.include_role:
+    name: "{{ _svc.role }}"
+  when: _svc.role is defined
+
+# compose_stack's URL probe never fails the play, and "up -d" returns before a crash loop
+# shows — so check the containers themselves: running, the expected image, healthy (if a
+# healthcheck exists), and still up with an unchanged restart count after a settle time.
+- name: Verify the containers (running, right image, healthy, not restart-looping)
+  ansible.builtin.shell: |
+    set -u
+    fail() { echo "VERIFY FAILED: $*"; exit 1; }
+    for c in {{ _svc.containers | join(' ') }}; do
+      img=$(docker inspect "$c" -f '{{ '{{.Config.Image}}' }}' 2>/dev/null) || fail "$c does not exist"
+      case "$img" in *":{{ _expect_tag }}") ;; *) fail "$c runs $img, expected tag {{ _expect_tag }}" ;; esac
+      if [ "$(docker inspect "$c" -f '{{ '{{if .State.Health}}yes{{end}}' }}')" = yes ]; then
+        for i in $(seq 1 {{ upgrade_health_retries }}); do
+          [ "$(docker inspect "$c" -f '{{ '{{.State.Health.Status}}' }}')" = healthy ] && break
+          [ "$i" = "{{ upgrade_health_retries }}" ] && fail "$c did not become healthy"
+          sleep 5
+        done
+      fi
+    done
+    declare -A before
+    for c in {{ _svc.containers | join(' ') }}; do before[$c]=$(docker inspect "$c" -f '{{ '{{.RestartCount}}' }}'); done
+    sleep {{ upgrade_settle_seconds }}
+    for c in {{ _svc.containers | join(' ') }}; do
+      [ "$(docker inspect "$c" -f '{{ '{{.State.Running}}' }}')" = true ] || fail "$c is not running after {{ upgrade_settle_seconds }}s"
+      [ "$(docker inspect "$c" -f '{{ '{{.RestartCount}}' }}')" = "${before[$c]}" ] || fail "$c restarted during the settle time (crash loop?)"
+    done
+    echo "verified: {{ _svc.containers | join(' ') }}"
+  args:
+    executable: /bin/bash
+  register: _verify
+  changed_when: false
+  failed_when: _verify.rc != 0
+  when: _svc.containers | default([]) | length > 0

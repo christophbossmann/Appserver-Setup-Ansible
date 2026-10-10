@@ -1,0 +1,18 @@
+# Per-stack settings for compose_stack (see roles/compose_stack/defaults/main.yml).
+compose_mode: "0600"   # compose file contains the shared postgres credentials
+networks:
+  - backend            # shared net; the postgres stack lives there
+dirs:
+  # ABSOLUTE path — the media library lives in the 'business' data domain
+  # (/srv/business/immich), NOT under the compose project dir.
+  - "{{ immich_upload_dir }}"
+configs:
+  # Authentik OIDC config (contains the client secret -> 0640). Only mounted when
+  # immich_oidc_enabled; harmless to deploy otherwise.
+  - { src: configs/immich-config.json.j2, dest: immich-config.json, mode: "0640" }
+# First start runs DB migrations and downloads ML models — give it headroom.
+health_url: "http://127.0.0.1:{{ immich_port }}/api/server/ping"
+health_retries: 30
+health_delay: 5
+status_msg: >-
+  Photos (Voll-App): https://{{ svc_edge_host['immich_int'] }} — first user to register becomes admin. Shares: https://{{ svc_edge_host['immich'] }}.

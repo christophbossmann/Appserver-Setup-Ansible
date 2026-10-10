@@ -1,0 +1,19 @@
+# Per-stack settings for compose_stack (see roles/compose_stack/defaults/main.yml).
+compose_mode: "0600"   # compose references the read-only headscale config mount
+networks:
+  - backend            # shared net so headplane reaches headscale by name
+dirs:
+  - config             # -> /opt/headplane/config  (mounted /etc/headplane)
+  - data               # -> /opt/headplane/data     (mounted /var/lib/headplane)
+configs:
+  # Contains the Headscale API key + cookie secret -> 0640.
+  - { src: configs/config.yaml.j2, dest: config/config.yaml, mode: "0640" }
+pull: true
+# Behind proxy_auth, an unauthenticated poll from the host may 401/redirect —
+# any of these means "headplane is up".
+health_url: "http://127.0.0.1:{{ headplane_port }}/"
+health_status: [200, 302, 303, 307, 401, 403]
+health_retries: 20
+health_delay: 3
+status_msg: >-
+  Headplane UI (internal + SSO): {{ headplane_base_url }}/admin  (the UI lives under /admin)

@@ -1,0 +1,162 @@
+---
+# =============================================================================
+# headscale_bootstrap — declarative Headscale provisioning (post-stack).
+#
+# Runs ONLY where the headscale stack is deployed (headscale in caddy_services).
+# Idempotent:
+#   - users: created once, checked against the live `users list -o json`
+#   - pre-auth keys: created ONCE per user and CACHED on the controller
+#     (create-if-no-cached-file) so re-runs never spam new keys
+#   - headplane API key: same create-if-no-cached-file pattern
+# CLI (headscale v0.29): `users create NAME`, `preauthkeys create --user <ID>`
+# (ID, not name!), `apikeys create`.
+# =============================================================================
+- name: Headscale bootstrap
+  when: "'headscale' in (caddy_services | default({}))"
+  block:
+    - name: Wait until headscale answers (users list)
+      ansible.builtin.command: docker exec headscale headscale users list -o json
+      register: _hs_list
+      changed_when: false
+      check_mode: false   # read-only query; --check needs the real state
+      failed_when: false
+      retries: 12
+      delay: 3
+      until: _hs_list.rc == 0
+
+    - name: Fail if headscale never became ready
+      ansible.builtin.assert:
+        that: [_hs_list.rc == 0]
+        fail_msg: "headscale did not answer 'users list' — is the stack up?"
+
+    - name: Existing headscale user names
+      # Robust to empty stdout: headscale returns 'null' for no users, but --check (and
+      # some builds) yield an empty string, on which `from_json` throws before `or []`.
+      # Coerce empty/whitespace to 'null' first, then `or []` handles null/empty-list.
+      ansible.builtin.set_fact:
+        _hs_existing: "{{ (((_hs_list.stdout | default('') | trim) or 'null') | from_json or []) | map(attribute='name') | list }}"
+
+    - name: Create missing headscale users
+      # --email lets Headplane auto-link the Authentik SSO identity to this user
+      # (matched by email); omitted when no email is configured for the user.
+      ansible.builtin.command: >-
+        docker exec headscale headscale users create {{ item }}
+        {{ ('--email ' + (headscale_user_emails[item])) if (headscale_user_emails[item] | default('')) else '' }}
+      loop: "{{ headscale_users }}"
+      loop_control: { label: "{{ item }}" }
+      when: item not in _hs_existing
+      changed_when: true
+
+    - name: Re-read users (fresh name -> id map incl. new ones)
+      ansible.builtin.command: docker exec headscale headscale users list -o json
+      register: _hs_list2
+      changed_when: false
+      check_mode: false   # read-only query; --check needs the real state
+
+    - name: Build name -> id map
+      ansible.builtin.set_fact:
+        _hs_uid: "{{ dict(_u | map(attribute='name') | list | zip(_u | map(attribute='id') | list)) }}"
+      vars:
+        # Same empty-stdout hardening as _hs_existing above (null / '' / [] -> []).
+        _u: "{{ ((_hs_list2.stdout | default('') | trim) or 'null') | from_json or [] }}"
+
+    - name: Ensure controller-side key store exists
+      ansible.builtin.file:
+        path: "{{ headscale_keys_dir }}/{{ inventory_hostname }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Check for a cached pre-auth key per user (controller)
+      ansible.builtin.stat:
+        path: "{{ headscale_keys_dir }}/{{ inventory_hostname }}/{{ item }}.preauthkey"
+      loop: "{{ headscale_users }}"
+      loop_control: { label: "{{ item }}" }
+      delegate_to: localhost
+      become: false
+      register: _hs_keystat
+
+    # headscale is the source of truth, not the controller cache: after a headscale
+    # REBUILD (wiped DB) the old cached keys survive on the controller but are invalid
+    # in the fresh DB. Regenerate whenever the user has NO key in the CURRENT headscale
+    # (fresh DB) — not just when the cache file is missing. (Key secrets are masked in
+    # `list`, so we can't recover an existing key; a missing cache also forces a create.)
+    - name: List existing headscale pre-auth keys (survives cache/DB drift)
+      ansible.builtin.command: docker exec headscale headscale preauthkeys list -o json
+      register: _hs_pak_raw
+      changed_when: false
+      check_mode: false   # read-only query; --check needs the real state
+
+    - name: Users that already have a pre-auth key in the CURRENT headscale
+      ansible.builtin.set_fact:
+        _hs_users_with_key: "{{ (((_hs_pak_raw.stdout | trim) or 'null') | from_json or []) | map(attribute='user.name') | list | unique }}"
+
+    - name: Create a reusable pre-auth key (no cached one, or headscale has none — e.g. after a rebuild)
+      ansible.builtin.command: >-
+        docker exec headscale headscale preauthkeys create
+        --user {{ _hs_uid[item.item] }} --reusable --expiration {{ headscale_preauthkey_expiration }}
+      loop: "{{ _hs_keystat.results }}"
+      loop_control: { label: "{{ item.item }}" }
+      when: (not item.stat.exists) or (item.item not in _hs_users_with_key)
+      register: _hs_keycreate
+      changed_when: true
+      no_log: true
+
+    - name: Cache new pre-auth keys on the controller (chmod 600)
+      ansible.builtin.copy:
+        content: "{{ item.stdout | trim }}\n"
+        dest: "{{ headscale_keys_dir }}/{{ inventory_hostname }}/{{ item.item.item }}.preauthkey"
+        mode: "0600"
+      loop: "{{ _hs_keycreate.results | default([]) }}"
+      loop_control: { label: "{{ item.item.item | default('') }}" }
+      when: not (item.skipped | default(false))
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    # --- headplane API key ----------------------------------------------------
+    - name: Check for a cached headplane API key (controller)
+      ansible.builtin.stat:
+        path: "{{ headscale_keys_dir }}/{{ inventory_hostname }}/headplane.apikey"
+      delegate_to: localhost
+      become: false
+      register: _hs_apistat
+
+    # Same rebuild-safety as the pre-auth keys: regenerate when the cache is missing OR
+    # the fresh headscale has no API key (wiped DB → old cached key is invalid → headplane
+    # could not authenticate to headscale).
+    - name: List existing headscale API keys (survives cache/DB drift)
+      ansible.builtin.command: docker exec headscale headscale apikeys list -o json
+      register: _hs_api_raw
+      changed_when: false
+
+    - name: Whether the CURRENT headscale already has an API key
+      ansible.builtin.set_fact:
+        _hs_has_apikey: "{{ ((((_hs_api_raw.stdout | trim) or 'null') | from_json) or []) | length > 0 }}"
+
+    - name: Create a headplane API key (no cached one, or headscale has none — e.g. after a rebuild)
+      ansible.builtin.command: >-
+        docker exec headscale headscale apikeys create --expiration {{ headscale_apikey_expiration }}
+      register: _hs_apicreate
+      changed_when: true
+      when: (not _hs_apistat.stat.exists) or (not _hs_has_apikey)
+      no_log: true
+
+    - name: Cache the headplane API key on the controller (chmod 600)
+      ansible.builtin.copy:
+        content: "{{ _hs_apicreate.stdout | trim }}\n"
+        dest: "{{ headscale_keys_dir }}/{{ inventory_hostname }}/headplane.apikey"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      when: not (_hs_apicreate.skipped | default(false))
+      no_log: true
+
+    - name: Headscale bootstrap ready
+      ansible.builtin.debug:
+        msg: >-
+          Headscale users [{{ headscale_users | join(', ') }}] + reusable pre-auth keys
+          + a headplane API key are provisioned. Keys cached on the controller at
+          {{ headscale_keys_dir }}/{{ inventory_hostname }}/ (chmod 600). Enrol a device with:
+          tailscale up --login-server {{ headscale_server_url }} --authkey "$(cat {{ headscale_keys_dir }}/{{ inventory_hostname }}/<user>.preauthkey)"

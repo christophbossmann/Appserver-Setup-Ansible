@@ -13,6 +13,13 @@
 # earlier in the play (it also adds the Docker CE apt repo that provides
 # docker-ce-rootless-extras).
 # =============================================================================
+# Intent-aware post-check: mark the playground deployed in THIS run so its routes
+# (webdav-playground, pg1..pgN environments) are only checked when the role actually ran.
+# Routes map here via depends_service: playground.
+- name: Register playground as deployed (intent-aware post-check)
+  ansible.builtin.set_fact:
+    deployed_services: "{{ (deployed_services | default([])) + ['playground'] }}"
+
 - name: Fresh start - tear down claude-ctl stack and image (when requested)
   when: playground_fresh_start | default(false) | bool
   ansible.builtin.import_tasks: fresh_start.yml
