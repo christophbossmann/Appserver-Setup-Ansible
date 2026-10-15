@@ -6,7 +6,7 @@
 # Dozzle = "what is happening right now", Grafana = "since when / trend".
 # Route: dozzle.<internal_host> behind Authentik forward-auth (admins only).
 
-dozzle_version: "v8"                       # major tag; pin e.g. "v8.13.8" for stricter reproducibility
+dozzle_version: "v11"                      # major tag; pin a full version for stricter reproducibility
 dozzle_image: "amir20/dozzle:{{ dozzle_version }}"
 
 # Host loopback port (Caddy fronts it on the internal route).

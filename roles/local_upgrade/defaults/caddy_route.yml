@@ -1,0 +1,16 @@
+# Caddy route for the on-host upgrade page (roles/local_upgrade) — loaded explicitly by caddy.
+# Internal (VPN) + Authentik forward-auth: needs the matching entry in
+# authentik_forward_auth_apps (admins only — do NOT add access_groups) and
+# `upgrade: internal` in the host's caddy_services. The upstream is the loopback-only webhook
+# service; behind the login all of its hooks are reachable here:
+#   /hooks/upgrade (confirm page), /hooks/upgrade-status, /hooks/app-upgrade (start).
+caddy_route_upgrade:
+  name: upgrade
+  hostname_label: upgrade
+  caddy_upstream: "127.0.0.1:{{ monitoring_webhook_port | default(9777) }}"
+  caddy_forward_auth: true
+  # The site's root shows the portal's overview. A rewrite only changes the path — the request
+  # still passes the forward-auth gate (a `handle` here would NOT: it is ordered before the
+  # gated route block).
+  caddy_extra: |
+    rewrite / /hooks/upgrade

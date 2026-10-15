@@ -40,10 +40,10 @@
         that:
           - upgrade_confirm | default('') == 'YES'
           - upgrade_service in upgrade_catalog
-          - upgrade_catalog[upgrade_service].playbook == 'stack-upgrade.yml'
+          - (upgrade_catalog[upgrade_service].playbook | default('')) == 'stack-upgrade.yml'
           - (upgrade_version | default('')) | length > 0
         fail_msg: >-
-          Need -e upgrade_service=<one of {{ upgrade_catalog | dict2items | selectattr('value.playbook', 'equalto', 'stack-upgrade.yml') | map(attribute='key') | join(', ') }}>
+          Need -e upgrade_service=<one of {{ upgrade_catalog | dict2items | selectattr('value.playbook', 'defined') | selectattr('value.playbook', 'equalto', 'stack-upgrade.yml') | map(attribute='key') | join(', ') }}>
           -e upgrade_version=<tag> -e upgrade_confirm=YES. (immich / nextcloud / authentik
           have their own playbooks with a database rollback.)
 

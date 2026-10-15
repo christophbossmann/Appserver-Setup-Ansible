@@ -178,8 +178,10 @@ panels = [
          'count(count by (image) (trivy_image_newer_version_info)) or vector(0)', 0, 4, steps=BLUE, y=25, h=5),
     stat(54, "Registry comparison (age)",
          "When the comparison with the registries (newer builds + newer versions) last completed. It runs at most "
-         "once per ~20h (nightly) because every run costs registry requests — Docker Hub rate-limits anonymous IPs; "
-         "scans started in between (button) reuse this result and only rescan the local images. Orange after 30h = "
+         "once per 12h (in practice: the nightly run) because every run costs registry requests — Docker Hub "
+         "rate-limits anonymous IPs. Scans in between (button, after an upgrade) reuse the cached result and only "
+         "rescan the local images; a newly running version gets its update targets from the cached tag lists, its "
+         "'after' finding counts follow with the next comparison. Orange after 30h = "
          "the registry was unreachable or rate-limited (journalctl -u trivy-metrics).",
          'time() - max(trivy_registry_check_timestamp_seconds > 0)', 0, 4, unit="s",
          steps=[{"color": "green", "value": None}, {"color": "orange", "value": 108000}], y=30, h=5),
@@ -332,8 +334,14 @@ prio_ov = [{"matcher": {"id": "byName", "options": name}, "properties": [
                    {"color": "text", "value": None}, {"color": color, "value": 1}]}},
                {"id": "custom.width", "value": 175}]}
            for _, _, _, name, color in PRIO_COLS]
-prio_ov += [{"matcher": {"id": "byName", "options": n}, "properties": [{"id": "custom.width", "value": w}]}
-            for n, w in (("Image", 330), ("① Minor update to", 150), ("② Next major", 150), ("③ Newest major", 150))]
+prio_ov += [{"matcher": {"id": "byName", "options": "Image"}, "properties": [{"id": "custom.width", "value": 330}]}]
+# the version cells link to the on-host upgrade page (roles/local_upgrade): /hooks/upgrade on the
+# Grafana host redirects to the login-protected page, which asks for confirmation first
+prio_ov += [{"matcher": {"id": "byName", "options": n}, "properties": [
+                {"id": "custom.width", "value": 150},
+                {"id": "links", "value": [{"title": "Upgrade to ${__value.raw} …", "targetBlank": True,
+                                           "url": "/hooks/upgrade?image=${__data.fields.Image}&version=${__value.raw}"}]}]}
+            for n in ("① Minor update to", "② Next major", "③ Newest major")]
 prio_ov.append({"matcher": {"id": "byName", "options": "Image age"}, "properties": [
     {"id": "unit", "value": "d"}, {"id": "decimals", "value": 0}, {"id": "custom.width", "value": 105},
     {"id": "custom.cellOptions", "value": {"type": "color-text"}},
@@ -349,7 +357,8 @@ panels.append({
                    "findings only that removes — the realistic next step where majors must not be skipped "
                    "(Nextcloud). ③ Newest major: what going all the way removes on top. ④ What stays open even "
                    "then — nothing to do but know. Counts are findings (per package); findings without a CVSS score "
-                   "are in no column. Empty cell = none / no such version.",
+                   "are in no column. Empty cell = none / no such version. Click a version to upgrade to it from "
+                   "the server itself (opens the confirm page; needs on-host upgrades, roles/local_upgrade).",
     "gridPos": {"h": 14, "w": 24, "x": 0, "y": 37},
     "fieldConfig": {"defaults": {"custom": {"align": "auto", "filterable": True}}, "overrides": prio_ov},
     "options": {"showHeader": True, "cellHeight": "sm",
@@ -364,6 +373,48 @@ panels.append({
             "renameByName": prio_rename,
             "indexByName": {k: i for i, k in enumerate(prio_order)}}}],
     "targets": [{"datasource": ds, "expr": e, "format": "table", "instant": True, "refId": r} for r, e in prio_targets]})
+
+# --- results of on-host upgrades (roles/local_upgrade: app-upgrade.prom) ---
+for p in panels:
+    if p["gridPos"]["y"] >= 51:
+        p["gridPos"]["y"] += 6
+panels.append({
+    "datasource": ds, "id": 56, "title": "On-host upgrades (last result per service)", "type": "table",
+    "description": "Upgrades started on the server itself (click a version in the table above, or open the "
+                   "upgrade page). Result: what the upgrade playbook reported — FAILED means it rolled back "
+                   "(details: journalctl -u 'app-upgrade@*' on the host). Empty = none yet, or on-host upgrades "
+                   "are not enabled on this host.",
+    "gridPos": {"h": 6, "w": 20, "x": 0, "y": 51},
+    "links": [{"title": "Upgrade page", "url": "/hooks/upgrade", "targetBlank": True}],
+    "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Result"}, "properties": [
+            {"id": "mappings", "value": [{"type": "value", "options": {
+                "1": {"text": "upgraded", "color": "green", "index": 0},
+                "0": {"text": "FAILED / rolled back", "color": "red", "index": 1}}}]},
+            {"id": "custom.cellOptions", "value": {"type": "color-text"}}]},
+        {"matcher": {"id": "byName", "options": "Finished"}, "properties": [{"id": "unit", "value": "dateTimeFromNow"}]},
+        {"matcher": {"id": "byName", "options": "Duration"}, "properties": [{"id": "unit", "value": "s"}]},
+        {"matcher": {"id": "byName", "options": "Target"}, "properties": [
+            {"id": "mappings", "value": [{"type": "value", "options": {
+                "same-major": {"text": "minor update", "index": 0}, "next-major": {"text": "next major", "index": 1},
+                "latest": {"text": "newest major", "index": 2}}}]}]}]},
+    "options": {"showHeader": True, "cellHeight": "sm", "sortBy": [{"displayName": "Finished", "desc": True}]},
+    "transformations": [
+        {"id": "joinByField", "options": {"byField": "service", "mode": "outer"}},
+        {"id": "organize", "options": {
+            "excludeByName": {"Time": True, "Time 1": True, "Time 2": True, "Time 3": True},
+            "renameByName": {"service": "Service", "version": "Version", "target": "Target", "Value #A": "Result",
+                             "Value #B": "Finished", "Value #C": "Duration"},
+            "indexByName": {"service": 0, "version": 1, "target": 2, "Value #A": 3, "Value #B": 4, "Value #C": 5}}}],
+    "targets": [{"datasource": ds, "expr": e, "format": "table", "instant": True, "refId": r} for r, e in (
+        ("A", 'max by (service, version, target) (app_upgrade_last_result)'),
+        ("B", 'max by (service) (app_upgrade_last_timestamp_seconds) * 1000'),
+        ("C", 'max by (service) (app_upgrade_last_duration_seconds)'))]})
+RUNNING = stat(57, "Upgrade running", "1 while an upgrade started on the server is running (only one at a time).",
+               'max(app_upgrade_running) or vector(0)', 20, 4, steps=BLUE, y=51, h=6)
+RUNNING["fieldConfig"]["defaults"]["mappings"] = [{"type": "value", "options": {
+    "0": {"text": "no", "index": 0}, "1": {"text": "yes", "index": 1}}}]
+panels.append(RUNNING)
 
 d = {k: ref[k] for k in ref if k not in ('panels', 'title', 'uid', 'tags', 'description', 'id', 'version', 'time', 'templating')}
 d.update(title="Vulnerabilities", uid="vulnerabilities", tags=["security", "ansible"], panels=panels,

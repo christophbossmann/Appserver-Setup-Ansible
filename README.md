@@ -63,6 +63,8 @@ profiles in host_vars). The application configuration does not change.
 │   ├── server-proxy.yml            # cloudflared + Caddy proxy host (no apps)
 │   ├── backup-pull.yml             # OPS: pull a local backup to the controller
 │   ├── nextcloud-restore*.yml      # OPS: restore (DESTRUCTIVE) — run deliberately
+│   ├── *-upgrade.yml               # OPS: upgrades with verification + automatic rollback
+│   ├── vars/upgrade_catalog.yml    # how each service is upgraded (one entry per service)
 │   └── tests/                      # TEST-only, NEVER deployed (see playbooks/tests/README.md)
 ├── roles/                          # dedicated roles — services WITH lifecycle logic
 │                                   #   (everything here is PRODUCTION; no test roles)
@@ -233,10 +235,15 @@ Dedicated roles:
 | `tailscale` | Tailscale VPN with identity backup/restore |
 | `compose_stack` | Generic deployer for everything under `stacks/` |
 | `n8n` | n8n workflow engine, reverse-proxy env, WebDAV brain access, agent dirs |
-| `monitoring` | Prometheus + Grafana with provisioned datasource/dashboards |
+| `monitoring` | Prometheus + Grafana with provisioned datasource/dashboards; host-side collectors incl. a nightly vulnerability scan of the running images (trivy) that also reports which newer version would fix what, and a snapshot overview with the space each btrfs snapshot would free |
+| `local_upgrade` | Upgrades started **on the server itself** from a login-protected page — no controller, no third party holding keys; the same page lists the btrfs snapshots and can delete them or roll a volume back ([README](roles/local_upgrade/README.md)) |
+| `postgres_pitr` | WAL archiving + daily base backups (point-in-time recovery) per postgres instance |
+| `storagebox` | Hetzner Storage Box mounted via rclone (large immich originals live there) |
+| `storagebox_backup` | Copies that survive the server: immich thumbnails mirrored nightly, `pg_dump` sets every 4 days, onto the Storage Box |
+| `backup_restic` | Nightly cloud backup (restic over rclone) |
 | `cockpit` | Cockpit web console (apt/systemd) |
 | `claude_playground` | Sandboxed Claude Code runtime: rootless Docker, root broker (`playgroundctl`), public demo route, WebDAV for workspace + memory files |
-| `caddy` | Caddy reverse proxy: TLS modes, xcaddy DNS plugins, route resolver, acme-dns registration/seeding, certificate gates |
+| `caddy` | Caddy reverse proxy: TLS modes, xcaddy DNS plugins (the package is then put on hold — new releases come in via `host-upgrade.yml`), route resolver, acme-dns registration/seeding, certificate gates |
 | `caddy_post_check` | End-to-end HTTP checks of every routed hostname after deployment |
 | `cloudflare_dns` | Cloudflare DNS records via API (tunnel CNAMEs) |
 | `cloudflared` | Tunnel connector install + API-managed public hostnames |
@@ -249,6 +256,25 @@ Compose stacks (`stacks/<name>/`, deployed by `compose_stack`):
 | `pgadmin` | pgAdmin 4 with auto-registered Postgres server |
 | `komodo` | [Komodo](https://komo.do) container/deployment management (Core + Periphery + FerretDB) |
 | `playwright_mcp` | Playwright MCP server with noVNC browser view |
+
+---
+
+## Keeping it current
+
+Three layers, each with its own mechanism:
+
+- **Ubuntu security updates** install themselves (`unattended-upgrades`, `hardening` role).
+- **Everything else on the host** — Docker, Tailscale, the custom Caddy build, a reboot —
+  is `playbooks/host-upgrade.yml`.
+- **Container images** are pinned in the private config. The `monitoring` role scans the
+  running images every night (trivy) and compares them with the registries: the
+  "Vulnerabilities" dashboard shows per image which newer version exists and how many
+  findings it removes. The comparison is cached for 12 hours, because anonymous registry
+  requests are rate-limited (Docker Hub) and the same limit applies to real pulls.
+
+Upgrades run through playbooks that verify the result and roll back on failure
+([playbooks/README.md](playbooks/README.md#upgrades-with-automatic-rollback)) — from the
+controller, or, with `roles/local_upgrade`, from a page on the server itself.
 
 ---
 

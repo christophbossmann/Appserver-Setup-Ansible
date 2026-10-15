@@ -1,0 +1,94 @@
+#!/bin/bash
+# Managed by Ansible (roles/storagebox_backup). Backups onto the Storage Box.
+#
+#   storagebox-backup thumbs            mirror the immich thumbnails to the box
+#   storagebox-backup dumps [--force]   dump the databases if the newest set is at least
+#                                       {{ storagebox_backup_dump_interval_days }} days old (--force: now); keep the last {{ storagebox_backup_dump_keep }} sets
+#   storagebox-backup list              what is on the box
+#   storagebox-backup restore-thumbs    copy the thumbnails back (adds/overwrites, deletes nothing)
+#   storagebox-backup fetch-dumps [<set>]   download a dump set (default: newest) to
+#                                       {{ storagebox_backup_dump_workdir }}/<set>/ — restore with pg_restore
+set -euo pipefail
+
+RCLONE=(rclone --config {{ storagebox_config_file }})
+REMOTE="{{ storagebox_remote_name }}:{{ [storagebox_remote_subdir, storagebox_root_path, storagebox_backup_dir] | select | join('/') }}"
+THUMBS_SRC="{{ storagebox_backup_thumbs_src }}"
+WORK="{{ storagebox_backup_dump_workdir }}"
+INTERVAL_DAYS={{ storagebox_backup_dump_interval_days }}
+KEEP={{ storagebox_backup_dump_keep }}
+TEXTFILE=/var/lib/node_exporter/textfile
+# name|container|user|database
+DATABASES=(
+{% for d in storagebox_backup_databases %}
+  "{{ d.name }}|{{ d.container }}|{{ d.user }}|{{ d.db }}"
+{% endfor %}
+)
+
+metric() {   # <job> <bytes> — success timestamp + size, for the dashboards
+  [ -d "$TEXTFILE" ] || return 0
+  local f="$TEXTFILE/storagebox-backup-$1.prom"
+  { echo "storagebox_backup_last_success_timestamp_seconds{job=\"$1\"} $(date +%s)"
+    echo "storagebox_backup_size_bytes{job=\"$1\"} $2"; } > "$f.tmp" && mv "$f.tmp" "$f"
+}
+remote_size() { "${RCLONE[@]}" size --json "$1" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])' 2>/dev/null || echo 0; }
+sets() { "${RCLONE[@]}" lsf --dirs-only "$REMOTE/db-dumps" 2>/dev/null | tr -d '/' | grep -E '^[0-9]{8}-[0-9]{6}$' | sort || true; }
+
+thumbs() {
+  # An empty source means "not there" (unmounted subvolume, wrong path), never "all deleted".
+  [ -d "$THUMBS_SRC" ] && [ -n "$(find "$THUMBS_SRC" -type f -print -quit)" ] \
+    || { echo "source $THUMBS_SRC is missing or empty — refusing to mirror" >&2; exit 1; }
+  "${RCLONE[@]}" sync "$THUMBS_SRC" "$REMOTE/immich-thumbs" --max-delete {{ storagebox_backup_thumbs_max_delete }} \
+    --transfers 8 --checkers 16 --stats-one-line --stats 0 -v 2>&1 | tail -5
+  metric thumbs "$(remote_size "$REMOTE/immich-thumbs")"
+  echo "thumbs mirrored to $REMOTE/immich-thumbs"
+}
+
+dumps() {
+  local force="${1:-}" newest age stamp dir entry name ctr user db
+  newest=$(sets | tail -1)
+  if [ -n "$newest" ] && [ "$force" != --force ]; then
+    age=$(( $(date +%s) - $(date -d "${newest:0:8} ${newest:9:2}:${newest:11:2}:${newest:13:2}" +%s) ))
+    # 2h tolerance: the timer fires at the same time of day, the previous set finished a bit later
+    if [ "$age" -lt $(( INTERVAL_DAYS * 86400 - 7200 )) ]; then
+      echo "newest dump set $newest is $(( age / 3600 ))h old — next one after ${INTERVAL_DAYS} days"; return 0
+    fi
+  fi
+  stamp=$(date +%Y%m%d-%H%M%S); dir="$WORK/$stamp"
+  mkdir -p "$dir"; chmod 700 "$WORK" "$dir"
+  trap 'rm -rf "$dir"' RETURN
+  for entry in "${DATABASES[@]}"; do
+    IFS='|' read -r name ctr user db <<<"$entry"
+    docker exec "$ctr" pg_dump -U "$user" -Fc "$db" > "$dir/$name.dump"
+    # a dump that pg_restore cannot list is not a backup
+    docker exec -i "$ctr" pg_restore -l < "$dir/$name.dump" > /dev/null
+    echo "dumped $name ($(du -h "$dir/$name.dump" | cut -f1))"
+  done
+  "${RCLONE[@]}" copy "$dir" "$REMOTE/db-dumps/$stamp" --transfers 4
+  "${RCLONE[@]}" check "$dir" "$REMOTE/db-dumps/$stamp" --one-way 2>&1 | tail -1
+  # only now, with the new set safely on the box, drop the oldest ones
+  sets | head -n -"$KEEP" | while read -r old; do
+    [ -n "$old" ] || continue
+    "${RCLONE[@]}" purge "$REMOTE/db-dumps/$old"; echo "removed old set $old"
+  done
+  metric dumps "$(remote_size "$REMOTE/db-dumps")"
+  echo "dump set $stamp on the box; sets kept: $(sets | tr '\n' ' ')"
+}
+
+case "${1:-}" in
+  thumbs) thumbs ;;
+  dumps)  dumps "${2:-}" ;;
+  list)
+    echo "thumbs:  $("${RCLONE[@]}" size "$REMOTE/immich-thumbs" 2>/dev/null | tr '\n' ' ')"
+    echo "dump sets:"; for s in $(sets); do echo "  $s  $("${RCLONE[@]}" lsf --format sp "$REMOTE/db-dumps/$s" | tr '\n' ' ')"; done ;;
+  restore-thumbs)
+    mkdir -p "$THUMBS_SRC"
+    "${RCLONE[@]}" copy "$REMOTE/immich-thumbs" "$THUMBS_SRC" --transfers 8 --checkers 16 --stats-one-line -v 2>&1 | tail -3
+    echo "thumbs copied back to $THUMBS_SRC — check ownership matches the rest of the immich data dir" ;;
+  fetch-dumps)
+    s="${2:-$(sets | tail -1)}"; [ -n "$s" ] || { echo "no dump set on the box" >&2; exit 1; }
+    mkdir -p "$WORK/$s"; chmod 700 "$WORK" "$WORK/$s"
+    "${RCLONE[@]}" copy "$REMOTE/db-dumps/$s" "$WORK/$s"
+    echo "downloaded to $WORK/$s:"; ls -l "$WORK/$s"
+    echo "restore one with e.g.:  docker exec -i <container> pg_restore -U <user> -d <db> --clean --if-exists < $WORK/$s/<name>.dump" ;;
+  *) sed -n '2,12p' "$0"; exit 2 ;;
+esac

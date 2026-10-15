@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+# Managed by Ansible (roles/monitoring). btrfs/snapper snapshots for node_exporter's textfile
+# collector -> "Disk snapshots" dashboard, and (state file) the snapshot page of the on-host
+# portal.
+#
+#   snapshot-metrics [<samples, default 60000>]
+#
+# What costs space is not a snapshot but an EXTENT (a piece of file data) that something
+# still references. Deleting snapshots frees exactly the extents that nothing outside the
+# deleted set references. So the interesting numbers are per SET:
+#   - one snapshot alone ("freed if deleted" — often little, because neighbours share its data)
+#   - all snapshots of a volume, all automatic ones but the newest, those older than 7 days
+# Walking the trees (`btrfs filesystem du`) can only answer the first, and takes over a
+# minute per snapshot of an OS root. Instead this SAMPLES: it picks random positions in the
+# filesystem's data block groups and asks the kernel which subvolumes reference the extent
+# there (btrfs inspect-internal logical-resolve — the method of btdu). From one set of
+# samples every set size follows: (samples referenced only from within the set) x (bytes per
+# sample). 60000 samples take a few minutes at idle priority and resolve about 1.5 MiB each
+# on a 85 GiB filesystem; values are estimates (the smaller, the rougher), which is what a
+# "where did my space go" view needs. No btrfs quotas involved.
+import csv
+import io
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+
+TEXTFILE = os.environ.get("TEXTFILE_DIR", "/var/lib/node_exporter/textfile")
+STATE_DIR = "/var/lib/snapshot-metrics"
+STATE = os.path.join(STATE_DIR, "state.json")
+SAMPLES = int(sys.argv[1]) if len(sys.argv) > 1 else 60000
+OLD_DAYS = 7
+SETS = {"all": "all snapshots of the volume",
+        "auto_but_newest": "all snapshots under automatic cleanup except the newest of them",
+        "auto_older_7d": "snapshots under automatic cleanup that are older than %d days" % OLD_DAYS}
+start = time.time()
+
+
+def out(cmd, timeout=600):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def configs():
+    """snapper config -> mountpoint of its volume."""
+    res = {}
+    try:
+        names = sorted(os.listdir("/etc/snapper/configs"))
+    except OSError:
+        return res
+    for name in names:
+        try:
+            with open(os.path.join("/etc/snapper/configs", name)) as f:
+                for line in f:
+                    if line.startswith("SUBVOLUME="):
+                        res[name] = line.split("=", 1)[1].strip().strip('"').rstrip("/") or "/"
+        except OSError:
+            pass
+    return res
+
+
+def snapshots(cfg):
+    rows = []
+    for row in csv.DictReader(io.StringIO(out(["snapper", "--csvout", "-c", cfg, "list", "--columns",
+                                               "number,type,pre-number,date,cleanup,description"], 120))):
+        try:
+            n = int(row["number"])
+        except (KeyError, ValueError):
+            continue
+        if n == 0:          # the live volume
+            continue
+        try:
+            ts = int(time.mktime(time.strptime(row.get("date", ""), "%Y-%m-%d %H:%M:%S")))
+        except ValueError:
+            ts = 0
+        rows.append({"number": n, "type": row.get("type", ""), "pre": row.get("pre-number", ""), "created": ts,
+                     "cleanup": row.get("cleanup", ""), "description": row.get("description", "")})
+    return sorted(rows, key=lambda s: s["number"])
+
+
+def subvol_of(mountpoint):
+    """Path (from the filesystem's top level) of the subvolume mounted there."""
+    m = re.search(r"(?:^|,)subvol=/?([^,]*)", out(["findmnt", "-no", "OPTIONS", mountpoint]).strip())
+    return m.group(1) if m else None
+
+
+def data_chunks(dev):
+    chunks, at = [], None
+    for line in out(["btrfs", "inspect-internal", "dump-tree", "-t", "chunk", dev]).splitlines():
+        m = re.search(r"key \(FIRST_CHUNK_TREE CHUNK_ITEM (\d+)\)", line)
+        if m:
+            at = int(m.group(1))
+            continue
+        m = re.search(r"^\s+length (\d+) owner \d+ stripe_len \d+ type (\S+)", line)
+        if m and at is not None:
+            if m.group(2).startswith("DATA"):
+                chunks.append((at, int(m.group(1))))
+            at = None
+    return chunks
+
+
+def esc(s):
+    return str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+def write(state):
+    L = {k: [] for k in ("created", "excl", "ref", "count", "set")}
+    for cfg, snaps in state["snapshots"].items():
+        for s in snaps:
+            lbl = 'config="%s",number="%d"' % (esc(cfg), s["number"])
+            L["created"].append('snapshot_created_timestamp_seconds{%s,type="%s",cleanup="%s",description="%s"} %d'
+                                % (lbl, esc(s["type"]), esc(s["cleanup"] or "none"), esc(s["description"]), s["created"]))
+            m = state["sizes"].get(cfg, {}).get(str(s["number"]))
+            if m:
+                L["excl"].append("snapshot_exclusive_bytes{%s} %d" % (lbl, m["exclusive"]))
+                L["ref"].append("snapshot_referenced_bytes{%s} %d" % (lbl, m["referenced"]))
+        L["count"].append('snapshot_count{config="%s",subvolume="%s"} %d' % (esc(cfg), esc(state["subvolumes"][cfg]), len(snaps)))
+        for name, val in state.get("sets", {}).get(cfg, {}).items():
+            L["set"].append('snapshot_set_exclusive_bytes{config="%s",set="%s"} %d' % (esc(cfg), esc(name), val))
+    res = []
+    for key, name, help_ in (
+            ("created", "snapshot_created_timestamp_seconds", "When the snapshot was taken"),
+            ("excl", "snapshot_exclusive_bytes", "Estimated space that deleting this ONE snapshot would free now"),
+            ("ref", "snapshot_referenced_bytes", "Estimated size of the data the snapshot references (mostly shared)"),
+            ("count", "snapshot_count", "Snapshots per snapper config"),
+            ("set", "snapshot_set_exclusive_bytes",
+             "Estimated space freed by deleting a SET of the volume's snapshots: " + "; ".join("%s = %s" % kv for kv in SETS.items()))):
+        res += ["# HELP %s %s" % (name, help_), "# TYPE %s gauge" % name] + L[key]
+    for name, val, help_ in (
+            ("snapshot_held_bytes", state.get("held", 0), "Estimated space only snapshots still reference (all volumes)"),
+            ("snapshot_data_used_bytes", state.get("used", 0), "Estimated data in use on the filesystem (sanity check against df)"),
+            ("snapshot_sample_bytes", state.get("sample_bytes", 0), "Resolution of the estimates: bytes one sample stands for"),
+            ("snapshot_metrics_duration_seconds", state.get("duration", 0), "How long the last pass took"),
+            ("snapshot_metrics_timestamp_seconds", state.get("measured", 0), "When the sizes were last measured")):
+        res += ["# HELP %s %s" % (name, help_), "# TYPE %s gauge" % name, "%s %d" % (name, val)]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(state, f)
+    os.replace(STATE + ".tmp", STATE)
+    if os.path.isdir(TEXTFILE):
+        tmp = os.path.join(TEXTFILE, "snapshots.prom.tmp")
+        with open(tmp, "w") as f:
+            f.write("\n".join(res) + "\n")
+        os.replace(tmp, os.path.join(TEXTFILE, "snapshots.prom"))
+
+
+def main():
+    try:
+        with open(STATE) as f:
+            old = json.load(f)
+    except (OSError, ValueError):
+        old = {}
+    confs = configs()
+    snaps_of = {cfg: snapshots(cfg) for cfg in confs}
+    state = {"subvolumes": confs, "snapshots": snaps_of,
+             # keep the previous sizes visible while this pass runs (only of snapshots that still exist)
+             "sizes": {cfg: {k: v for k, v in old.get("sizes", {}).get(cfg, {}).items()
+                             if int(k) in [s["number"] for s in snaps_of[cfg]]} for cfg in confs},
+             "sets": {cfg: old.get("sets", {}).get(cfg, {}) for cfg in confs},
+             "set_help": SETS,
+             **{k: old.get(k, 0) for k in ("held", "used", "sample_bytes", "duration", "measured")}}
+    write(state)
+    if not confs:
+        return
+
+    dev = re.sub(r"\[.*", "", out(["findmnt", "-no", "SOURCE", "/"]).strip())
+    chunks = data_chunks(dev)
+    total = sum(l for _, l in chunks)
+    if not total:
+        print("no data block groups found on %s — nothing measured" % dev)
+        return
+    # root id -> (config, snapshot number); the live volumes and everything else stay "outside"
+    paths = {}
+    for line in out(["btrfs", "subvolume", "list", "/"]).splitlines():
+        p = line.split()
+        if len(p) >= 9 and p[1].isdigit():
+            paths[p[-1]] = int(p[1])
+    member = {}
+    for cfg, mp in confs.items():
+        snapsv = subvol_of("/.snapshots" if mp == "/" else mp + "/.snapshots")
+        if snapsv is None:
+            continue
+        for s in state["snapshots"][cfg]:
+            rid = paths.get("%s/%d/snapshot" % (snapsv, s["number"]))
+            if rid:
+                member[rid] = (cfg, s["number"])
+
+    combos, used = {}, 0
+    for _ in range(SAMPLES):
+        x = random.randrange(total)
+        for at, length in chunks:
+            if x < length:
+                addr = (at + x) & ~4095
+                break
+            x -= length
+        # -o: every reference to the extent counts, whatever part of it it uses — an extent
+        # is only freed as a whole
+        ids = frozenset(int(i) for i in re.findall(r"root (\d+)", out(
+            ["btrfs", "inspect-internal", "logical-resolve", "-P", "-o", "-s", "4194304", str(addr), "/"], 60)))
+        if ids:
+            used += 1
+            combos[ids] = combos.get(ids, 0) + 1
+    per = total / SAMPLES
+
+    def only_in(rids):
+        return int(sum(c for ids, c in combos.items() if ids <= rids) * per)
+
+    now = time.time()
+    state["sizes"], state["sets"] = {}, {}
+    for cfg in confs:
+        snaps = state["snapshots"][cfg]
+        rid = {n: r for r, (c, n) in member.items() if c == cfg}
+        state["sizes"][cfg] = {
+            str(n): {"exclusive": only_in(frozenset([r])),
+                     "referenced": int(sum(c for ids, c in combos.items() if r in ids) * per)}
+            for n, r in rid.items()}
+        auto = [s for s in snaps if s["cleanup"] and s["number"] in rid]
+        state["sets"][cfg] = {
+            "all": only_in(frozenset(rid.values())),
+            "auto_but_newest": only_in(frozenset(rid[s["number"]] for s in auto[:-1])),
+            "auto_older_7d": only_in(frozenset(rid[s["number"]] for s in auto if now - s["created"] > OLD_DAYS * 86400))}
+    state.update(held=only_in(frozenset(member)), used=int(used * per), sample_bytes=int(per),
+                 duration=int(time.time() - start), measured=int(time.time()))
+    write(state)
+    print("%d samples in %ds, %.1f MiB each; data in use ~%.1f GiB, of which only snapshots hold ~%.1f GiB"
+          % (SAMPLES, time.time() - start, per / 2**20, used * per / 2**30, state["held"] / 2**30))
+
+
+if __name__ == "__main__":
+    main()

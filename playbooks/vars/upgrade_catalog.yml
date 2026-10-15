@@ -6,6 +6,8 @@
 #   - roles/local_upgrade                 (renders it for the on-host trigger + the confirm page)
 #
 # Per service:
+#   kind       image (default) | host (playbooks/host-upgrade.yml: no image, no version variable)
+#              | snapshots (the portal's snapshot page; nothing to upgrade)
 #   playbook   which playbook upgrades it
 #   arg        the -e variable that playbook takes the target version in
 #   images     image repositories the service runs (maps a row of the "Update overview per
@@ -13,14 +15,31 @@
 #   var        the Ansible variable that holds the version (or the whole image reference)
 #   value      how `var` is built from a version tag (default: the tag itself)
 #   file       group_vars/all/<file> of the PRIVATE config the version is persisted to
+#   targets    update targets that may be started on the host (same-major | next-major |
+#              latest); default: all. Restrict it where a bigger step needs manual work.
+#   pitr       postgres PITR instance behind the app (on-host upgrades refuse to start without
+#              a recent base backup + a live WAL archive of it)
 #   --- only for playbook: stack-upgrade.yml ---
 #   stack      compose_stack name to redeploy            } exactly one of the two
 #   role       role to re-run (monitoring)               }
 #   containers containers that must be running the new image afterwards
+#   verify     shell commands that must succeed after the (re)deploy — what "works" means for
+#              the service beyond "the container is up" (also run after a rollback)
 #   state_paths host dirs holding file-based state (sqlite …): the containers are stopped
 #              and the dirs copied (reflink) before the upgrade and put back on a rollback.
 #              Not for postgres-backed apps — those have their own playbook with PITR.
 upgrade_catalog:
+  # --- the server itself: packages (Docker, Tailscale, Ubuntu), Caddy, reboot ---------------
+  # kind: host = not a container image. Its "versions" are the modes of host-upgrade.yml.
+  host:
+    kind: host
+    playbook: host-upgrade.yml
+    arg: host_upgrade_mode
+  # kind: snapshots = the snapshot page of the on-host portal (list / delete / keep / roll
+  # back btrfs snapshots). No playbook: the entry point drives the host's `snapshot` helper.
+  snapshots:
+    kind: snapshots
+
   # --- database-backed: dedicated playbooks with PITR anchor + automatic rollback ---------
   immich:
     playbook: immich-upgrade.yml
@@ -28,18 +47,32 @@ upgrade_catalog:
     images: [ghcr.io/immich-app/immich-server, ghcr.io/immich-app/immich-machine-learning]
     var: immich_version
     file: immich.yml
+    pitr: postgres-business
   nextcloud:
     playbook: nextcloud-upgrade.yml
     arg: nextcloud_upgrade_version
     images: [nextcloud]
     var: nextcloud_version
     file: nextcloud.yml
+    pitr: postgres-business
   authentik:
     playbook: authentik-upgrade.yml
     arg: authentik_upgrade_version
     images: [ghcr.io/goauthentik/server, ghcr.io/goauthentik/ldap]
     var: authentik_version
     file: authentik.yml
+    pitr: authentik
+  # The shared database IMAGE of immich + nextcloud (Postgres minor release, OS packages,
+  # VectorChord/pgvector). Same Postgres major only — 16 -> 17 needs a dump/restore.
+  postgres_business:
+    playbook: postgres-business-upgrade.yml
+    arg: postgres_business_upgrade_version
+    images: [ghcr.io/immich-app/postgres]
+    var: postgres_business_image
+    value: "ghcr.io/immich-app/postgres:{v}"
+    file: postgres.yml
+    pitr: postgres-business
+    targets: [same-major]
 
   # --- no database of their own: the generic playbook (new image -> verify -> old image) ---
   grafana:
@@ -118,3 +151,7 @@ upgrade_catalog:
     stack: acme_dns
     containers: [acme-dns]
     state_paths: ["{{ acme_dns_data_dir | default('/opt/acme_dns') }}/data"]     # sqlite db with the registered ACME accounts
+    verify:
+      # the API is up, and the PUBLIC DNS listener answers for the delegated zone
+      - "curl -sf -m 5 -o /dev/null http://127.0.0.1:{{ acme_dns_api_port }}/health"
+      - "dig +time=3 +tries=1 @{{ acme_dns_public_ip }} {{ acme_dns_domain }} SOA | grep -q 'status: NOERROR'"

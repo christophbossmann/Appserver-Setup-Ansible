@@ -98,7 +98,8 @@
           delay: 5
 
         - name: Verify all three containers run the new version
-          ansible.builtin.command: "docker inspect {{ item }} -f {{ '{{.Config.Image}} {{.State.Running}}' }}"
+          ansible.builtin.command:
+            argv: [docker, inspect, "{{ item }}", -f, "{{ '{{.Config.Image}} {{.State.Running}}' }}"]
           register: _akimg
           changed_when: false
           failed_when: (':' ~ authentik_upgrade_version) not in _akimg.stdout or 'true' not in _akimg.stdout

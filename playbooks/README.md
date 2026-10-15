@@ -14,6 +14,9 @@ machine. Most day-to-day work is `server-all.yml` with `--tags`.
 > ssh-agent bash -c 'ssh-add ~/.ssh/ansible_key && ansible-playbook playbooks/server-all.yml --limit <host>'
 > ```
 >
+> Or once per terminal session (valid until the terminal is closed):
+> `eval "$(ssh-agent -s)" && ssh-add ~/.ssh/ansible_key`
+>
 > Each server playbook starts with [`preflight-ssh-agent.yml`](preflight-ssh-agent.yml),
 > which fails fast — before any SSH connection — if the key isn't in an agent and prints
 > this exact command for the current run. Details: [QUICKSTART § 5](../QUICKSTART.md#5-deploy).
@@ -48,6 +51,12 @@ ansible-playbook playbooks/server-all.yml --limit myserver --tags nextcloud
 The scheduled cloud backups themselves live in `roles/backup_restic` (systemd timer);
 the job list (what gets dumped + which paths) is `group_vars/all/backup.yml`.
 
+Hosts with a Storage Box can additionally keep copies **on the box** without the controller
+(`roles/storagebox_backup`, host-gated by `storagebox_backup_enabled`): the immich
+thumbnails are mirrored nightly and a `pg_dump` of each listed database is written every
+4 days (last 4 sets kept). Operate it on the host with `storagebox-backup list |
+restore-thumbs | fetch-dumps | dumps --force`.
+
 ## Restore
 
 | Playbook | What it does |
@@ -62,25 +71,34 @@ the job list (what gets dumped + which paths) is `group_vars/all/backup.yml`.
 > immich DB restore/rollback, `isAdmin` reverts to the backup era; it self-heals on the
 > next Authentik login (immich_role claim), or use `immich-admin grant-admin` as break-glass.
 
-## Upgrades (with automatic PITR rollback)
+## Upgrades (with automatic rollback)
 
-Both share the same safety model: because Nextcloud **and** Immich sit on the shared
-`postgres-business` instance, **both apps are quiesced** for the whole window (Nextcloud
-`maintenance:mode --on`; Immich native `immich-admin enable-maintenance-mode`). A PITR
-**anchor** is captured, the image is bumped + verified, and on any failure the business
-instance is rolled back to the anchor and the old image redeployed. Rollback logic is
-shared via `tasks/{nextcloud,immich}_rollback.yml`.
+Every upgrade playbook follows the same model: take a way back, switch to the new version,
+**verify that the service really works**, and on any failure put the old state back and end
+with `failed=1, rescued=1` — by design, so a rolled-back upgrade cannot be mistaken for a
+successful one. The new version is written to the private config only after every check
+passed.
 
-| Playbook | What it does |
-|---|---|
-| **`nextcloud-upgrade.yml`** | `-e nextcloud_upgrade_version=<tag> -e upgrade_confirm=YES`. One major hop at a time. |
-| **`immich-upgrade.yml`** | `-e immich_upgrade_version=<tag> -e upgrade_confirm=YES`. |
+| Playbook | Upgrades | Way back |
+|---|---|---|
+| **`immich-upgrade.yml`** | Immich. `-e immich_upgrade_version=<tag>` | PITR of `postgres-business` + old image |
+| **`nextcloud-upgrade.yml`** | Nextcloud, **one major at a time**. `-e nextcloud_upgrade_version=<tag>` | PITR of `postgres-business` + the pre-upgrade program dir (`html`: the official image keeps the code there, and the old image refuses to start on newer code) + old image |
+| **`authentik-upgrade.yml`** | Authentik server, worker and LDAP outpost together. `-e authentik_upgrade_version=<tag>` | PITR of the `authentik` instance + old images |
+| **`postgres-business-upgrade.yml`** | The shared database **image** of immich + nextcloud within the same Postgres major: Postgres minor, OS packages, pgvector/VectorChord. Runs `ALTER EXTENSION … UPDATE` and rebuilds the VectorChord indexes. `-e postgres_business_upgrade_version=<tag>` | old image first, then PITR to the moment before |
+| **`stack-upgrade.yml`** | Everything without a database of its own (grafana, prometheus, exporters, cadvisor, dozzle, headplane) and services with file-based state (headscale, acme-dns: the state dir is copied before and put back). `-e upgrade_service=<name> -e upgrade_version=<tag>` | previous image (+ state copy) |
+| **`host-upgrade.yml`** | The server itself: all apt sources (Docker, Tailscale, Ubuntu), a newer **Caddy** build with the same DNS plugins (validated against the live Caddyfile before it is swapped in), optionally a reboot. `-e host_upgrade_mode=packages \| packages-reboot \| reboot` | snapper pre/post snapshot pair of `/`; the previous Caddy binary is put back automatically if Caddy does not come up |
+
+All of them need `-e upgrade_confirm=YES`. Because Nextcloud **and** Immich share the
+`postgres-business` instance, both are write-frozen (maintenance mode) whenever that
+instance could be rolled back — in the immich, nextcloud and postgres-business upgrades.
 
 Shared options:
-- **`-e force_rollback=true`** — DRILL mode: roll back at the end **even on success**
-  (non-committal test of the full upgrade+rollback cycle).
+- **`-e force_rollback=true`** — DRILL: roll back at the end **even on success**. Run this
+  once before trusting a playbook with a real upgrade; it exercises the whole way back.
+  (Not for `host-upgrade.yml`.)
 - **`-e upgrade_health_retries=N`** — health/status poll attempts (×5 s); lower for drills.
-- **`-e upgrade_keep_old=false`** — drop the pre-rollback data dir (default keeps it).
+- **`-e upgrade_keep_old=false`** — drop the pre-rollback data dir (default keeps it for
+  inspection: `<data dir>-pre-pitr-<stamp>`; delete it once you no longer need it).
 
 ```bash
 # Real upgrade
@@ -91,18 +109,41 @@ ansible-playbook playbooks/nextcloud-upgrade.yml \
 ansible-playbook playbooks/immich-upgrade.yml \
   --limit myserver -e immich_upgrade_version=v3.0.3 -e upgrade_confirm=YES \
   -e force_rollback=true
+
+# A service from the catalog
+ansible-playbook playbooks/stack-upgrade.yml \
+  --limit myserver -e upgrade_service=grafana -e upgrade_version=13.2.3 -e upgrade_confirm=YES
 ```
 
-A failed upgrade ends with `failed=1, rescued=1` **by design** — the final task fails
-loudly to signal "upgrade failed and was rolled back".
+### The upgrade catalog
+
+[`vars/upgrade_catalog.yml`](vars/upgrade_catalog.yml) is the single place that says **how**
+each service is upgraded: which playbook, which variable in which private config file holds
+the version, which containers must run the new image afterwards, optional service-specific
+checks (`verify`), state dirs to copy, and which kinds of update may be started on the host
+(`targets`). Adding a service to `stack-upgrade.yml` is one entry there.
+
+### Upgrades started on the server (no controller)
+
+With `local_upgrade_enabled` (host_vars) the host can run these same playbooks itself,
+triggered from a small web page behind the VPN and the SSO login — see
+[`roles/local_upgrade/README.md`](../roles/local_upgrade/README.md).
+
+Such an upgrade cannot write to the private config repo, so every upgrade leaves a record on
+the host (`/var/lib/app-upgrade/versions/<var>.json`), and **every run from the controller
+first reconciles**: a version upgraded on the host is taken over into the private config
+(commit it afterwards) instead of being silently rolled back to what the repo still says.
+If repo and host contradict each other the run stops; `-e version_conflict_ok=true` lets
+the repo win on purpose.
 
 ## `tasks/` — shared includes (not run directly)
 
 | File | Used by |
 |---|---|
-| `pitr_restore.yml` | `postgres-pitr-restore.yml` and both upgrade rollbacks — the actual PITR steps (move data dir aside → extract base + WAL → recover to target → fresh base on the new timeline). |
-| `nextcloud_rollback.yml` | `nextcloud-upgrade.yml` rescue **and** its `force_rollback` path. |
-| `immich_rollback.yml` | `immich-upgrade.yml` rescue **and** its `force_rollback` path. |
+| `pitr_restore.yml` | `postgres-pitr-restore.yml` and the upgrade rollbacks — the actual PITR steps (move data dir aside → extract base + WAL → recover to target → fresh base on the new timeline). |
+| `nextcloud_rollback.yml`, `immich_rollback.yml`, `authentik_rollback.yml`, `postgres_business_rollback.yml` | the respective upgrade's rescue **and** its `force_rollback` path. |
+| `stack_upgrade_deploy.yml`, `stack_upgrade_rollback.yml` | `stack-upgrade.yml`: (re)deploy + verify, used for the upgrade and for the rollback alike. |
+| `record_version.yml`, `adopt_host_versions.yml` | version records on the host and their reconciliation with the private config (see above). |
 
 ## `tests/` — non-destructive verification (on-demand only)
 

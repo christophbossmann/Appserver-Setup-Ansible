@@ -1,0 +1,41 @@
+---
+# Backups ONTO the Storage Box (roles/storagebox must be enabled on the host): what lives
+# only on the server's disk and would otherwise be lost with it.
+# HOST-GATED: off unless storagebox_backup_enabled is set in host_vars.
+#
+#   thumbs  the immich thumbnails/previews are mirrored to the box every night. They can be
+#           regenerated from the originals (which already live on the box), but that takes
+#           hours of CPU — fetching them back takes minutes.
+#   dumps   a pg_dump (custom format) of each listed database every N days, the last K sets
+#           kept. PITR (roles/postgres_pitr) covers "back to 10 minutes ago" but lives on the
+#           same disk as the databases; these dumps are the copy that survives the server.
+#
+# Both talk to the box with rclone directly (SFTP, the storagebox role's config + key) — not
+# through the FUSE mount, whose VFS cache is sized for immich's originals.
+# On the box:  <storagebox_root_path>/<storagebox_backup_dir>/immich-thumbs/
+#              <storagebox_root_path>/<storagebox_backup_dir>/db-dumps/<YYYYmmdd-HHMMSS>/<name>.dump
+# Restore:     storagebox-backup list | restore-thumbs | fetch-dumps [<set>]   (on the host)
+storagebox_backup_enabled: false
+
+storagebox_backup_dir: backup
+
+# --- immich thumbnails ----------------------------------------------------------------
+storagebox_backup_thumbs_enabled: true
+storagebox_backup_thumbs_src: "{{ immich_upload_dir | default('/srv/business/immich') }}/thumbs"
+storagebox_backup_thumbs_oncalendar: "*-*-* 04:20:00"
+# The mirror deletes on the box what was deleted locally — but refuses a run that would
+# delete more than this many files (an emptied or unmounted source must not wipe the copy).
+storagebox_backup_thumbs_max_delete: 2000
+
+# --- database dumps ---------------------------------------------------------------------
+storagebox_backup_dumps_enabled: true
+storagebox_backup_dump_interval_days: 4
+storagebox_backup_dump_keep: 4
+# The timer fires daily; the script itself decides whether the newest set is old enough.
+storagebox_backup_dumps_oncalendar: "*-*-* 03:50:00"
+storagebox_backup_dump_workdir: "{{ backup_dump_dir | default('/opt/backups') }}/storagebox-dumps"
+# name = file name on the box; container/user/db = where pg_dump runs.
+storagebox_backup_databases:
+  - { name: authentik, container: authentik-postgres, user: authentik, db: authentik }
+  - { name: immich, container: "{{ postgres_business_container | default('postgres-business') }}", user: "{{ postgres_business_user | default('business') }}", db: "{{ immich_db_name | default('immich') }}" }
+  - { name: nextcloud, container: "{{ postgres_business_container | default('postgres-business') }}", user: "{{ postgres_business_user | default('business') }}", db: "{{ nextcloud_db_name | default('nextcloud') }}" }

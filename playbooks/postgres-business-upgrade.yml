@@ -1,0 +1,300 @@
+---
+# Upgrade of the business Postgres IMAGE (shared by immich + nextcloud) within the SAME
+# Postgres major version, with automatic PITR rollback on failure.
+#
+#   ansible-playbook playbooks/postgres-business-upgrade.yml --limit <host> \
+#     -e postgres_business_upgrade_version=16-vectorchord1.1.1 \
+#     -e upgrade_confirm=YES \
+#     [-e upgrade_keep_old=false]   # drop the pre-rollback data dir if a rollback happens
+#     [-e force_rollback=true]      # DRILL: upgrade, then roll back on purpose
+#
+# What a new image tag of ghcr.io/immich-app/postgres brings: a newer Postgres MINOR release
+# + OS packages (that is where the fixed CVEs are) and newer VectorChord / pgvector
+# libraries. Swapping the image alone leaves the extensions INSIDE the databases at their
+# old version — so after the swap this runs, per database, ALTER EXTENSION ... UPDATE for
+# vector + vchord and rebuilds every VectorChord index (immich: clip_index, face_index), as
+# the Immich docs ask for. Check that the VectorChord version is in the range the running
+# Immich supports (docs: administration/postgres-standalone) before picking a tag.
+#
+# NOT for a Postgres MAJOR change (16 -> 17): the data dir format differs, that needs a
+# dump/restore or pg_upgrade — refused here.
+#
+# Both apps are write-frozen for the whole window (immich maintenance mode, nextcloud
+# maintenance mode); they lose their DB connections for the restart and reconnect. On ANY
+# failure: the old image is started again and the instance is restored (PITR) to the moment
+# before the upgrade, which also takes the extensions back to their old version.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+  when: not (upgrade_local_run | default(false) | bool)
+
+- name: Business Postgres image upgrade (PITR auto-rollback)
+  hosts: all
+  become: true
+  vars:
+    upgrade_confirm: ""
+    postgres_business_upgrade_version: ""
+    upgrade_keep_old: true          # keep the pre-rollback data dir by default (safety)
+    force_rollback: false           # DRILL: roll back at the end even on success
+    upgrade_health_retries: 60      # health poll attempts (x5s); lower for drills
+    _biz: postgres-business
+    _occ: ["docker", "exec", "-u", "www-data", "nextcloud", "php", "occ"]
+    _immadm: ["docker", "exec", "immich-server", "immich-admin"]
+    _psql: ["docker", "exec", "postgres-business", "psql", "-U", "{{ postgres_business_user }}", "-v", "ON_ERROR_STOP=1", "-XAt"]
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that:
+          - upgrade_confirm | default('') == 'YES'
+          - (postgres_business_upgrade_version | default('')) | length > 0
+        fail_msg: "Need -e postgres_business_upgrade_version=<image tag> and -e upgrade_confirm=YES"
+
+    - name: Reconcile versions with the host
+      ansible.builtin.include_tasks: tasks/adopt_host_versions.yml
+
+    - name: Resolve the old and the new image
+      ansible.builtin.set_fact:
+        _old_image: "{{ postgres_business_image }}"
+        _new_image: "{{ postgres_business_image | regex_replace(':[^:/]+$', '') }}:{{ postgres_business_upgrade_version }}"
+
+    - name: Refuse a no-op and a Postgres major change
+      ansible.builtin.assert:
+        that:
+          - _new_image != _old_image
+          - (postgres_business_upgrade_version | regex_search('^[0-9]+')) == (_old_image | regex_replace('^.*:', '') | regex_search('^[0-9]+'))
+        fail_msg: >-
+          {{ _old_image }} -> {{ _new_image }}: already there, or another Postgres MAJOR version
+          (the tag's leading number). A major change needs a dump/restore, not this playbook.
+
+    # ---- QUIESCE BOTH APPS ------------------------------------------------------------
+    - name: Nextcloud into maintenance mode
+      ansible.builtin.command:
+        argv: "{{ _occ + ['maintenance:mode', '--on'] }}"
+      changed_when: true
+
+    - name: Immich into its native maintenance mode (write-freeze)
+      ansible.builtin.command:
+        argv: "{{ _immadm + ['enable-maintenance-mode'] }}"
+      changed_when: true
+
+    - name: Count the immich assets (compared after the upgrade)
+      ansible.builtin.command:
+        argv: "{{ _psql + ['-d', immich_db_name, '-c', 'select count(*) from asset'] }}"
+      register: _assets_before
+      changed_when: false
+
+    # ---- PITR ANCHOR ------------------------------------------------------------------
+    - name: Capture the PITR anchor time (UTC, from the business instance itself)
+      ansible.builtin.command:
+        argv: "{{ _psql + ['-c', \"select to_char(now() at time zone 'utc','YYYY-MM-DD HH24:MI:SS')\"] }}"
+      register: _anchor
+      changed_when: false
+
+    - name: Set the anchor fact (+00)
+      ansible.builtin.set_fact:
+        _pitr_target: "{{ _anchor.stdout | trim }}+00"
+
+    - name: Force a WAL switch (guarantee the anchor segment reaches the archive)
+      ansible.builtin.command:
+        argv: "{{ _psql + ['-c', 'select pg_switch_wal()'] }}"
+      changed_when: false
+
+    # ---- UPGRADE (block) with automatic PITR ROLLBACK (rescue) -------------------------
+    - name: Upgrade
+      block:
+        # The private config is NOT changed here — the new image comes in via the var
+        # override and is persisted only after every check passed (see below).
+        - name: Redeploy the business instance with the new image
+          ansible.builtin.include_role:
+            name: compose_stack
+          vars:
+            stack: postgres-business
+            postgres_business_image: "{{ _new_image }}"
+
+        - name: Wait for the instance to accept connections
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ _biz }}", pg_isready, -U, "{{ postgres_business_user }}"]
+          register: _ready
+          until: _ready.rc == 0
+          retries: "{{ upgrade_health_retries | default(60) }}"
+          delay: 5
+          changed_when: false
+
+        - name: Verify the container runs the new image
+          ansible.builtin.command:
+            argv: [docker, inspect, "{{ _biz }}", -f, "{{ '{{.Config.Image}} {{.State.Running}}' }}"]
+          register: _bimg
+          changed_when: false
+          failed_when: (_new_image ~ ' true') not in _bimg.stdout
+
+        # Per database: bring vector + vchord to the version the new image ships, then
+        # rebuild every VectorChord index (their on-disk format belongs to the library
+        # version). Databases without these extensions (nextcloud) are left alone.
+        - name: Update the vector extensions and rebuild the VectorChord indexes
+          ansible.builtin.shell: |
+            set -euo pipefail
+            P() { docker exec {{ _biz }} psql -U {{ postgres_business_user }} -v ON_ERROR_STOP=1 -XAt "$@"; }
+            for db in $(P -c "select datname from pg_database where not datistemplate and datallowconn"); do
+              for ext in vector vchord; do
+                [ "$(P -d "$db" -c "select count(*) from pg_extension where extname = '$ext'")" = 1 ] || continue
+                P -d "$db" -c "ALTER EXTENSION $ext UPDATE" >/dev/null
+                echo "$db: $ext $(P -d "$db" -c "select extversion from pg_extension where extname = '$ext'")"
+              done
+              P -d "$db" -c "select format('%I.%I', n.nspname, c.relname) from pg_index i
+                             join pg_class c on c.oid = i.indexrelid join pg_namespace n on n.oid = c.relnamespace
+                             join pg_am am on am.oid = c.relam where am.amname like 'vchord%'" | while read -r idx; do
+                [ -n "$idx" ] || continue
+                P -d "$db" -c "REINDEX INDEX $idx" >/dev/null
+                echo "$db: reindexed $idx"
+              done
+            done
+          args:
+            executable: /bin/bash
+          register: _extupd
+          changed_when: true
+
+        # A new image can bring another C library; then text indexes sort differently than
+        # they were built. Postgres records the collation version per database — rebuild +
+        # acknowledge only when it really differs (same Debian release: nothing to do).
+        - name: Reindex everything if the collation version changed
+          ansible.builtin.shell: |
+            set -euo pipefail
+            P() { docker exec {{ _biz }} psql -U {{ postgres_business_user }} -v ON_ERROR_STOP=1 -XAt "$@"; }
+            changed=$(P -c "select datname from pg_database where datallowconn
+                            and datcollversion is distinct from pg_database_collation_actual_version(oid)")
+            [ -n "$changed" ] || { echo "collation versions unchanged"; exit 0; }
+            docker exec {{ _biz }} reindexdb -U {{ postgres_business_user }} --all
+            for db in $changed; do P -c "ALTER DATABASE \"$db\" REFRESH COLLATION VERSION"; done
+            echo "reindexed all databases; collation version refreshed for: $changed"
+          args:
+            executable: /bin/bash
+          register: _coll
+          changed_when: "'unchanged' not in _coll.stdout"
+
+        - name: Verify the extensions are at the image's version and no index is invalid
+          ansible.builtin.shell: |
+            set -euo pipefail
+            P() { docker exec {{ _biz }} psql -U {{ postgres_business_user }} -v ON_ERROR_STOP=1 -XAt "$@"; }
+            for db in $(P -c "select datname from pg_database where not datistemplate and datallowconn"); do
+              P -d "$db" -c "select '$db: ' || e.extname || ' is ' || e.extversion || ', image ships ' || a.default_version
+                             from pg_extension e join pg_available_extensions a on a.name = e.extname
+                             where e.extname in ('vector', 'vchord') and e.extversion <> a.default_version"
+              P -d "$db" -c "select '$db: invalid index ' || indexrelid::regclass from pg_index where not indisvalid or not indisready"
+            done
+          args:
+            executable: /bin/bash
+          register: _extchk
+          changed_when: false
+          failed_when: _extchk.rc != 0 or (_extchk.stdout | trim | length > 0)
+
+        # immich-server keeps a connection pool and checks the extension versions when it
+        # starts: restart it so it runs against the new library from a clean start.
+        - name: Restart immich-server
+          ansible.builtin.command: docker restart immich-server
+          changed_when: true
+
+        - name: Wait until immich-server is healthy
+          ansible.builtin.command:
+            argv: [docker, inspect, immich-server, -f, "{{ '{{.State.Health.Status}}' }}"]
+          register: _ih
+          until: (_ih.stdout | trim) == 'healthy'
+          retries: "{{ upgrade_health_retries | default(60) }}"
+          delay: 5
+          changed_when: false
+
+        - name: Verify the immich data is unchanged and a vector search works
+          ansible.builtin.shell: |
+            set -euo pipefail
+            P() { docker exec {{ _biz }} psql -U {{ postgres_business_user }} -v ON_ERROR_STOP=1 -XAt -d {{ immich_db_name }} "$@"; }
+            assets=$(P -c 'select count(*) from asset'); echo "assets $assets"
+            # A nearest-neighbour query through the VectorChord index. vchordrq.probes has no
+            # default for an index built with lists (immich sets it per query) — 1 is valid for
+            # any list count. Assigned first so a failing query fails the task.
+            if [ "$(P -c "select to_regclass('smart_search') is not null")" = t ]; then
+              nearest=$(P -c "set enable_seqscan = off" -c "set vchordrq.probes = 1" -c "select count(*) from
+                        (select 1 from smart_search order by embedding <=> (select embedding from smart_search limit 1) limit 5) s" | tail -1)
+              echo "vector search returned $nearest row(s)"
+            fi
+          args:
+            executable: /bin/bash
+          register: _imchk
+          changed_when: false
+          failed_when: _imchk.rc != 0 or ('assets ' ~ (_assets_before.stdout | trim)) not in _imchk.stdout_lines
+
+        - name: Verify nextcloud reads its database
+          ansible.builtin.command:
+            argv: "{{ _occ + ['user:list'] }}"
+          register: _ncusers
+          changed_when: false
+          failed_when: _ncusers.rc != 0 or (_ncusers.stdout_lines | length) == 0
+
+        - name: Upgrade verified
+          ansible.builtin.debug:
+            msg: >-
+              Business Postgres upgraded {{ _old_image }} -> {{ _new_image }}.
+              {{ _extupd.stdout_lines | join('; ') }}. {{ _coll.stdout | trim }}.
+              Immich healthy ({{ _imchk.stdout_lines | join(', ') }}), nextcloud reads its DB.
+
+        # Persist ONLY now — verified and kept (a force_rollback drill undoes the upgrade).
+        - name: Persist postgres_business_image to the private config (verified upgrade, kept)
+          ansible.builtin.lineinfile:
+            path: "{{ inventory_dir }}/group_vars/all/postgres.yml"
+            regexp: '^postgres_business_image:'
+            line: 'postgres_business_image: "{{ _new_image }}"'
+          delegate_to: localhost
+          become: false
+          when: not (force_rollback | default(false) | bool)
+
+        - name: Record the deployed version on the host
+          ansible.builtin.include_tasks: tasks/record_version.yml
+          vars:
+            rec_service: postgres_business
+            rec_var: postgres_business_image
+            rec_file: postgres.yml
+            rec_value: "{{ _new_image }}"
+            rec_previous: "{{ _old_image }}"
+          when: not (force_rollback | default(false) | bool)
+
+        # Base backups taken before the upgrade stay usable (same Postgres major), but a
+        # fresh one on the new image makes later restores independent of the old image.
+        - name: Fresh base backup on the new image (upgrade kept)
+          ansible.builtin.command: /usr/local/bin/pg-pitr-backup postgres-business
+          changed_when: true
+          failed_when: false
+          when: not (force_rollback | default(false) | bool)
+
+        # ---- force_rollback DRILL: undo the (successful) upgrade on purpose -----------
+        - name: force_rollback — roll the just-upgraded instance back (drill)
+          ansible.builtin.include_tasks: tasks/postgres_business_rollback.yml
+          when: force_rollback | default(false) | bool
+
+        - name: Drill complete
+          ansible.builtin.debug:
+            msg: "force_rollback drill complete — business Postgres is back on {{ _old_image }} (restored to {{ _pitr_target }})."
+          when: force_rollback | default(false) | bool
+
+      rescue:
+        - name: Upgrade FAILED — starting PITR rollback
+          ansible.builtin.debug:
+            msg: "Business Postgres upgrade failed. Back to {{ _old_image }} and restoring the instance to {{ _pitr_target }}."
+
+        - name: Roll back (shared steps — same as the force_rollback drill)
+          ansible.builtin.include_tasks: tasks/postgres_business_rollback.yml
+
+        - name: Roll-back complete — fail the play so the outcome is unmistakable
+          ansible.builtin.fail:
+            msg: >-
+              Business Postgres upgrade to {{ _new_image }} FAILED and was rolled back to
+              {{ _old_image }} (instance restored to {{ _pitr_target }}). Investigate before retrying.
+
+      always:
+        - name: Lift immich maintenance mode — runs whatever happened above
+          ansible.builtin.command:
+            argv: "{{ _immadm + ['disable-maintenance-mode'] }}"
+          changed_when: true
+          failed_when: false
+
+        - name: Resume nextcloud (maintenance off) — runs whatever happened above
+          ansible.builtin.command:
+            argv: "{{ _occ + ['maintenance:mode', '--off'] }}"
+          changed_when: true
+          failed_when: false

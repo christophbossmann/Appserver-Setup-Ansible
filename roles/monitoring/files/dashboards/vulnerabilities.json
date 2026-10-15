@@ -1165,7 +1165,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "When the comparison with the registries (newer builds + newer versions) last completed. It runs at most once per ~20h (nightly) because every run costs registry requests \u2014 Docker Hub rate-limits anonymous IPs; scans started in between (button) reuse this result and only rescan the local images. Orange after 30h = the registry was unreachable or rate-limited (journalctl -u trivy-metrics).",
+      "description": "When the comparison with the registries (newer builds + newer versions) last completed. It runs at most once per 12h (in practice: the nightly run) because every run costs registry requests \u2014 Docker Hub rate-limits anonymous IPs. Scans in between (button, after an upgrade) reuse the cached result and only rescan the local images; a newly running version gets its update targets from the cached tag lists, its 'after' finding counts follow with the next comparison. Orange after 30h = the registry was unreachable or rate-limited (journalctl -u trivy-metrics).",
       "id": 54,
       "title": "Registry comparison (age)",
       "type": "stat",
@@ -1364,7 +1364,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 57
       },
       "fieldConfig": {
         "defaults": {
@@ -1677,7 +1677,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 63
+        "y": 69
       },
       "panels": []
     },
@@ -1694,7 +1694,7 @@
         "h": 14,
         "w": 24,
         "x": 0,
-        "y": 64
+        "y": 70
       },
       "fieldConfig": {
         "defaults": {
@@ -2039,7 +2039,7 @@
         "h": 14,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 84
       },
       "fieldConfig": {
         "defaults": {
@@ -2370,7 +2370,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 98
       },
       "fieldConfig": {
         "defaults": {
@@ -2466,7 +2466,7 @@
       "id": 55,
       "title": "Update overview per image",
       "type": "table",
-      "description": "Every running image, read left to right. Image age = days since the running image was BUILT: orange from 90, red from 180 days \u2014 an image that is no longer rebuilt gets no security fixes (typical for the tag of an end-of-life major version), whatever the CVE counts say. \u2460 Minor update (newest version of the running major): the version to go to and how many CRITICAL/HIGH findings it removes \u2014 red = CVSS 9\u201310, update soon. \u2461 Next major: how many MORE findings only that removes \u2014 the realistic next step where majors must not be skipped (Nextcloud). \u2462 Newest major: what going all the way removes on top. \u2463 What stays open even then \u2014 nothing to do but know. Counts are findings (per package); findings without a CVSS score are in no column. Empty cell = none / no such version.",
+      "description": "Every running image, read left to right. Image age = days since the running image was BUILT: orange from 90, red from 180 days \u2014 an image that is no longer rebuilt gets no security fixes (typical for the tag of an end-of-life major version), whatever the CVE counts say. \u2460 Minor update (newest version of the running major): the version to go to and how many CRITICAL/HIGH findings it removes \u2014 red = CVSS 9\u201310, update soon. \u2461 Next major: how many MORE findings only that removes \u2014 the realistic next step where majors must not be skipped (Nextcloud). \u2462 Newest major: what going all the way removes on top. \u2463 What stays open even then \u2014 nothing to do but know. Counts are findings (per package); findings without a CVSS score are in no column. Empty cell = none / no such version. Click a version to upgrade to it from the server itself (opens the confirm page; needs on-host upgrades, roles/local_upgrade).",
       "gridPos": {
         "h": 14,
         "w": 24,
@@ -2774,6 +2774,16 @@
               {
                 "id": "custom.width",
                 "value": 150
+              },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Upgrade to ${__value.raw} \u2026",
+                    "targetBlank": true,
+                    "url": "/hooks/upgrade?image=${__data.fields.Image}&version=${__value.raw}"
+                  }
+                ]
               }
             ]
           },
@@ -2786,6 +2796,16 @@
               {
                 "id": "custom.width",
                 "value": 150
+              },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Upgrade to ${__value.raw} \u2026",
+                    "targetBlank": true,
+                    "url": "/hooks/upgrade?image=${__data.fields.Image}&version=${__value.raw}"
+                  }
+                ]
               }
             ]
           },
@@ -2798,6 +2818,16 @@
               {
                 "id": "custom.width",
                 "value": 150
+              },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Upgrade to ${__value.raw} \u2026",
+                    "targetBlank": true,
+                    "url": "/hooks/upgrade?image=${__data.fields.Image}&version=${__value.raw}"
+                  }
+                ]
               }
             ]
           },
@@ -3050,6 +3080,284 @@
           "format": "table",
           "instant": true,
           "refId": "L"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 56,
+      "title": "On-host upgrades (last result per service)",
+      "type": "table",
+      "description": "Upgrades started on the server itself (click a version in the table above, or open the upgrade page). Result: what the upgrade playbook reported \u2014 FAILED means it rolled back (details: journalctl -u 'app-upgrade@*' on the host). Empty = none yet, or on-host upgrades are not enabled on this host.",
+      "gridPos": {
+        "h": 6,
+        "w": 20,
+        "x": 0,
+        "y": 51
+      },
+      "links": [
+        {
+          "title": "Upgrade page",
+          "url": "/hooks/upgrade",
+          "targetBlank": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Result"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "upgraded",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "FAILED / rolled back",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Finished"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeFromNow"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Duration"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Target"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "same-major": {
+                        "text": "minor update",
+                        "index": 0
+                      },
+                      "next-major": {
+                        "text": "next major",
+                        "index": 1
+                      },
+                      "latest": {
+                        "text": "newest major",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Finished",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "service",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true
+            },
+            "renameByName": {
+              "service": "Service",
+              "version": "Version",
+              "target": "Target",
+              "Value #A": "Result",
+              "Value #B": "Finished",
+              "Value #C": "Duration"
+            },
+            "indexByName": {
+              "service": 0,
+              "version": 1,
+              "target": 2,
+              "Value #A": 3,
+              "Value #B": 4,
+              "Value #C": 5
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (service, version, target) (app_upgrade_last_result)",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (service) (app_upgrade_last_timestamp_seconds) * 1000",
+          "format": "table",
+          "instant": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (service) (app_upgrade_last_duration_seconds)",
+          "format": "table",
+          "instant": true,
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "1 while an upgrade started on the server is running (only one at a time).",
+      "id": 57,
+      "title": "Upgrade running",
+      "type": "stat",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 20,
+        "y": 51
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "no",
+                  "index": 0
+                },
+                "1": {
+                  "text": "yes",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              },
+              {
+                "color": "blue",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(app_upgrade_running) or vector(0)",
+          "refId": "A",
+          "instant": true
         }
       ]
     }

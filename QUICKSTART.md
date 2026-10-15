@@ -5,7 +5,11 @@ live in [README.md](README.md) — this is just the path.
 
 ## 0. Prerequisites
 
-- Ansible on your controller (WSL/Linux/macOS), `ansible-vault` included.
+- Ansible on your controller (WSL/Linux/macOS), `ansible-vault` included — **ansible-core
+  2.19 or newer** (developed and tested with 2.20; hosts that upgrade themselves run their
+  distro's 2.20). Ubuntu 24.04's package is too old (2.16): install it with
+  `pipx install --include-deps ansible` and
+  `pipx inject ansible netaddr passlib "bcrypt==4.0.1" jmespath`.
 - A target host running recent Ubuntu/Debian, SSH-reachable as a sudo user.
 - A domain. For the tunnel model additionally a (free) Cloudflare account with the
   domain onboarded; for internal routes a [Tailscale](https://tailscale.com) account.
@@ -92,9 +96,16 @@ one-shot ssh-agent — the passphrase is asked ONCE, the agent ends with the com
 ssh-agent bash -c 'ssh-add ~/.ssh/ansible_key && ansible-playbook playbooks/server-all.yml --limit <your_host>'
 ```
 
+Running several playbooks in a row? Load the key once for the terminal session instead
+(valid until you close that terminal), then run the commands plainly:
+
+```bash
+eval "$(ssh-agent -s)" && ssh-add ~/.ssh/ansible_key
+```
+
 Every server playbook starts with a controller-side preflight
 (`playbooks/preflight-ssh-agent.yml`) that fails fast — before any SSH connection — when
-the key has a passphrase but isn't in an agent, and prints exactly this command for the
+the key has a passphrase but isn't in an agent, and prints both variants for the
 current run. Same for all commands below.
 
 Two interactive moments on a first run:
@@ -128,8 +139,9 @@ ansible-playbook playbooks/server-all.yml --limit <host> --check --diff
 # update ONE service + re-render routes/tunnel/checks (fast):
 ansible-playbook playbooks/server-all.yml --limit <host> --tags komodo,caddy
 
-# bump a service version: edit <service>_version in ../ansible-private/group_vars/all/<service>.yml, then:
-ansible-playbook playbooks/server-all.yml --limit <host> --tags <service>
+# bump a service version: use the upgrade playbooks (§7) — they verify, roll back on failure
+# and write the new version to ../ansible-private/group_vars/all/<service>.yml themselves.
+# (Editing <service>_version there by hand + --tags <service> still works, without the net.)
 
 # wipe + reinstall one compose stack (DESTRUCTIVE: containers, volumes, data dir):
 ansible-playbook playbooks/server-all.yml --limit <host> \
@@ -157,6 +169,13 @@ ansible-playbook playbooks/backup-pull.yml --limit <host>      # all apps, incl.
 ansible-playbook playbooks/backup-pull.yml --limit <host> \
   -e backup_only=immich,nextcloud -e backup_pull_originals=false
 
+# BACKUPS ON THE STORAGE BOX (hosts with storagebox_backup_enabled; run ON the host as root):
+#   immich thumbnails are mirrored nightly, database dumps written every 4 days (4 sets kept).
+#   storagebox-backup list              # what is there
+#   storagebox-backup restore-thumbs    # copy the thumbnails back
+#   storagebox-backup fetch-dumps       # download the newest dump set, then pg_restore
+#   storagebox-backup dumps --force     # an extra dump set right now
+
 # RESTORE from that local backup (DESTRUCTIVE — overwrites live data + DB):
 ansible-playbook playbooks/immich-restore-local.yml    --limit <host> -e immich_restore_confirm=YES
 ansible-playbook playbooks/nextcloud-restore-local.yml --limit <host> -e nc_restore_confirm=YES
@@ -172,11 +191,30 @@ ansible-playbook playbooks/immich-restore-local.yml    --limit <host> -e immich_
 #   Afterwards run Administration -> Job Queues -> Generate Thumbnails -> "Missing" (the play
 #   tells you if "All" is needed); if motion photos don't move: Extract Metadata -> "Missing".
 
-# UPGRADE immich / nextcloud (auto PITR rollback on failure; persists the new version):
+# UPGRADES — each verifies the result, rolls back on failure and persists the new version.
+# Add -e force_rollback=true for a drill (upgrade, verify, roll back). Details + the full
+# list: playbooks/README.md.
 ansible-playbook playbooks/immich-upgrade.yml --limit <host> \
   -e immich_upgrade_version=vX.Y.Z -e upgrade_confirm=YES
 ansible-playbook playbooks/nextcloud-upgrade.yml --limit <host> \
-  -e nextcloud_upgrade_version=NN-apache -e upgrade_confirm=YES
+  -e nextcloud_upgrade_version=NN-apache -e upgrade_confirm=YES          # one major at a time
+ansible-playbook playbooks/authentik-upgrade.yml --limit <host> \
+  -e authentik_upgrade_version=YYYY.M.P -e upgrade_confirm=YES
+# ...anything else from playbooks/vars/upgrade_catalog.yml (grafana, prometheus, dozzle, acme_dns, …):
+ansible-playbook playbooks/stack-upgrade.yml --limit <host> \
+  -e upgrade_service=<name> -e upgrade_version=<tag> -e upgrade_confirm=YES
+# ...the shared database IMAGE of immich + nextcloud (same Postgres major only; updates the
+# vector extensions + reindexes; both apps are in maintenance meanwhile):
+ansible-playbook playbooks/postgres-business-upgrade.yml --limit <host> \
+  -e postgres_business_upgrade_version=16-vectorchordX.Y.Z -e upgrade_confirm=YES
+# ...the SERVER itself: all packages (Docker, Tailscale, Ubuntu), a newer Caddy build, and —
+# with packages-reboot — a reboot if one is required (host_upgrade_mode=reboot: just reboot).
+# A Docker upgrade restarts every container once.
+ansible-playbook playbooks/host-upgrade.yml --limit <host> -e upgrade_confirm=YES \
+  -e host_upgrade_mode=packages-reboot
+# Without the controller: hosts with local_upgrade_enabled offer all of the above on
+# https://upgrade.<internal domain>/ (VPN + SSO, admins) — roles/local_upgrade/README.md.
+# The next run from here takes the versions over into the private config: commit them.
 
 # POINT-IN-TIME RECOVERY of a whole postgres instance (DESTRUCTIVE, every DB on it):
 ansible-playbook playbooks/postgres-pitr-restore.yml --limit <host> \
@@ -203,5 +241,10 @@ pair it with a Storage Box snapshot from about the same time.
 | acme-dns registration backup | `~/.ansible/acmedns/<host>.json` (controller) |
 | Tailscale identity backup | `~/.ansible/tailscale-state/<host>.state` (controller) |
 | Internal UIs | `https://<service>.int.<domain>` (via Tailscale) |
+| Upgrade page (if enabled) | `https://upgrade.int.<domain>/` — log of a run: the "log" link there, or `journalctl -t app-upgrade` on the host |
+| Snapshots (if enabled) | `https://upgrade.int.<domain>/hooks/snapshots` — list, space freed per snapshot, delete / keep / roll back; Grafana: "Snapshots" |
+| Versions upgraded on the host | `/var/lib/app-upgrade/versions/` (taken over by the next controller run) |
+| Backups on the Storage Box (if enabled) | `<host root>/backup/immich-thumbs/`, `<host root>/backup/db-dumps/<stamp>/` — `storagebox-backup list` on the host |
+| Pre-rollback database dirs | `<data dir>-pre-pitr-<stamp>` next to the data dir — delete when no longer needed |
 | Public apps | `https://<service>.<domain>` |
 | Debug access to a loopback port | `ssh -L <port>:127.0.0.1:<port> ansible@<host>` |

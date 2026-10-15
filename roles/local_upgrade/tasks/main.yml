@@ -1,0 +1,299 @@
+---
+# On-host upgrade backend — see defaults/main.yml for what and why.
+- name: On-host upgrades
+  when:
+    - local_upgrade_enabled | default(false) | bool
+    - not (upgrade_local_run | default(false) | bool)     # never from the host's own run
+  vars:
+    _lu_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+    _lu_user: "{{ hostvars[inventory_hostname].ansible_user | default('ansible') }}"
+    _lu_ssh: "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+    _lu_repo: "{{ role_path }}/../.."
+  block:
+    # The distro package (ansible-core 2.20 on current Ubuntu) — the controller runs the same
+    # major version, so a playbook behaves the same in both places.
+    - name: Install Ansible, rsync and webhook on the host
+      ansible.builtin.apt:
+        name: [ansible, rsync, webhook]
+        state: present
+
+    - name: Create the on-host directories (root only)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - "{{ local_upgrade_dir }}"
+        - "{{ local_upgrade_dir }}/repo"
+        - "{{ local_upgrade_dir }}/config"
+        - "{{ local_upgrade_dir }}/config/group_vars"
+        - "{{ local_upgrade_dir }}/config/group_vars/all"
+        - "{{ local_upgrade_dir }}/config/host_vars"
+        - /etc/app-upgrade
+        - /var/lib/app-upgrade
+
+    # rsync PUSHES from the controller (delegate_to localhost, direct rsync over SSH —
+    # synchronize breaks on the WSL controller); --rsync-path=sudo rsync writes as root.
+    - name: Sync the repository snapshot to the host
+      ansible.builtin.command:
+        argv: ["rsync", "-az", "--delete", "--no-owner", "--no-group", "--chmod=D700,F600",
+               "--exclude=.git/", "--exclude=.claude/", "--exclude=backups/", "--exclude=private/",
+               "--exclude=__pycache__/", "--exclude=*.pyc", "--exclude=group_vars/", "--exclude=host_vars/",
+               "-e", "{{ _lu_ssh }}", "--rsync-path=sudo rsync",
+               "{{ _lu_repo }}/", "{{ _lu_user }}@{{ _lu_host }}:{{ local_upgrade_dir }}/repo/"]
+      delegate_to: localhost
+      become: false
+      register: _lu_sync_repo
+      changed_when: false
+      when: not ansible_check_mode
+
+    # The private config WITHOUT the vault files (those are written filtered below) and with
+    # only THIS host's host_vars.
+    - name: Sync group_vars (no vault) to the host
+      ansible.builtin.command:
+        argv: ["rsync", "-az", "--delete", "--no-owner", "--no-group", "--chmod=D700,F600",
+               "--exclude=vault*", "-e", "{{ _lu_ssh }}", "--rsync-path=sudo rsync",
+               "{{ inventory_dir }}/group_vars/all/", "{{ _lu_user }}@{{ _lu_host }}:{{ local_upgrade_dir }}/config/group_vars/all/"]
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Copy this host's host_vars
+      ansible.builtin.copy:
+        src: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}.yml"
+        dest: "{{ local_upgrade_dir }}/config/host_vars/{{ inventory_hostname }}.yml"
+        owner: root
+        group: root
+        mode: "0600"
+
+    # Filtered vault: every key whose NAME matches local_upgrade_vault_exclude is dropped
+    # (`search`, not `match`: a pattern like 'playground' must hit anywhere in the name).
+    - name: Write the filtered vault copy
+      ansible.builtin.copy:
+        dest: "{{ local_upgrade_dir }}/config/group_vars/all/{{ item | basename }}"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Managed by Ansible (roles/local_upgrade) — FILTERED copy for on-host upgrades.
+          {{ (lookup('ansible.builtin.file', inventory_dir ~ '/' ~ item) | from_yaml | default({}, true) | dict2items
+              | rejectattr('key', 'search', (local_upgrade_vault_exclude | default([]) | join('|')) or '^$') | items2dict)
+             | to_nice_yaml(indent=2, width=100000) }}
+      loop: "{{ local_upgrade_vault_files }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      no_log: true
+
+    - name: Write the on-host inventory (this host, local connection)
+      ansible.builtin.copy:
+        dest: "{{ local_upgrade_dir }}/config/inventory.ini"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Managed by Ansible (roles/local_upgrade): this host talks to itself. ansible_host is
+          # not used to connect — it stays set because configs derive the public IP from it.
+          [servers]
+          {{ inventory_hostname }} ansible_connection=local ansible_python_interpreter=/usr/bin/python3 ansible_host={{ _lu_host }}
+
+    - name: Write the on-host ansible.cfg
+      ansible.builtin.copy:
+        dest: "{{ local_upgrade_dir }}/ansible.cfg"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Managed by Ansible (roles/local_upgrade)
+          [defaults]
+          inventory = {{ local_upgrade_dir }}/config/inventory.ini
+          roles_path = {{ local_upgrade_dir }}/repo/roles
+          gathering = explicit
+          interpreter_python = auto_silent
+          executable = /bin/bash
+          retry_files_enabled = false
+
+    - name: Load the upgrade catalog
+      ansible.builtin.include_vars:
+        file: "{{ _lu_repo }}/playbooks/vars/upgrade_catalog.yml"
+        name: _lu_cat
+
+    # What the entry point is allowed to do: the catalog reduced to what it needs, with
+    # `local` = may be upgraded on this host. Built with a loop (not a Jinja block that prints
+    # a dict): ansible-core >= 2.19 no longer turns such a string back into a structure.
+    - name: Start the on-host catalog
+      ansible.builtin.set_fact:
+        _lu_catalog: {}
+
+    - name: Build the on-host catalog
+      ansible.builtin.set_fact:
+        _lu_catalog: >-
+          {{ _lu_catalog | combine({item.key: {'playbook': item.value.playbook | default(''),
+                                               'arg': item.value.arg | default(''),
+                                               'images': item.value.images | default([]),
+                                               'kind': item.value.kind | default('image'),
+                                               'pitr': item.value.pitr | default(''),
+                                               'targets': item.value.targets | default([]),
+                                               'local': (item.key in local_upgrade_services)}}) }}
+      loop: "{{ _lu_cat.upgrade_catalog | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Deploy the catalog for the entry point
+      ansible.builtin.copy:
+        dest: /etc/app-upgrade/catalog.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: "{{ _lu_catalog | to_nice_json }}
+"
+
+    # For the snapshot page: which containers are postgres instances with a WAL archive (their
+    # archive must be rotated after a volume rollback) and follow-up commands per volume.
+    - name: Deploy the snapshot page settings
+      ansible.builtin.copy:
+        dest: /etc/app-upgrade/snapshots.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: "{{ {'pitr': dict((postgres_pitr_instances | default([]) | map(attribute='container') | list)
+                                    | zip(postgres_pitr_instances | default([]) | map(attribute='name') | list))
+                              if (postgres_pitr_enabled | default(false) | bool) else {},
+                      'stop': local_upgrade_snapshot_stop,
+                      'post': local_upgrade_snapshot_post} | to_nice_json }}\n"
+
+    - name: Install the entry point
+      ansible.builtin.copy:
+        src: app-upgrade
+        dest: /usr/local/bin/app-upgrade
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Install the upgrade unit (one instance per <service>:<version>)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/app-upgrade@.service
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/local_upgrade) — started by `app-upgrade request`
+          [Unit]
+          Description=On-host upgrade %i
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/app-upgrade run %i
+          TimeoutStartSec=3h
+          # a broken upgrade must not be restarted automatically
+          Restart=no
+      register: _lu_unit
+
+    # needrestart (apt hook) restarts services that still use replaced libraries — including
+    # the upgrade unit that is running apt at that moment (host-upgrade.yml): the run was
+    # killed mid-way and started again from the top. Never restart it.
+    - name: Check for needrestart
+      ansible.builtin.stat:
+        path: /etc/needrestart/conf.d
+      register: _lu_nr
+
+    - name: Tell needrestart to leave running upgrades alone
+      ansible.builtin.copy:
+        dest: /etc/needrestart/conf.d/50-app-upgrade.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/local_upgrade): an on-host upgrade runs apt itself.
+          $nrconf{override_rc}{qr(^app-upgrade\@.+\.service$)} = 0;
+      when: _lu_nr.stat.exists
+
+    # Second hooks file for the webhook service (the scan button's hook lives in
+    # /etc/webhook.conf, roles/monitoring — whose drop-in loads this file when
+    # local_upgrade_enabled). Reached through the `upgrade` Caddy route only (VPN + Authentik
+    # forward-auth, admins — defaults/caddy_route.yml):
+    #   GET  /hooks/upgrade?image=<service|image>&version=<v>   the confirm page (no params: overview;
+    #        the site's root / shows the same overview)
+    #   GET  /hooks/snapshots[?version=<config>.<N>.<action>]    snapshot page / its confirm page
+    #        (actions are started through the same POST as upgrades: service "snapshots")
+    #   GET  /hooks/upgrade-status                              last results + running upgrade (JSON)
+    #   GET  /hooks/upgrade-log?service=<s>                     page following the log of the running / last upgrade
+    #   GET  /hooks/upgrade-logdata?service=<s>&cursor=<c>      its new lines (JSON, polled by the pages)
+    #   POST /hooks/app-upgrade {"service","version"}           start it — only with this site's
+    #        Origin (a foreign page cannot make the browser send it), and the entry point
+    #        validates both fields itself. The forward-auth user name is passed on for the record.
+    - name: Define the upgrade hooks
+      ansible.builtin.copy:
+        dest: /etc/webhook-upgrade.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {{ [{'id': 'app-upgrade',
+               'execute-command': '/usr/local/bin/app-upgrade',
+               'pass-arguments-to-command': [{'source': 'string', 'name': 'request'},
+                                             {'source': 'payload', 'name': 'service'},
+                                             {'source': 'payload', 'name': 'version'}],
+               'pass-environment-to-command': [{'source': 'header', 'name': 'X-Authentik-Username', 'envname': 'APP_UPGRADE_USER'}],
+               'http-methods': ['POST'],
+               'include-command-output-in-response': true,
+               'include-command-output-in-response-on-error': true,
+               'trigger-rule': {'and': [
+                   {'match': {'type': 'value', 'value': local_upgrade_origin, 'parameter': {'source': 'header', 'name': 'Origin'}}},
+                   {'match': {'type': 'regex', 'regex': '^[A-Za-z0-9_]{1,40}$', 'parameter': {'source': 'payload', 'name': 'service'}}},
+                   {'match': {'type': 'regex', 'regex': '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$', 'parameter': {'source': 'payload', 'name': 'version'}}}]}},
+              {'id': 'upgrade',
+               'execute-command': '/usr/local/bin/app-upgrade',
+               'pass-arguments-to-command': [{'source': 'string', 'name': 'page'},
+                                             {'source': 'url', 'name': 'image'},
+                                             {'source': 'url', 'name': 'version'}],
+               'pass-environment-to-command': [{'source': 'header', 'name': 'X-Authentik-Username', 'envname': 'APP_UPGRADE_USER'}],
+               'http-methods': ['GET'],
+               'include-command-output-in-response': true,
+               'response-headers': [{'name': 'Content-Type', 'value': 'text/html; charset=utf-8'},
+                                    {'name': 'Cache-Control', 'value': 'no-store'}]},
+              {'id': 'snapshots',
+               'execute-command': '/usr/local/bin/app-upgrade',
+               'pass-arguments-to-command': [{'source': 'string', 'name': 'page'},
+                                             {'source': 'string', 'name': 'snapshots'},
+                                             {'source': 'url', 'name': 'version'}],
+               'pass-environment-to-command': [{'source': 'header', 'name': 'X-Authentik-Username', 'envname': 'APP_UPGRADE_USER'}],
+               'http-methods': ['GET'],
+               'include-command-output-in-response': true,
+               'response-headers': [{'name': 'Content-Type', 'value': 'text/html; charset=utf-8'},
+                                    {'name': 'Cache-Control', 'value': 'no-store'}]},
+              {'id': 'upgrade-log',
+               'execute-command': '/usr/local/bin/app-upgrade',
+               'pass-arguments-to-command': [{'source': 'string', 'name': 'logpage'},
+                                             {'source': 'url', 'name': 'service'}],
+               'pass-environment-to-command': [{'source': 'header', 'name': 'X-Authentik-Username', 'envname': 'APP_UPGRADE_USER'}],
+               'http-methods': ['GET'],
+               'include-command-output-in-response': true,
+               'response-headers': [{'name': 'Content-Type', 'value': 'text/html; charset=utf-8'},
+                                    {'name': 'Cache-Control', 'value': 'no-store'}]},
+              {'id': 'upgrade-logdata',
+               'execute-command': '/usr/local/bin/app-upgrade',
+               'pass-arguments-to-command': [{'source': 'string', 'name': 'log'},
+                                             {'source': 'url', 'name': 'service'},
+                                             {'source': 'url', 'name': 'cursor'}],
+               'http-methods': ['GET'],
+               'include-command-output-in-response': true,
+               'response-headers': [{'name': 'Content-Type', 'value': 'application/json'},
+                                    {'name': 'Cache-Control', 'value': 'no-store'}]},
+              {'id': 'upgrade-status',
+               'execute-command': '/usr/local/bin/app-upgrade',
+               'pass-arguments-to-command': [{'source': 'string', 'name': 'status'}],
+               'http-methods': ['GET'],
+               'include-command-output-in-response': true,
+               'response-headers': [{'name': 'Content-Type', 'value': 'application/json'},
+                                    {'name': 'Cache-Control', 'value': 'no-store'}]}]
+             | to_nice_json }}
+      register: _lu_hook
+
+    - name: Reload systemd / restart webhook when their files changed
+      ansible.builtin.systemd:
+        name: webhook.service
+        state: "{{ 'restarted' if _lu_hook.changed else 'started' }}"
+        daemon_reload: "{{ _lu_unit.changed }}"
+      when: not ansible_check_mode
+      failed_when: false     # the webhook drop-in comes with the monitoring role (runs after this one on a first install)

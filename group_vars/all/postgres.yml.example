@@ -12,7 +12,7 @@
 # dir) — n8n and other consumers are unaffected. Tags:
 # https://github.com/immich-app/base-images/pkgs/container/postgres
 postgres_version: "16"
-postgres_vectorchord_version: "0.4.3"
+postgres_vectorchord_version: "1.1.1"
 postgres_image: "ghcr.io/immich-app/postgres:{{ postgres_version }}-vectorchord{{ postgres_vectorchord_version }}"
 postgres_data_dir: "{{ data_root_dev }}/db"           # dev domain (n8n DB instance)
 postgres_port: 5432
@@ -27,6 +27,8 @@ postgres_db: "n8n"
 # PITR-rolled-back / upgraded independently of the shared n8n/experimental one.
 # Needs the vectorchord image (Immich). n8n stays on the `postgres` instance above.
 postgres_business_image: "{{ postgres_image }}"        # vectorchord (immich needs it)
+# Upgrade with playbooks/postgres-business-upgrade.yml (same Postgres major; updates the
+# extensions + reindexes, PITR rollback) — it writes the full image reference here.
 postgres_business_container: postgres-business
 postgres_business_user: "business"                    # instance superuser (bootstrap only)
 postgres_business_password: "{{ vault_postgres_business_password }}"

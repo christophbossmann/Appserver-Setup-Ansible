@@ -73,6 +73,14 @@
 # ==========================================================
 # xcaddy: build Caddy with required DNS provider plugins
 # ==========================================================
+# A custom build replaces the package's binary — so the package must not be upgraded behind
+# its back (a manual `apt upgrade` would put the stock binary without the plugin in place and
+# Caddy would not start). New Caddy releases come in through playbooks/host-upgrade.yml.
+- name: Hold the caddy package when it carries a custom build
+  ansible.builtin.dpkg_selections:
+    name: caddy
+    selection: "{{ 'hold' if ((caddy_build_cloudflare_dns_plugin | bool) or (caddy_build_acme_dns_plugin | bool)) else 'install' }}"
+
 - name: Collect required xcaddy DNS plugins
   ansible.builtin.set_fact:
     _caddy_required_plugins: >-

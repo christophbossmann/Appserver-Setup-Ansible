@@ -23,3 +23,21 @@ btrfs_checkpoint_config: root
 # -> at most one ans_<label>_* per host, no accumulation on repeat deploys. Set false to
 # create a fresh timestamped snapshot every run.
 btrfs_checkpoint_skip_if_exists: true
+
+# Retention of the OS-root snapshots (snapper config `root`), kept at these values on every
+# run. Two kinds of snapshots, two rules:
+#   timeline  the daily snapshot: kept by AGE — 30 days here, no weekly/monthly tiers (they
+#             would hold a state for half a year)
+#   number    the pre/post pairs around package runs and upgrades: kept by COUNT (snapper has
+#             no age limit for them)
+# Permanent snapshots (deploy checkpoints, `snapshot keep`) are never touched by either.
+# The data volumes have their own retention (roles/data_storage: daily, per volume).
+btrfs_root_retention_manage: true
+btrfs_root_retention:
+  TIMELINE_LIMIT_HOURLY: 0
+  TIMELINE_LIMIT_DAILY: 30
+  TIMELINE_LIMIT_WEEKLY: 0
+  TIMELINE_LIMIT_MONTHLY: 0
+  TIMELINE_LIMIT_YEARLY: 0
+  NUMBER_LIMIT: 20
+  NUMBER_LIMIT_IMPORTANT: 10

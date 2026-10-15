@@ -43,9 +43,13 @@
   loop_control:
     label: "{{ item.key }} -> {{ item.value }}"
 
+# Two steps on purpose: rendering the template in its own task makes a template error show
+# up as itself (inside one big expression ansible-core >= 2.19 only reports the follow-up
+# "can only concatenate list" of the failed sub-expression).
+- name: Render the active services into route definitions
+  ansible.builtin.set_fact:
+    _proxy_routes_resolved: "{{ lookup('template', 'proxy_routes_resolved.yml.j2') | from_yaml | default([], true) }}"
+
 - name: Resolve active services into proxy_routes (+ keep base wildcards)
   ansible.builtin.set_fact:
-    proxy_routes: >-
-      {{ (proxy_routes | default([]))
-         + (proxy_routes_base | default([]))
-         + (lookup('template', 'proxy_routes_resolved.yml.j2') | from_yaml | default([], true)) }}
+    proxy_routes: "{{ (proxy_routes | default([])) + (proxy_routes_base | default([])) + _proxy_routes_resolved }}"

@@ -16,7 +16,19 @@
     group: root
     mode: "0755"
 
+# Several host-side upgrades in a row (31 -> 32 -> 33 before the laptop ran again): the config
+# repo still holds the version from BEFORE the first of them. Keep that as `previous`, or the
+# reconciliation would see "repo says 31, host went 32 -> 33" and stop as a conflict.
+- name: Read the existing record
+  ansible.builtin.slurp:
+    src: "/var/lib/app-upgrade/versions/{{ rec_var }}.json"
+  register: _rec_old
+  failed_when: false
+
 - name: Record {{ rec_var }} = {{ rec_value }}
+  vars:
+    _old: "{{ (_rec_old.content | b64decode | from_json) if (_rec_old.content is defined) else {} }}"
+    _chained: "{{ (upgrade_local_run | default(false) | bool) and (_old.source | default('')) == 'host' }}"
   ansible.builtin.copy:
     dest: "/var/lib/app-upgrade/versions/{{ rec_var }}.json"
     owner: root
@@ -24,6 +36,6 @@
     mode: "0644"
     content: |
       {{ {'service': rec_service, 'var': rec_var, 'file': rec_file, 'value': rec_value,
-          'previous': rec_previous,
+          'previous': (_old.previous if _chained else rec_previous),
           'source': ('host' if (upgrade_local_run | default(false) | bool) else 'controller'),
           'time': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')} | to_nice_json }}

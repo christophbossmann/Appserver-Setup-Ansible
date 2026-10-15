@@ -43,10 +43,12 @@
     # The caddy role seeds /etc/caddy/acmedns.json from this on a fresh server; the
     # migration on an existing server replaces the old file (see the migration steps).
     - name: Derive caddy_acme_dns_seed_credentials from the declared accounts
-      # lookup('template') on a JSON body already returns a dict here (Ansible
-      # auto-parses), so NO from_json.
       ansible.builtin.set_fact:
-        caddy_acme_dns_seed_credentials: "{{ lookup('template', 'seed_credentials.json.j2') }}"
+        # Parse explicitly: ansible-core < 2.19 turned a JSON-looking string into a dict on its
+        # own, >= 2.19 keeps it a string (".keys() on str" further down in the caddy role).
+        caddy_acme_dns_seed_credentials: "{{ _seed if (_seed is mapping) else (_seed | from_json) }}"
+      vars:
+        _seed: "{{ lookup('template', 'seed_credentials.json.j2') }}"
       no_log: true
 
     - name: acme-dns bootstrap summary (+ the CNAMEs to set at the registrar)

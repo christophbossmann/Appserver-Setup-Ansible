@@ -9,7 +9,7 @@
 # clients (desktop/mobile, CalDAV/CardDAV) authenticate against Nextcloud
 # itself and would break behind an SSO redirect.
 
-nextcloud_version: "31-apache"
+nextcloud_version: "35-apache"
 nextcloud_image: "nextcloud:{{ nextcloud_version }}"
 nextcloud_redis_image: "valkey/valkey:9"
 

@@ -1,0 +1,30 @@
+---
+# Retention of the OS-root snapshots (snapper config `root`). The config itself is created
+# once by btrfs-bootstrap.sh; this only keeps its limits at btrfs_root_retention, so they are
+# the same on every host and a change is one variable. Does nothing where snapper has no
+# root config. Applied by snapper's own daily cleanup — nothing is deleted here.
+- name: Read the root snapshot config
+  ansible.builtin.command: snapper -c root get-config
+  register: _btrfs_rootcfg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Apply the root snapshot retention
+  ansible.builtin.shell: |
+    set -e
+    changed=0
+    {% for k, v in btrfs_root_retention.items() %}
+    cur=$(snapper -c root get-config | awk -F'|' '$1 ~ /^{{ k }} *$/ { gsub(/ /, "", $2); print $2 }')
+    if [ "$cur" != "{{ v }}" ]; then snapper -c root set-config "{{ k }}={{ v }}"; echo "{{ k }}: $cur -> {{ v }}"; changed=1; fi
+    {% endfor %}
+    [ "$changed" = 1 ] || echo unchanged
+  args:
+    executable: /bin/bash
+  register: _btrfs_retention
+  changed_when: "'unchanged' not in _btrfs_retention.stdout"
+  when: _btrfs_rootcfg.rc == 0
+
+- name: Remember that the retention was handled in this play
+  ansible.builtin.set_fact:
+    _btrfs_retention_done: true

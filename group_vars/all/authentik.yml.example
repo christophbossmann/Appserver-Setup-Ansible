@@ -9,7 +9,7 @@
 # === Images ===
 # Server, worker and LDAP outpost must run the SAME version -> one variable for all three.
 # Upgrade with playbooks/authentik-upgrade.yml (PITR rollback), not by editing this.
-authentik_version: "2026.5.5"
+authentik_version: "2026.8.3"
 authentik_server_image:   "ghcr.io/goauthentik/server:{{ authentik_version }}"
 authentik_postgres_image: "postgres:16-alpine"
 # Host LOOPBACK port for admin access to the Authentik DB (local pgAdmin via SSH tunnel).
@@ -117,6 +117,8 @@ authentik_forward_auth_apps:
   - { name: playwright, display_name: "Playwright MCP", hostname: "{{ svc_edge_host.get('playwright_mcp', '') }}" }
   # Container dashboard (live logs + restart buttons) — admins only.
   - { name: dozzle, display_name: "Dozzle", hostname: "{{ svc_edge_host.get('dozzle', '') }}" }
+  # On-host upgrade page (roles/local_upgrade) — admins only: it can start upgrades.
+  - { name: upgrade, display_name: "Updates", hostname: "{{ svc_edge_host.get('upgrade', '') }}" }
   # (headplane moved to native OIDC — see authentik_oauth_apps below; no forward-auth.)
   # Supabase Studio UI (the API prefixes bypass forward-auth — see the supabase
   # caddy_route's caddy_forward_auth_except_paths). External host -> global_host.

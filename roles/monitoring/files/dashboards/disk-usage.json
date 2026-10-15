@@ -231,9 +231,9 @@
         "uid": "prometheus"
       },
       "id": 3,
-      "title": "Free space",
-      "type": "stat",
-      "description": "Absolute free space per filesystem.",
+      "title": "Filesystems: total, used, free",
+      "type": "table",
+      "description": "Size, used and free space of the local disk (/) and the Storage Box. Local 'used' includes what snapshots still hold (see the Disk snapshots dashboard) and the container images (/var/lib/containerd).",
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -242,29 +242,77 @@
       },
       "fieldConfig": {
         "defaults": {
+          "custom": {
+            "align": "auto"
+          },
           "unit": "bytes",
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "text"
+          "decimals": 1
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Used %"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.75
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.9
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Filesystem"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              }
+            ]
           }
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "horizontal",
-        "textMode": "value_and_name",
-        "wideLayout": true,
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showPercentChange": false
+        ]
       },
       "targets": [
         {
@@ -272,12 +320,81 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "node_filesystem_avail_bytes{mountpoint=~\"/|/mnt/storagebox\"}",
           "refId": "A",
-          "legendFormat": "{{mountpoint}}",
-          "instant": true
+          "format": "table",
+          "instant": true,
+          "expr": "max by (mountpoint) (node_filesystem_size_bytes{mountpoint=~\"/|/mnt/storagebox\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "format": "table",
+          "instant": true,
+          "expr": "max by (mountpoint) (node_filesystem_size_bytes{mountpoint=~\"/|/mnt/storagebox\"} - node_filesystem_avail_bytes{mountpoint=~\"/|/mnt/storagebox\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "C",
+          "format": "table",
+          "instant": true,
+          "expr": "max by (mountpoint) (node_filesystem_avail_bytes{mountpoint=~\"/|/mnt/storagebox\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "D",
+          "format": "table",
+          "instant": true,
+          "expr": "max by (mountpoint) (1 - node_filesystem_avail_bytes{mountpoint=~\"/|/mnt/storagebox\"} / node_filesystem_size_bytes{mountpoint=~\"/|/mnt/storagebox\"})"
         }
-      ]
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "mountpoint",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true
+            },
+            "renameByName": {
+              "mountpoint": "Filesystem",
+              "Value #A": "Total",
+              "Value #B": "Used",
+              "Value #C": "Free",
+              "Value #D": "Used %"
+            },
+            "indexByName": {
+              "mountpoint": 0,
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4
+            }
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "md"
+      }
     },
     {
       "datasource": {
@@ -408,6 +525,277 @@
           "expr": "disk_usage_bytes and on (path) topk(8, disk_usage_bytes)",
           "refId": "A",
           "legendFormat": "{{path}}"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "title": "Largest directories anywhere (nightly search)",
+      "description": "Found by walking every local filesystem completely once a night (disk-discover-metrics) \u2014 not limited to the fixed list the panels above use, so data in an unexpected place shows up here. Every directory of at least the threshold, split as deep as it stays that big; nothing is counted twice. '(rest)' = what a directory holds besides its big children, '(everything smaller)' = the remainder of a volume. Snapshot directories and the Storage Box are left out.",
+      "gridPos": {
+        "h": 18,
+        "w": 16,
+        "x": 0,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "namePlacement": "left",
+        "showUnfilled": true,
+        "valueMode": "text",
+        "sizing": "manual",
+        "minVizHeight": 16,
+        "maxVizHeight": 22,
+        "text": {
+          "titleSize": 12,
+          "valueSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "instant": true,
+          "legendFormat": "{{path}}",
+          "expr": "sort_desc(topk(30, disk_big_dir_bytes))"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "title": "Not attributed",
+      "description": "Used space the nightly search could not explain: used - all directories it measured - what only snapshots still hold. A few GiB are normal (filesystem metadata, estimates). A large value means data somewhere that is not visible as files \u2014 or a place the search does not reach.",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 8000000000.0
+              },
+              {
+                "color": "red",
+                "value": 20000000000.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "instant": true,
+          "expr": "sum(disk_discover_unassigned_bytes)"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "title": "Used = files + snapshots + not attributed",
+      "description": "How the used space of the local disk adds up: what the search found as files, what only snapshots still hold (Disk snapshots dashboard), and the unexplained remainder.",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value_and_name",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "instant": true,
+          "legendFormat": "used",
+          "expr": "sum(disk_discover_used_bytes)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "instant": true,
+          "legendFormat": "files",
+          "expr": "sum(disk_discover_measured_bytes)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "C",
+          "instant": true,
+          "legendFormat": "snapshots",
+          "expr": "sum(disk_discover_snapshots_bytes)"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "title": "Search last ran (age)",
+      "description": "disk-discover-metrics runs once a night.",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 129600
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "instant": true,
+          "expr": "time() - max(disk_discover_timestamp_seconds)"
         }
       ]
     }

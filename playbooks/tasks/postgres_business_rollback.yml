@@ -1,0 +1,38 @@
+---
+# Roll the business Postgres instance back to the pre-upgrade image + anchor. Included by
+# postgres-business-upgrade.yml from BOTH the rescue (on failure) and the force_rollback
+# drill path. Does NOT fail the play — the caller decides that. Both apps are still in
+# maintenance mode. Expects play vars: _biz, _old_image, _pitr_target, upgrade_keep_old,
+# upgrade_health_retries.
+#
+# Order matters: the OLD image first, then the restore. The restore replaces the data dir
+# with the pre-upgrade base backup + WAL up to the anchor, so the extensions inside the
+# databases are back at the version the old image's libraries belong to.
+- name: Redeploy the business instance with the pre-upgrade image
+  ansible.builtin.include_role:
+    name: compose_stack
+  vars:
+    stack: postgres-business
+    postgres_business_image: "{{ _old_image }}"
+
+- name: PITR the business instance back to the pre-upgrade anchor
+  ansible.builtin.include_tasks: pitr_restore.yml
+  vars:
+    pitr_instance: postgres-business
+    pitr_target_time: "{{ _pitr_target }}"
+    pitr_keep_old: "{{ upgrade_keep_old }}"
+
+- name: Restart immich-server (fresh connections to the restored instance)
+  ansible.builtin.command: docker restart immich-server
+  changed_when: true
+  failed_when: false
+
+- name: Wait for immich to be healthy again (so maintenance can be lifted)
+  ansible.builtin.command:
+    argv: [docker, inspect, immich-server, -f, "{{ '{{.State.Health.Status}}' }}"]
+  register: _ihrb
+  until: (_ihrb.stdout | trim) == 'healthy'
+  retries: "{{ upgrade_health_retries | default(60) }}"
+  delay: 5
+  changed_when: false
+  failed_when: false

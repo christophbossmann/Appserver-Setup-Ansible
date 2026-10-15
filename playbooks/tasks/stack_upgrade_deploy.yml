@@ -47,3 +47,16 @@
   changed_when: false
   failed_when: _verify.rc != 0
   when: _svc.containers | default([]) | length > 0
+
+# What "works" means beyond "the container is up" (catalog: verify) — e.g. acme-dns v2 with
+# a wrong database driver runs and answers /health, but not DNS.
+- name: Service-specific checks
+  ansible.builtin.shell: "{{ item }}"
+  args:
+    executable: /bin/bash
+  register: _svc_verify
+  until: _svc_verify.rc == 0
+  retries: 6
+  delay: 5
+  changed_when: false
+  loop: "{{ _svc.verify | default([]) }}"

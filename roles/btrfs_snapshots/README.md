@@ -23,6 +23,9 @@ Set `btrfs_snapshots_enable: true` in the host's `host_vars` for real btrfs host
 missing/broken setup is caught loudly); leave it at `auto` for non-btrfs hosts, where every
 checkpoint is a safe no-op.
 
+It also keeps the **retention of the root snapshots** at `btrfs_root_retention` (default:
+daily snapshots for 30 days, the last 20 package-run/upgrade snapshots; permanent ones stay).
+
 ## Key variables (see `defaults/main.yml`)
 - `btrfs_check_path` (default `/`) — the mount whose FS type decides btrfs-or-not.
 - `btrfs_checkpoint_config` (default `root`) — the snapper config the checkpoints use
@@ -45,6 +48,11 @@ subvolume for a fresh copy of the snapshot (one command, from the running system
 reboots). On a
 headless VPS you can also boot **read-only** into any snapshot from the **GRUB menu** via the
 provider's **VNC console at boot** (grub-btrfs), just to inspect it. See `../../btrfs-setup.md` §5.
+
+**Overview + space:** the "Snapshots" dashboard in Grafana (`roles/monitoring`,
+`snapshot-metrics`) shows every snapshot of every config with the space deleting it would
+free. On hosts with `roles/local_upgrade` the same list is on the portal's snapshot page,
+with delete / keep / roll back per snapshot.
 
 ## Notes
 - On non-btrfs hosts with `auto` the role prints a warning and does nothing — safe to keep

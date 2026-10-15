@@ -1,0 +1,270 @@
+---
+# Host software upgrade: everything on the server that is NOT a container image.
+#
+#   ansible-playbook playbooks/host-upgrade.yml --limit <host> -e upgrade_confirm=YES \
+#     [-e host_upgrade_mode=packages]          # default: packages + Caddy
+#     [-e host_upgrade_mode=packages-reboot]   # ... then reboot IF one is required
+#     [-e host_upgrade_mode=reboot]            # just reboot (now)
+#
+# packages:
+#   - apt dist-upgrade of ALL configured sources. unattended-upgrades only installs Ubuntu
+#     security updates on its own — Docker, containerd and Tailscale come from their vendors'
+#     repositories and are only upgraded here. A Docker upgrade restarts the Docker daemon:
+#     every container restarts once (a minute of downtime for everything, SSO included).
+#   - Caddy: when it carries DNS plugins it is a custom xcaddy build, which a package upgrade
+#     would silently replace by the stock binary (no plugin -> Caddy does not start). So the
+#     package is put on hold, and the newest Caddy is BUILT here instead (same plugins as the
+#     running binary), checked against the live Caddyfile and swapped in — with the previous
+#     binary put back if Caddy does not come up.
+# Snapshots: a snapper pre/post pair of the root filesystem frames the run (cleanup
+# algorithm "number", i.e. the normal retention of the root config); apt's own snapper hook
+# adds its pair around the package step, and snapper-boot one at the next boot.
+# Reboot: only in the two reboot modes. On the host itself (on-host upgrade) it is scheduled
+# one minute after the play ended; from the controller the play waits for the server and
+# checks that the containers are back.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+  when: not (upgrade_local_run | default(false) | bool)
+
+- name: Host upgrade (packages, Caddy, optional reboot)
+  hosts: all
+  become: true
+  vars:
+    upgrade_confirm: ""
+    host_upgrade_mode: packages
+    host_upgrade_container_wait: 60     # x5s for the containers to be back after a Docker restart
+    _caddy_plugin_modules:              # module in the running binary -> xcaddy plugin to build with
+      dns.providers.acmedns: github.com/caddy-dns/acmedns
+      dns.providers.cloudflare: github.com/caddy-dns/cloudflare
+    _do_packages: "{{ host_upgrade_mode in ['packages', 'packages-reboot'] }}"
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that:
+          - upgrade_confirm | default('') == 'YES'
+          - host_upgrade_mode in ['packages', 'packages-reboot', 'reboot']
+        fail_msg: "Need -e upgrade_confirm=YES and host_upgrade_mode = packages | packages-reboot | reboot"
+
+    - name: Check for snapper's root config
+      ansible.builtin.command: snapper -c root get-config
+      register: _snapper
+      changed_when: false
+      failed_when: false
+
+    - name: Snapshot the root filesystem (pre)
+      ansible.builtin.command: >-
+        snapper -c root create --type pre --cleanup-algorithm number --print-number
+        --description "host-upgrade ({{ host_upgrade_mode }})"
+      register: _snap_pre
+      changed_when: true
+      when: _snapper.rc == 0
+
+    - name: Remember which containers are running
+      ansible.builtin.command: docker ps --format {{ '{{.Names}}' }}
+      register: _ctr_before
+      changed_when: false
+
+    # ---- PACKAGES ---------------------------------------------------------------------
+    - name: Packages
+      when: _do_packages | bool
+      block:
+        - name: Which DNS plugins does the running Caddy carry?
+          ansible.builtin.command: caddy list-modules
+          register: _caddy_mods
+          changed_when: false
+          failed_when: false
+
+        - name: Resolve the Caddy plugins
+          ansible.builtin.set_fact:
+            _caddy_plugins: "{{ _caddy_plugin_modules | dict2items | selectattr('key', 'in', (_caddy_mods.stdout | default('')).split()) | map(attribute='value') | list }}"
+
+        # A custom build must not be replaced by the package (see the header).
+        - name: Hold the caddy package (custom build)
+          ansible.builtin.dpkg_selections:
+            name: caddy
+            selection: hold
+          when: _caddy_plugins | length > 0
+
+        - name: Refresh the package lists
+          ansible.builtin.apt:
+            update_cache: true
+
+        - name: What would be upgraded
+          ansible.builtin.shell: "apt-get -s dist-upgrade | awk '/^Inst / { print $2, $3, \"->\", $4 }' | tr -d '()[]'"
+          register: _pending
+          changed_when: false
+
+        - name: Upgrade all packages (keeps changed config files)
+          ansible.builtin.apt:
+            upgrade: dist
+            dpkg_options: "force-confdef,force-confold"
+          register: _aptup
+          when: _pending.stdout_lines | length > 0
+
+        - name: Remove packages that are no longer needed (old kernels)
+          ansible.builtin.apt:
+            autoremove: true
+
+        # ---- Caddy: build the newest release with the same plugins ----------------------
+        - name: Caddy (custom build)
+          when: _caddy_plugins | length > 0
+          vars:
+            _build: /var/tmp/caddy-build
+            _goenv: { GOPATH: /root/go, HOME: /root, GOFLAGS: "-buildvcs=false" }
+          block:
+            - name: Ensure xcaddy is installed
+              ansible.builtin.command: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+              environment: "{{ _goenv }}"
+              args:
+                creates: /root/go/bin/xcaddy
+
+            - name: Fresh build dir
+              ansible.builtin.shell: "rm -rf {{ _build }} && mkdir -p {{ _build }}"
+              changed_when: false
+
+            - name: Build the newest Caddy with {{ _caddy_plugins | join(', ') }}
+              ansible.builtin.command: >-
+                /root/go/bin/xcaddy build --output {{ _build }}/caddy
+                {{ _caddy_plugins | map('regex_replace', '^', '--with ') | join(' ') }}
+              environment: "{{ _goenv }}"
+              args:
+                chdir: "{{ _build }}"
+              changed_when: false
+
+            - name: Compare the versions
+              ansible.builtin.shell: "echo \"$(caddy version | cut -d' ' -f1) $({{ _build }}/caddy version | cut -d' ' -f1)\""
+              register: _caddy_ver
+              changed_when: false
+
+            - name: Swap in the new Caddy
+              when: _caddy_ver.stdout.split()[0] != _caddy_ver.stdout.split()[1]
+              block:
+                - name: The new binary must carry the plugins and accept the live Caddyfile
+                  ansible.builtin.shell: |
+                    set -e
+                    for m in {{ _caddy_plugin_modules | dict2items | selectattr('value', 'in', _caddy_plugins) | map(attribute='key') | join(' ') }}; do
+                      {{ _build }}/caddy list-modules | grep -qx "$m" || { echo "module $m missing in the new build"; exit 1; }
+                    done
+                    set -a; [ ! -f /etc/caddy/cloudflare.env ] || . /etc/caddy/cloudflare.env; set +a
+                    {{ _build }}/caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+                  args:
+                    executable: /bin/bash
+                  changed_when: false
+
+                - name: Keep the running binary, install the new one, restart Caddy
+                  ansible.builtin.shell: |
+                    set -e
+                    cp -p /usr/bin/caddy /usr/bin/caddy.previous
+                    install -o root -g root -m 0755 {{ _build }}/caddy /usr/bin/caddy.new
+                    mv /usr/bin/caddy.new /usr/bin/caddy
+                    systemctl restart caddy
+                  args:
+                    executable: /bin/bash
+                  changed_when: true
+
+                - name: Caddy must be up and serving TLS
+                  ansible.builtin.shell: |
+                    sleep 5
+                    systemctl is-active --quiet caddy || exit 1
+                    ss -ltn | grep -q ':443 ' || exit 1
+                  args:
+                    executable: /bin/bash
+                  register: _caddy_up
+                  until: _caddy_up.rc == 0
+                  retries: 6
+                  delay: 5
+                  changed_when: false
+              rescue:
+                - name: Put the previous Caddy back
+                  ansible.builtin.shell: |
+                    [ -f /usr/bin/caddy.previous ] && [ "$(/usr/bin/caddy.previous version)" != "$(/usr/bin/caddy version)" ] \
+                      && cp -p /usr/bin/caddy.previous /usr/bin/caddy
+                    systemctl restart caddy
+                  args:
+                    executable: /bin/bash
+                  changed_when: true
+
+                - name: Caddy upgrade failed — previous binary restored
+                  ansible.builtin.fail:
+                    msg: >-
+                      The new Caddy ({{ _caddy_ver.stdout.split()[1] }}) was rejected or did not come up;
+                      {{ _caddy_ver.stdout.split()[0] }} is running again. The packages above stay upgraded.
+
+        # ---- everything back? (a Docker upgrade restarted the daemon) ---------------------
+        - name: Wait until the containers that were running are running again
+          ansible.builtin.shell: |
+            for c in {{ _ctr_before.stdout_lines | join(' ') }}; do
+              [ "$(docker inspect "$c" -f '{{ '{{.State.Running}}' }}' 2>/dev/null)" = true ] || { echo "not running: $c"; exit 1; }
+            done
+          args:
+            executable: /bin/bash
+          register: _ctr_back
+          until: _ctr_back.rc == 0
+          retries: "{{ host_upgrade_container_wait }}"
+          delay: 5
+          changed_when: false
+
+        - name: Caddy must be running
+          ansible.builtin.command: systemctl is-active caddy
+          changed_when: false
+
+    - name: Snapshot the root filesystem (post)
+      ansible.builtin.command: >-
+        snapper -c root create --type post --pre-number {{ _snap_pre.stdout | trim }}
+        --cleanup-algorithm number --description "host-upgrade ({{ host_upgrade_mode }})"
+      changed_when: true
+      when: _snapper.rc == 0
+
+    # ---- REBOOT -----------------------------------------------------------------------
+    - name: Is a reboot required?
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: _rbreq
+
+    - name: Decide
+      ansible.builtin.set_fact:
+        _reboot: "{{ host_upgrade_mode == 'reboot' or (host_upgrade_mode == 'packages-reboot' and _rbreq.stat.exists) }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ ((_pending.stdout_lines | default([])) | length) ~ ' package(s) upgraded' if (_do_packages | bool) else 'no package step' }}{{
+          '; Caddy ' ~ (_caddy_ver.stdout | default('') | replace(' ', ' -> ')) if (_caddy_ver.stdout is defined and _caddy_ver.stdout.split()[0] != _caddy_ver.stdout.split()[1]) else '' }}.
+          Reboot required: {{ 'yes' if _rbreq.stat.exists else 'no' }}.
+          {{ 'REBOOTING' ~ (' in one minute' if (upgrade_local_run | default(false) | bool) else ' now') ~ '.' if (_reboot | bool)
+             else ('Reboot later with host_upgrade_mode=reboot.' if _rbreq.stat.exists else '') }}
+
+    # On the host itself the play cannot survive its own reboot: schedule it, so the run
+    # ends cleanly and its result is recorded first.
+    - name: Schedule the reboot (on-host run)
+      ansible.builtin.command:
+        argv: [shutdown, -r, "+1", "host-upgrade reboot"]
+      changed_when: true
+      when:
+        - _reboot | bool
+        - upgrade_local_run | default(false) | bool
+
+    - name: Reboot and wait for the server (run from the controller)
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+        msg: "host-upgrade reboot"
+      when:
+        - _reboot | bool
+        - not (upgrade_local_run | default(false) | bool)
+
+    - name: After the reboot — the containers that were running are running again
+      ansible.builtin.shell: |
+        for c in {{ _ctr_before.stdout_lines | join(' ') }}; do
+          [ "$(docker inspect "$c" -f '{{ '{{.State.Running}}' }}' 2>/dev/null)" = true ] || { echo "not running: $c"; exit 1; }
+        done
+        systemctl is-active --quiet caddy
+      args:
+        executable: /bin/bash
+      register: _ctr_boot
+      until: _ctr_boot.rc == 0
+      retries: "{{ host_upgrade_container_wait }}"
+      delay: 5
+      changed_when: false
+      when:
+        - _reboot | bool
+        - not (upgrade_local_run | default(false) | bool)

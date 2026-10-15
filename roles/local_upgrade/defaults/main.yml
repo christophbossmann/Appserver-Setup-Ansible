@@ -1,0 +1,62 @@
+---
+# On-host upgrades: lets an upgrade be started ON the server itself (webhook -> systemd unit
+# -> the same Ansible upgrade playbooks the laptop runs), so no third party has to hold an
+# SSH key or the vault. HOST-GATED: off unless local_upgrade_enabled is set in host_vars.
+#
+# What this puts on the host (all root-only):
+#   /opt/ansible-local/repo     snapshot of this repository (playbooks, roles, stacks)
+#   /opt/ansible-local/config   this host's config: inventory (itself, local connection),
+#                               group_vars, its host_vars, and a FILTERED copy of the vault
+#   /etc/app-upgrade/catalog.json   which services may be upgraded locally and how
+#   /usr/local/bin/app-upgrade      the only entry point (validates, pre-checks, runs)
+# Every normal run from the laptop refreshes the snapshot — AFTER it adopted versions that
+# were upgraded on the host (playbooks/tasks/adopt_host_versions.yml).
+local_upgrade_enabled: false
+
+local_upgrade_dir: /opt/ansible-local
+
+# Catalog services (playbooks/vars/upgrade_catalog.yml) that may be upgraded on the host.
+# Left out on purpose: headscale / headplane — their roles keep state in the CONTROLLER's
+# caches (pre-auth keys, API keys) that the host does not have; upgrade those from the laptop.
+local_upgrade_services:
+  - snapshots              # the snapshot page: list / delete / keep / roll back (needs the `snapshot` helper)
+  - host                   # server packages + Caddy build + reboot (playbooks/host-upgrade.yml)
+  - immich
+  - nextcloud
+  - authentik
+  - postgres_business      # database image of immich + nextcloud (same Postgres major only)
+  - grafana
+  - prometheus
+  - node_exporter
+  - blackbox_exporter
+  - postgres_exporter
+  - cadvisor
+  - dozzle
+  - acme_dns               # sqlite state is copied before + put back on a rollback
+
+# Vault keys (regexes on the key NAME) that are NOT copied to the host: secrets this host has
+# no use for. Everything else the host already holds in its services' config files anyway.
+# Set it in host_vars; a key an upgrade playbook turns out to need simply makes that upgrade
+# fail before it changes anything ("undefined variable").
+local_upgrade_vault_exclude: []
+
+# The private vault files to copy (filtered), relative to the inventory dir.
+local_upgrade_vault_files:
+  - group_vars/all/vault.yml
+  - group_vars/all/vault_secrets.yml
+
+# The site the confirm page is served from (the `upgrade` Caddy route, defaults/caddy_route.yml).
+# The start hook only accepts POSTs carrying exactly this Origin.
+local_upgrade_origin: "https://{{ (svc_edge_host | default({})).get('upgrade', 'upgrade.invalid') }}"
+
+# Snapshot page: containers to stop for a ROLLBACK of a volume IN ADDITION to those that bind
+# it (found automatically) — the applications of a database volume (snapper config -> list).
+local_upgrade_snapshot_stop:
+  business_db: [nextcloud-cron, nextcloud, immich-server]
+
+# Snapshot page: shell commands to run after a ROLLBACK of a volume (snapper config name ->
+# list), once its containers are started again. Failures are reported, not fatal.
+local_upgrade_snapshot_post:
+  # the file tree went back, nextcloud's file index (in the database, another volume) did not
+  nextcloud_data:
+    - "docker exec -u www-data nextcloud php occ files:scan --all"

@@ -6,10 +6,27 @@ caddy_route_grafana:
   caddy_upstream: "127.0.0.1:3000"
   # "Start new scan" button on the Vulnerabilities dashboard: same-origin POST to
   # /hooks/trivy-scan, handed to the loopback-only webhook service (roles/monitoring),
-  # whose single hook can do exactly one thing: start trivy-metrics.service.
+  # which can start trivy-metrics.service. ONLY this one hook path is proxied here without a
+  # login — other hooks of the webhook service (on-host upgrades) must not be reachable this way.
   caddy_extra: |
     {% if (monitoring_trivy_enabled | default(true)) and (monitoring_scan_button_enabled | default(true)) %}
-    handle /hooks/* {
+    handle /hooks/trivy-scan {
         reverse_proxy 127.0.0.1:{{ monitoring_webhook_port | default(9777) }}
+    }
+    {% if monitoring_snapshot_metrics_enabled | default(true) %}
+    # "Measure now" on the snapshots dashboard: starts snapshot-metrics (same idea, same limits).
+    handle /hooks/snapshot-measure {
+        reverse_proxy 127.0.0.1:{{ monitoring_webhook_port | default(9777) }}
+    }
+    {% endif %}
+    {% endif %}
+    {% if (local_upgrade_enabled | default(false)) and ('upgrade' in (caddy_services | default({}))) %}
+    # Links in the "Update overview per image" table: same-origin path, redirected to the
+    # login-protected upgrade page (the dashboard JSON stays host-independent).
+    handle /hooks/upgrade {
+        redir https://{{ svc_edge_host['upgrade'] }}/hooks/upgrade?{query} 302
+    }
+    handle /hooks/snapshots {
+        redir https://{{ svc_edge_host['upgrade'] }}/hooks/snapshots?{query} 302
     }
     {% endif %}

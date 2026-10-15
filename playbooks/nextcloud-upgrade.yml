@@ -12,7 +12,13 @@
 # nextcloud upgrade would be lost on rollback. We stop immich (server+ML) and put
 # nextcloud in maintenance to capture a clean PITR anchor, then let the new nextcloud
 # image run its own DB upgrade. On ANY failure in the block, we PITR the business
-# instance back to the anchor, restore the pre-upgrade config + old image, and fail.
+# instance back to the anchor, put the pre-upgrade program dir back + old image, and fail.
+#
+# WHY the program dir is copied: the official image keeps Nextcloud's CODE in the persistent
+# html dir (not only in the image) and the new image overwrites it there. The old image
+# refuses to start on newer code ("downgrading is not supported") — so a rollback needs the
+# old html dir (code + config + custom_apps) back, not just the old image. The user files
+# live in the separate data dir and are not touched by an upgrade.
 # immich is always restarted at the end (always:), whatever happened.
 #
 # Nextcloud only supports ONE major hop per upgrade (e.g. 31 -> 32). Don't skip majors.
@@ -93,6 +99,19 @@
                -C, "{{ nextcloud_html_dir }}", config]
       changed_when: true
 
+    # ---- PRE-UPGRADE COPY OF THE PROGRAM DIR (code + config + custom_apps) --------------
+    # Reflink copy next to the original: instant and without extra space on btrfs (a plain
+    # copy elsewhere). Taken in maintenance mode; put back by tasks/nextcloud_rollback.yml,
+    # dropped after a verified upgrade. Leftovers of an earlier run are cleared first.
+    - name: Copy the nextcloud program dir (pre-upgrade)
+      ansible.builtin.shell: |
+        set -e
+        rm -rf "{{ nextcloud_html_dir }}.pre-upgrade" "{{ nextcloud_html_dir }}.rolled-back"
+        cp -a --reflink=auto "{{ nextcloud_html_dir }}" "{{ nextcloud_html_dir }}.pre-upgrade"
+      args:
+        executable: /bin/bash
+      changed_when: true
+
     # ---- UPGRADE (block) with automatic PITR ROLLBACK (rescue) -------------------------
     - name: Upgrade
       block:
@@ -114,7 +133,9 @@
             stack: nextcloud
             nextcloud_version: "{{ nextcloud_upgrade_version }}"
 
-        - name: Wait until nextcloud is installed and OUT of maintenance (upgrade finished)
+        # Also waits for the NEW version: right after the container start the entrypoint has
+        # not begun yet and occ still answers from the old code (installed, no maintenance).
+        - name: Wait until nextcloud reports the new major and is OUT of maintenance (upgrade finished)
           ansible.builtin.command:
             argv: "{{ _occ + ['status', '--output=json'] }}"
           register: _st
@@ -122,6 +143,8 @@
             _st.rc == 0
             and (_st.stdout | from_json).installed | default(false)
             and not ((_st.stdout | from_json).maintenance | default(true))
+            and not ((_st.stdout | from_json).needsDbUpgrade | default(false))
+            and ((_st.stdout | from_json).versionstring | default('')) is match('^' ~ _target_major ~ '\\.')
           retries: "{{ upgrade_health_retries | default(60) }}"
           delay: 5
           changed_when: false
@@ -152,8 +175,11 @@
                    "http://127.0.0.1:{{ nextcloud_port }}/status.php"]
           register: _http
           changed_when: false
-          failed_when: >-
-            _http.rc != 0 or ('"installed":true' not in (_http.stdout | regex_replace('\\s', '')))
+          # Retried: the entrypoint starts Apache only AFTER its upgrade finished — occ already
+          # answers a moment before the web server accepts connections.
+          until: _http.rc == 0 and ('"installed":true' in (_http.stdout | regex_replace('\\s', '')))
+          retries: 24
+          delay: 5
 
         - name: Upgrade verified
           ansible.builtin.debug:
@@ -181,6 +207,12 @@
             rec_previous: "{{ _rollback_version }}"
           when: not (force_rollback | default(false) | bool)
 
+        - name: Drop the pre-upgrade copy of the program dir (upgrade kept)
+          ansible.builtin.file:
+            path: "{{ nextcloud_html_dir }}.pre-upgrade"
+            state: absent
+          when: not (force_rollback | default(false) | bool)
+
         # ---- force_rollback DRILL: undo the (successful) upgrade on purpose -----------
         - name: force_rollback — roll the just-upgraded environment back (drill)
           ansible.builtin.include_tasks: tasks/nextcloud_rollback.yml
@@ -196,7 +228,7 @@
           ansible.builtin.debug:
             msg: >-
               Nextcloud upgrade failed. Rolling the business instance back to {{ _pitr_target }},
-              restoring the pre-upgrade config + {{ _rollback_version }} image.
+              restoring the pre-upgrade program dir + {{ _rollback_version }} image.
 
         - name: Roll back (shared steps — same as the force_rollback drill)
           ansible.builtin.include_tasks: tasks/nextcloud_rollback.yml

@@ -121,6 +121,7 @@
     - { role: compose_stack, vars: { stack: nextcloud }, tags: [business, nextcloud] }
     - { role: nextcloud_bootstrap, tags: [business, nextcloud] }   # occ: wire user_oidc to Authentik
     - { role: backup_restic, tags: [platform, backup] }            # nightly cloud backup (restic over rclone; gated by backup_cloud_enabled)
+    - { role: storagebox_backup, tags: [platform, backup, storagebox_backup] }   # immich thumbs + database dumps onto the Storage Box (gated by storagebox_backup_enabled, host_vars)
     - { role: postgres_pitr, tags: [platform, postgres_pitr, backup] }   # WAL archiving + base backups for PITR (gated by postgres_pitr_enabled, host_vars)
     - { role: compose_stack, vars: { stack: supabase }, tags: [supabase] }
     - { role: supabase_bootstrap, tags: [supabase] }   # idempotent instance SQL (pg_cron) — also on rebuilds
@@ -140,6 +141,9 @@
     # containers RUNNING at deploy time (immich, authentik, headscale, PITR instances) and
     # joins their networks. Placed earlier, a fresh host came up without the immich/headscale
     # jobs until a second run. Before caddy, which drops its probe targets into file_sd.
+    # On-host upgrade backend (host-gated by local_upgrade_enabled). Before monitoring: that
+    # role's webhook drop-in loads the hooks file this one writes.
+    - { role: local_upgrade, tags: [platform, local_upgrade] }
     - { role: monitoring, tags: [platform, monitoring] }
     # Self-hosted acme-dns (DNS-01 relay) — MUST be up before caddy issues certs in
     # acme_dns mode. DNS public on :53, API loopback-only. Tagged 'caddy' so it

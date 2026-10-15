@@ -21,6 +21,11 @@
   any_errors_fatal: true
   tags: [always]
   vars:
+    # This play runs ON THE CONTROLLER under the target's inventory name. Pin the interpreter
+    # to the controller's own python: otherwise interpreter DISCOVERY runs here and its result
+    # (the controller's python path) is remembered for the host — the next play then looks for
+    # that path on the real server (seen with ansible-core 2.20: "/usr/bin/python3.12 not found").
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
     _key: "{{ (controller_ssh_key | default('~/.ssh/ansible_key')) | expanduser }}"
   tasks:
     - name: Check whether the SSH key has a passphrase
@@ -86,4 +91,9 @@
               Re-run under a one-shot agent (passphrase asked ONCE, agent gone afterwards):
 
                 {{ _pf_cmd.stdout | default('') | trim or ("ssh-agent bash -c 'ssh-add ~/.ssh/ansible_key && ansible-playbook <same arguments>'") }}
+
+              Or load the key for THIS terminal session (asked once, then every run in this
+              terminal works until you close it), and re-run the command as it was:
+
+                eval "$(ssh-agent -s)" && ssh-add {{ _key }}
           when: _pf_in_agent.rc != 0

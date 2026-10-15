@@ -6,14 +6,20 @@
 prometheus_version: "v3.12.0"
 prometheus_image: "prom/prometheus:{{ prometheus_version }}"
 prometheus_port: 9090
-prometheus_data_dir: /opt/monitoring/prometheus-data
+# The time-series database rewrites its files all the time (compaction): inside the OS root
+# every root snapshot would pin a stale copy — 13 GiB after one week on a small host. So it
+# lives on the no-snapshot cache volume when cache_root is defined (roles/data_storage);
+# nobody wants yesterday's metrics back after an OS rollback. Data found at a legacy
+# location is moved once.
+prometheus_data_dir: "{{ (cache_root ~ '/prometheus') if cache_root is defined else '/opt/monitoring/prometheus-data' }}"
+prometheus_data_legacy_dirs: [/opt/monitoring/prometheus-data]
 # Host metrics (node-exporter) are cheap — 15s is fine. cadvisor scrapes are
 # EXPENSIVE (see comment in prometheus.yml.j2) — 60s.
 prometheus_scrape_interval: "15s"
 cadvisor_scrape_interval: "60s"
 
 # Node Exporter (host metrics)
-node_exporter_version: "v1.11.1"
+node_exporter_version: "v1.12.1"
 node_exporter_image: "prom/node-exporter:{{ node_exporter_version }}"
 # blackbox_exporter: probes every hostname Caddy serves (list published by roles/caddy to
 # /etc/prometheus-file-sd/caddy-probes.json) — up/down, status, latency, TLS expiry.
@@ -49,9 +55,20 @@ monitoring_disk_usage_paths:
   - /srv:2
   - /opt:1
   - /var/lib/docker:1
+  # where Docker keeps the IMAGES when it uses the containerd image store (the default on
+  # new installs) — usually the biggest part, and not under /var/lib/docker
+  - /var/lib/containerd:1
   - /var/log:1
   - /home:1
   - /mnt/storagebox:4
+
+#   disk-discover-metrics : the list above is fixed — data in a place nobody listed stays
+#   invisible. Once a night this walks every local filesystem completely and reports every
+#   directory of at least the threshold, split as deep as it stays that big, plus how much of
+#   the used space it could not attribute ("Largest directories anywhere" / "Not attributed").
+monitoring_disk_discover_enabled: true
+monitoring_disk_discover_oncalendar: "*-*-* 02:20:00"
+monitoring_disk_discover_threshold_gib: 1
 
 #   immich-storage-metrics : Immich DB <-> files consistency (orphans = on disk but in no DB
 #   row, e.g. originals uploaded after the dump a restore came from; missing = DB row without
@@ -65,6 +82,18 @@ monitoring_immich_storage_dirs: [library, upload, encoded-video, thumbs]
 #   archived WAL, size) — "Database backups (PITR)" rows on the Immich + Postgres dashboards.
 monitoring_pitr_metrics_enabled: "{{ postgres_pitr_enabled | default(false) }}"
 monitoring_pitr_metrics_oncalendar: "*-*-* *:05:00"
+
+#   snapshot-metrics : btrfs/snapper snapshots of every config — when taken, retention, and
+#   how much space deleting them would free: per single snapshot and per SET (all of a
+#   volume, all automatic ones but the newest, those older than 7 days) — "Disk snapshots"
+#   dashboard + the snapshot page of the on-host portal. Estimated by SAMPLING the
+#   filesystem's data (which subvolumes reference the extent at a random position), because
+#   set sizes cannot be had by walking the trees and that walk takes over a minute per OS
+#   snapshot. More samples = finer estimates, longer run (~7 ms each). Nightly + on demand
+#   ("Measure now"). Does nothing without snapper.
+monitoring_snapshot_metrics_enabled: true
+monitoring_snapshot_metrics_oncalendar: "*-*-* 01:30:00"
+monitoring_snapshot_metrics_samples: 60000      # ~7 min; one sample stands for (data size / samples)
 
 #   trivy-metrics : CRITICAL/HIGH vulnerabilities of the images of all RUNNING containers
 #   (trivy, pinned .deb, checksum-verified) — "Vulnerabilities" dashboard. No daemon: one
@@ -85,12 +114,16 @@ monitoring_trivy_memory_max: "2G"
 # Images without a rule (or whose running tag does not match) are simply not compared.
 # tags_from (optional): take the tag list from ANOTHER repository — for images that are
 # released together, when the image's own repository has too many tags to list in time.
+# major_parts (optional, default 1): how many leading numbers form the "major" version. 2 for
+# calendar versions (authentik 2026.5.3): then "same-major" is the newest 2026.5.x, "next-major"
+# the newest of the NEXT release line (2026.6.x — the step its upgrade path expects) and
+# "latest" the newest overall.
 monitoring_trivy_update_rules:
   - { image: "ghcr.io/immich-app/immich-server",              tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
   - { image: "ghcr.io/immich-app/immich-machine-learning",    tags: '^v[0-9]+\.[0-9]+\.[0-9]+$', tags_from: "ghcr.io/immich-app/immich-server" }
   - { image: "ghcr.io/immich-app/postgres",                   tags: '^[0-9]+-vectorchord[0-9]+\.[0-9]+\.[0-9]+$' }
-  - { image: "ghcr.io/goauthentik/server",                    tags: '^[0-9]{4}\.[0-9]+\.[0-9]+$' }
-  - { image: "ghcr.io/goauthentik/ldap",                      tags: '^[0-9]{4}\.[0-9]+\.[0-9]+$' }
+  - { image: "ghcr.io/goauthentik/server",                    tags: '^[0-9]{4}\.[0-9]+\.[0-9]+$', major_parts: 2 }
+  - { image: "ghcr.io/goauthentik/ldap",                      tags: '^[0-9]{4}\.[0-9]+\.[0-9]+$', major_parts: 2 }
   - { image: "nextcloud",                                     tags: '^[0-9]+-apache$' }
   - { image: "ghcr.io/juanfont/headscale",                    tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
   - { image: "ghcr.io/tale/headplane",                        tags: '^[0-9]+\.[0-9]+\.[0-9]+$' }
@@ -121,10 +154,10 @@ grafana_plugins:
 # feeds the "Scheduled jobs" dashboard: the scheduled timers/services this repo and the
 # OS rely on, plus the long-running helpers docker-swap-sync + storagebox-mount.
 node_exporter_systemd_units: >-
-  (pg-pitr-backup|backup-restic|trivy-metrics|docker-prune|snapper-(timeline|cleanup|boot)|apt-daily(-upgrade)?|caddy-tailscale-cert-renew|fstrim|logrotate|dpkg-db-backup|docker-swap-sync|storagebox-mount)\.(service|timer)
+  (pg-pitr-backup|backup-restic|storagebox-backup-(thumbs|dumps)|trivy-metrics|snapshot-metrics|disk-discover-metrics|docker-prune|snapper-(timeline|cleanup|boot)|apt-daily(-upgrade)?|caddy-tailscale-cert-renew|fstrim|logrotate|dpkg-db-backup|docker-swap-sync|storagebox-mount)\.(service|timer)
 
 # cAdvisor (per-container metrics; host-level metrics come from node_exporter)
-cadvisor_version: "v0.60.5"
+cadvisor_version: "v0.60.6"
 cadvisor_image: "ghcr.io/google/cadvisor:{{ cadvisor_version }}"
 # cadvisor is EXPENSIVE by default (200%+ CPU on hosts with many containers,
 # plus induced dockerd/containerd load). Tame it: slower housekeeping and the
@@ -134,7 +167,7 @@ cadvisor_housekeeping_interval: "120s"
 cadvisor_disabled_metrics: "percpu,sched,tcp,udp,advtcp,process,hugetlb,referenced_memory,disk"
 
 # Grafana
-grafana_version: "12.2.9"
+grafana_version: "13.2.3"
 grafana_image: "grafana/grafana:{{ grafana_version }}"
 grafana_port: 3000
 grafana_data_dir: /opt/monitoring/grafana-data

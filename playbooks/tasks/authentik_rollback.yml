@@ -29,7 +29,7 @@
     url: "{{ _ak_api }}/-/health/ready/"
     status_code: [200, 204]
   register: _akrb
-  until: _akrb is not failed
+  until: (_akrb.status | default(0)) in [200, 204]
   retries: "{{ upgrade_health_retries | default(60) }}"
   delay: 5
   failed_when: false

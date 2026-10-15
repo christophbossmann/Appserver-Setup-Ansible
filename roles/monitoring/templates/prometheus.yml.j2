@@ -43,7 +43,9 @@ scrape_configs:
 {% endfor %}
 
 {% endif %}
-{% if caddy_metrics_enabled | default(false) | bool %}
+{# default(true) = the caddy role's own default. That default is NOT visible here on a run limited
+   to this role (--tags monitoring); with default(false) such a run silently dropped the job. #}
+{% if caddy_metrics_enabled | default(true) | bool %}
   # Caddy (host) — read-only metrics site on docker0, see roles/caddy
   - job_name: "caddy"
     static_configs:

@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+# Managed by Ansible (roles/monitoring). "Where is the space, wherever it is?" for
+# node_exporter's textfile collector -> "Disk usage" dashboard.
+#
+#   disk-discover-metrics [<threshold in GiB, default 1>]
+#
+# disk-usage-metrics measures a FIXED list of directories every hour — good units for the
+# treemap, but blind to anything outside the list (the container image store once sat under
+# a path nobody had listed). This one searches: once a night it walks every local filesystem
+# completely and reports every directory at or above the threshold, split as deep as it
+# stays that big. The result is a partition — no directory is counted inside another one:
+#   /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs   a big directory with no big child
+#   /var/lib (rest)                                              what a directory holds besides its big children
+#   / (everything smaller)                                       the remainder of the mount
+# Left out: snapshot directories and network/virtual mounts (du -x never leaves the mount it
+# started on; the Storage Box and the snapshot volumes are separate mounts).
+# It also says how much of the used space it could NOT attribute:
+#   used - everything measured - what only snapshots still hold
+# A large value there means data in a place that is not visible as files (or a bug here).
+import json
+import os
+import subprocess
+import sys
+import time
+
+TEXTFILE = os.environ.get("TEXTFILE_DIR", "/var/lib/node_exporter/textfile")
+THRESHOLD = int(float(sys.argv[1]) * 2**30) if len(sys.argv) > 1 else 2**30
+LOCAL_FS = {"btrfs", "ext4", "ext3", "xfs", "f2fs", "zfs"}
+SNAP_STATE = "/var/lib/snapshot-metrics/state.json"     # snapshot-metrics: space only snapshots hold
+start = time.time()
+
+
+def mounts():
+    """[(mountpoint, device)] of the local filesystems, without the snapshot mounts."""
+    res, seen = [], set()
+    out = subprocess.run(["findmnt", "-rn", "-o", "TARGET,FSTYPE,SOURCE"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) < 3 or p[1] not in LOCAL_FS:
+            continue
+        target, dev = p[0], p[2].split("[")[0]
+        if "/.snapshots" in target or target in seen or target.startswith(("/var/lib/docker/", "/run/")):
+            continue
+        seen.add(target)
+        res.append((target, dev))
+    return res
+
+
+def big_dirs(mount):
+    """Partition of the mount's usage into (label, bytes) pieces, see the header."""
+    r = subprocess.run(["du", "-x", "-B1", mount], capture_output=True, text=True)
+    size = {}
+    for line in r.stdout.splitlines():
+        n, _, path = line.partition("\t")
+        if n.isdigit():
+            size[path] = int(n)
+    total = size.get(mount, 0)
+    big = {p for p, s in size.items() if s >= THRESHOLD and p != mount}
+    children = {}
+    for p in big:
+        parent = os.path.dirname(p) or "/"
+        children.setdefault(parent, []).append(p)
+    pieces = []
+    for p in big:
+        rest = size[p] - sum(size[c] for c in children.get(p, []))
+        if p not in children:
+            pieces.append((p, size[p]))
+        elif rest >= THRESHOLD:
+            pieces.append((p + " (rest)", rest))
+    top = sum(size[c] for c in children.get(mount, []))
+    # what the pieces above do not cover: small directories + rests below the threshold
+    pieces.append(((mount.rstrip("/") or "/") + " (everything smaller)", max(total - sum(s for _, s in pieces), 0)))
+    return total, pieces, top
+
+
+def esc(s):
+    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def main():
+    lines, per_dev = [], {}
+    for mount, dev in mounts():
+        total, pieces, _ = big_dirs(mount)
+        per_dev.setdefault(dev, {"measured": 0, "mount": mount})
+        per_dev[dev]["measured"] += total
+        for label, b in pieces:
+            lines.append('disk_big_dir_bytes{device="%s",mount="%s",path="%s"} %d' % (esc(dev), esc(mount), esc(label), b))
+    try:
+        with open(SNAP_STATE) as f:
+            held = int(json.load(f).get("held", 0))
+    except (OSError, ValueError):
+        held = 0
+    root_dev = next((d for m, d in mounts() if m == "/"), None)
+    extra = []
+    for dev, info in per_dev.items():
+        st = os.statvfs(info["mount"])
+        used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        snap = held if dev == root_dev else 0       # snapshot-metrics samples the root filesystem
+        extra += ['disk_discover_used_bytes{device="%s"} %d' % (esc(dev), used),
+                  'disk_discover_measured_bytes{device="%s"} %d' % (esc(dev), info["measured"]),
+                  'disk_discover_snapshots_bytes{device="%s"} %d' % (esc(dev), snap),
+                  'disk_discover_unassigned_bytes{device="%s"} %d' % (esc(dev), used - info["measured"] - snap)]
+    out = (["# HELP disk_big_dir_bytes Directories at or above the threshold found by the nightly search (a partition: nothing counted twice)",
+            "# TYPE disk_big_dir_bytes gauge"] + lines +
+           ["# HELP disk_discover_unassigned_bytes Used space the search could not attribute: used - measured - held only by snapshots",
+            "# TYPE disk_discover_unassigned_bytes gauge"] + extra +
+           ["# TYPE disk_discover_threshold_bytes gauge", "disk_discover_threshold_bytes %d" % THRESHOLD,
+            "# TYPE disk_discover_duration_seconds gauge", "disk_discover_duration_seconds %d" % (time.time() - start),
+            "# TYPE disk_discover_timestamp_seconds gauge", "disk_discover_timestamp_seconds %d" % time.time()])
+    if os.path.isdir(TEXTFILE):
+        tmp = os.path.join(TEXTFILE, "disk-discover.prom.tmp")
+        with open(tmp, "w") as f:
+            f.write("\n".join(out) + "\n")
+        os.replace(tmp, os.path.join(TEXTFILE, "disk-discover.prom"))
+    print("%d pieces on %d filesystem(s) in %ds" % (len(lines), len(per_dev), time.time() - start))
+
+
+if __name__ == "__main__":
+    main()

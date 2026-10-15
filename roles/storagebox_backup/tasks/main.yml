@@ -1,0 +1,85 @@
+---
+# Backups onto the Storage Box — see defaults/main.yml for what and why.
+- name: Storage Box backups
+  when: storagebox_backup_enabled | default(false) | bool
+  vars:
+    _sbb_jobs:
+      - { name: thumbs, enabled: "{{ storagebox_backup_thumbs_enabled | bool }}", args: thumbs, oncalendar: "{{ storagebox_backup_thumbs_oncalendar }}",
+          desc: "Mirror the immich thumbnails to the Storage Box" }
+      - { name: dumps, enabled: "{{ storagebox_backup_dumps_enabled | bool }}", args: dumps, oncalendar: "{{ storagebox_backup_dumps_oncalendar }}",
+          desc: "Database dumps to the Storage Box (every {{ storagebox_backup_dump_interval_days }} days, keep {{ storagebox_backup_dump_keep }})" }
+  block:
+    - name: Require the Storage Box
+      ansible.builtin.assert:
+        that: storagebox_enabled | default(false) | bool
+        fail_msg: "storagebox_backup_enabled needs storagebox_enabled (roles/storagebox) on this host."
+
+    - name: Install the backup script
+      ansible.builtin.template:
+        src: storagebox-backup.j2
+        dest: /usr/local/bin/storagebox-backup
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Ensure the dump work dir exists (root only)
+      ansible.builtin.file:
+        path: "{{ storagebox_backup_dump_workdir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install the service units
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/storagebox-backup-{{ item.name }}.service"
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/storagebox_backup)
+          [Unit]
+          Description={{ item.desc }}
+          After=network-online.target docker.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/storagebox-backup {{ item.args }}
+          Nice=10
+          IOSchedulingClass=idle
+      loop: "{{ _sbb_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _sbb_units
+
+    - name: Install the timer units
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/storagebox-backup-{{ item.name }}.timer"
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/storagebox_backup)
+          [Unit]
+          Description={{ item.desc }} (timer)
+
+          [Timer]
+          OnCalendar={{ item.oncalendar }}
+          RandomizedDelaySec=10min
+          # run a missed slot after downtime
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+      loop: "{{ _sbb_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _sbb_timers
+
+    - name: Enable the timers of the enabled jobs (disable the others)
+      ansible.builtin.systemd:
+        name: "storagebox-backup-{{ item.name }}.timer"
+        enabled: "{{ item.enabled | bool }}"
+        state: "{{ 'started' if (item.enabled | bool) else 'stopped' }}"
+        daemon_reload: "{{ _sbb_units.changed or _sbb_timers.changed }}"
+      loop: "{{ _sbb_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not ansible_check_mode

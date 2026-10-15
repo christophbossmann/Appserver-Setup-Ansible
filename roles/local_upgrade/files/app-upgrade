@@ -1,0 +1,1043 @@
+#!/usr/bin/env python3
+# Managed by Ansible (roles/local_upgrade). Runs an upgrade playbook ON THIS HOST — the
+# backend of the "upgrade" button (no laptop, no SSH key held by a third party).
+#
+#   app-upgrade request <service> <version>   validate + pre-checks, then start the upgrade
+#                                             as its own systemd unit; prints a JSON answer
+#                                             (what the webhook returns to the browser)
+#   app-upgrade run <service>:<version>       what that unit executes (app-upgrade@.service)
+#   app-upgrade status                        last result per service + what is running (JSON)
+#   app-upgrade page [<service|image> <version>]   the HTML confirm page (no args: overview)
+#   app-upgrade page snapshots [<config>.<N>.<action>]   the snapshot page / its confirm page
+#   app-upgrade logpage <service>             HTML page that follows the log of the service's
+#                                             running / last upgrade
+#   app-upgrade log <service> [<cursor>]      that log as JSON (new lines after <cursor>)
+#
+# It can do exactly ONE thing: run the catalog's upgrade playbook for a service the catalog
+# marks as locally upgradable, to a version the nightly registry comparison (trivy-metrics)
+# reported as a newer version of what is running. Anything else is refused — a caller cannot
+# choose playbooks, variables or arbitrary image tags.
+#
+# The playbooks are the SAME ones the laptop runs (repo snapshot in /opt/ansible-local/repo,
+# this host's config in /opt/ansible-local/config), with their own verification and automatic
+# rollback (PITR for database-backed apps). The new version is recorded on the host; the next
+# run from the laptop adopts it into the config repo (playbooks/tasks/adopt_host_versions.yml).
+import fcntl
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+BASE = "/opt/ansible-local"
+CATALOG = "/etc/app-upgrade/catalog.json"
+TEXTFILE = "/var/lib/node_exporter/textfile"
+STATE_DIR = "/var/lib/app-upgrade"
+STATE = os.path.join(STATE_DIR, "last.json")
+REQUEST = os.path.join(STATE_DIR, "request.json")
+RUNNING = os.path.join(STATE_DIR, "running.json")
+LOCK = "/run/app-upgrade.lock"
+LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SAFE_CURSOR = re.compile(r"^[A-Za-z0-9=;]{1,400}$")
+SAFE_USER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$")
+
+
+class Refused(Exception):
+    pass
+
+
+def catalog():
+    with open(CATALOG) as f:
+        return json.load(f)
+
+
+def prom(name):
+    """[(labels, value)] of one metric family from the textfile collector outputs."""
+    out = []
+    for fn in ("trivy.prom", "pitr.prom"):
+        try:
+            with open(os.path.join(TEXTFILE, fn)) as f:
+                for line in f:
+                    if line.startswith(name + "{"):
+                        out.append((dict(LABEL.findall(line)), float(line.rsplit(" ", 1)[1])))
+        except OSError:
+            pass
+    return out
+
+
+def running_images(svc):
+    """Image references of the service's containers as docker runs them NOW."""
+    r = subprocess.run(["docker", "ps", "--format", "{{.Image}}"], capture_output=True, text=True)
+    return sorted({i for i in r.stdout.split() if i.rsplit(":", 1)[0] in svc["images"]})
+
+
+def vkey(tag):
+    """Sort key for version tags (like sort -V): numbers compare as numbers."""
+    return [(0, int(p)) if p.isdigit() else (1, p) for p in re.findall(r"\d+|[^\d]+", tag)]
+
+
+def major(tag):
+    m = re.search(r"\d+", tag)
+    return int(m.group()) if m else None
+
+
+# kind: host — the server itself. Its "versions" are the modes of playbooks/host-upgrade.yml.
+HOST_MODES = {
+    "packages": "install the pending packages; build and swap in a newer Caddy if there is one",
+    "packages-reboot": "the same, then restart the server if that is required",
+    "reboot": "restart the server now",
+}
+
+
+def host_state():
+    """(pending packages as 'name old -> new', reboot required?) from apt's cached lists."""
+    r = subprocess.run(["apt", "list", "--upgradable"], capture_output=True, text=True,
+                       env=dict(os.environ, LC_ALL="C"))
+    pending = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"^([^/\s]+)/\S+ (\S+) \S+ \[upgradable from: ([^\]]+)\]", line)
+        if m:
+            pending.append("%s %s -> %s" % (m.group(1), m.group(3), m.group(2)))
+    return pending, os.path.exists("/var/run/reboot-required")
+
+
+def targets(svc):
+    """version -> target kind, for the newer versions the registry comparison found.
+
+    Right after an upgrade the comparison still describes the PREVIOUS image (until the scan
+    that follows has finished). What it found stays true for the new one as far as it is
+    newer than what runs now — so those versions are kept (kind re-derived from the running
+    major) and everything up to the running version is dropped."""
+    if svc.get("kind") == "host":
+        return {mode: "host" for mode in HOST_MODES}
+    running = running_images(svc)
+    found, stale = {}, {}
+    for labels, _ in prom("trivy_image_newer_version_info"):
+        image, version = labels.get("image", ""), labels.get("version", "")
+        if image in running:
+            found[version] = labels.get("target", "")
+        elif image.rsplit(":", 1)[0] in svc["images"]:
+            stale[version] = image.rsplit(":", 1)[0]
+    if found or not running:
+        return allowed(svc, found)
+    for version, repo in stale.items():
+        tags = [i.rsplit(":", 1)[1] for i in running if i.rsplit(":", 1)[0] == repo and ":" in i]
+        if not tags or not all(vkey(version) > vkey(t) for t in tags):
+            continue
+        now, new = major(tags[0]), major(version)
+        found[version] = ("same-major" if new == now else
+                          "next-major" if now is not None and new == now + 1 else "latest")
+    return allowed(svc, found)
+
+
+def allowed(svc, found):
+    """Only the kinds of update the catalog lets this service take on the host (default: all)."""
+    kinds = svc.get("targets") or []
+    return {v: k for v, k in found.items() if not kinds or k in kinds}
+
+
+def validate(name, version):
+    cat = catalog()
+    if not SAFE.match(name or "") or name not in cat:
+        raise Refused("unknown service")
+    svc = cat[name]
+    if not svc.get("local"):
+        raise Refused("%s is not enabled for on-host upgrades (use the laptop)" % name)
+    if not SAFE.match(version or ""):
+        raise Refused("invalid version string")
+    if svc.get("kind") == "snapshots":
+        snap_validate(version)
+        return svc, "snapshots"
+    known = targets(svc)
+    if version not in known:
+        raise Refused("%s is not a known update target for %s (known: %s) — the registry comparison "
+                      "runs nightly" % (version, name, ", ".join(sorted(known)) or "none"))
+    return svc, known[version]
+
+
+def dockerhub_pulls_left():
+    """Remaining anonymous Docker Hub pulls of this host's IP, None if unknown.
+
+    Asked with a HEAD request on Docker's own test repository, which does not count
+    against the limit. 0 = exhausted (the registry answers 429)."""
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen("https://auth.docker.io/token?service=registry.docker.io"
+                                    "&scope=repository:ratelimitpreview/test:pull", timeout=8) as r:
+            token = json.load(r)["token"]
+        req = urllib.request.Request("https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest",
+                                     method="HEAD", headers={"Authorization": "Bearer " + token})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            left = r.headers.get("ratelimit-remaining", "")
+        return int(left.split(";")[0]) if left else None
+    except urllib.error.HTTPError as e:
+        return 0 if e.code == 429 else None
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def unit_active(pattern):
+    r = subprocess.run(["systemctl", "list-units", "--state=active,activating", "--plain", "--no-legend", pattern],
+                       capture_output=True, text=True)
+    return [line.split()[0] for line in r.stdout.splitlines() if line.strip()]
+
+
+def prechecks(svc, own_unit=None):
+    du = shutil.disk_usage("/")
+    if du.free / du.total < 0.10:
+        raise Refused("less than 10%% free on / (%d%% free)" % (100 * du.free / du.total))
+    busy = [u for u in unit_active("app-upgrade@*") if u != own_unit]
+    if busy:
+        raise Refused("another upgrade is running: " + ", ".join(busy))
+    busy = (unit_active("pg-pitr-backup.service") + unit_active("backup-restic.service")
+            + unit_active("storagebox-backup-dumps.service"))
+    if busy:
+        raise Refused("a backup is running (%s) — try again when it finished" % ", ".join(busy))
+    # images without a registry host come from Docker Hub, which rate-limits anonymous pulls
+    hub = [i for i in svc["images"] if "." not in i.split("/")[0]]
+    if hub:
+        left = dockerhub_pulls_left()
+        if left is not None and left < 2 * len(hub):
+            raise Refused("Docker Hub's pull limit for this server is used up (%d left; anonymous pulls, "
+                          "the window is 6 h) — the new image could not be downloaded. Try again later" % left)
+    inst = svc.get("pitr")
+    if inst:      # database-backed: the rollback needs a recent base backup + a live WAL archive
+        now = time.time()
+        base = [v for lbl, v in prom("pitr_base_newest_timestamp_seconds") if lbl.get("instance") == inst]
+        wal = [v for lbl, v in prom("pitr_wal_last_archived_timestamp_seconds") if lbl.get("instance") == inst]
+        if not base or now - max(base) > 30 * 3600:
+            raise Refused("no base backup of %s within the last 30h — a rollback would not be safe" % inst)
+        if not wal or now - max(wal) > 3 * 3600:
+            raise Refused("WAL archiving of %s looks stalled (last segment > 3h ago)" % inst)
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save(state, running=None):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(STATE + ".tmp", STATE)
+    esc = lambda s: str(s).replace("\\", "\\\\").replace('"', '\\"')
+    lines = ["# HELP app_upgrade_last_result Outcome of the last on-host upgrade per service (1 = upgraded, 0 = failed / rolled back)",
+             "# TYPE app_upgrade_last_result gauge"]
+    lines += ['app_upgrade_last_result{service="%s",version="%s",target="%s"} %d'
+              % (esc(s), esc(r["version"]), esc(r.get("target", "")), 1 if r["ok"] else 0) for s, r in sorted(state.items())]
+    lines += ["# HELP app_upgrade_last_timestamp_seconds When the last on-host upgrade of the service finished",
+              "# TYPE app_upgrade_last_timestamp_seconds gauge"]
+    lines += ['app_upgrade_last_timestamp_seconds{service="%s"} %d' % (esc(s), r["finished"]) for s, r in sorted(state.items())]
+    lines += ["# HELP app_upgrade_last_duration_seconds How long it took",
+              "# TYPE app_upgrade_last_duration_seconds gauge"]
+    lines += ['app_upgrade_last_duration_seconds{service="%s"} %d' % (esc(s), r["duration"]) for s, r in sorted(state.items())]
+    lines += ["# HELP app_upgrade_running 1 while an on-host upgrade is running",
+              "# TYPE app_upgrade_running gauge",
+              'app_upgrade_running{service="%s"} %d' % (esc(running or ""), 1 if running else 0)]
+    try:
+        with open(os.path.join(TEXTFILE, "app-upgrade.prom.tmp"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(os.path.join(TEXTFILE, "app-upgrade.prom.tmp"), os.path.join(TEXTFILE, "app-upgrade.prom"))
+    except OSError:
+        pass
+
+
+def requester():
+    """Who asked (the forward-auth user the hook passes on); 'local' for a call on the host."""
+    user = os.environ.get("APP_UPGRADE_USER", "")
+    return user if SAFE_USER.match(user) else "local"
+
+
+def cmd_request(name, version):
+    try:
+        svc, target = validate(name, version)
+        prechecks(svc)
+    except Refused as e:
+        print(json.dumps({"status": "refused", "service": name, "version": version, "reason": str(e)}))
+        return 1
+    unit = "app-upgrade@%s:%s.service" % (name, version)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(REQUEST, "w") as f:      # picked up by `run` (the unit name has no room for it)
+        json.dump({"service": name, "version": version, "by": requester(), "time": int(time.time())}, f)
+    r = subprocess.run(["systemctl", "start", "--no-block", unit], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(json.dumps({"status": "refused", "service": name, "version": version,
+                          "reason": "could not start the upgrade unit: " + r.stderr.strip()[:200]}))
+        return 1
+    print(json.dumps({"status": "started", "service": name, "version": version, "target": target, "unit": unit,
+                      "note": "runs on the host; watch the dashboard or: journalctl -u '%s' -f" % unit}))
+    return 0
+
+
+def cmd_run(instance):
+    name, _, version = instance.partition(":")
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("another upgrade holds the lock — refusing", file=sys.stderr)
+        return 1
+    try:
+        svc, target = validate(name, version)
+        prechecks(svc, own_unit="app-upgrade@%s.service" % instance)
+    except Refused as e:
+        print("REFUSED: %s" % e, file=sys.stderr)
+        return 1
+    cmd = ["ansible-playbook", "-i", os.path.join(BASE, "config", "inventory.ini"),
+           os.path.join("playbooks", svc["playbook"]),
+           "-e", "upgrade_confirm=YES", "-e", "upgrade_local_run=true"]
+    if svc.get("arg"):       # (for kind: host the "version" is the mode)
+        cmd += ["-e", "%s=%s" % (svc["arg"], version)]
+    else:
+        cmd += ["-e", "upgrade_service=%s" % name, "-e", "upgrade_version=%s" % version]
+    env = dict(os.environ, ANSIBLE_CONFIG=os.path.join(BASE, "ansible.cfg"), HOME="/root",
+               ANSIBLE_FORCE_COLOR="0", ANSIBLE_NOCOLOR="1", PYTHONUNBUFFERED="1")
+    by = "local"
+    try:
+        with open(REQUEST) as f:
+            req = json.load(f)
+        if req.get("service") == name and req.get("version") == version:
+            by = req.get("by", "local")
+    except (OSError, ValueError):
+        pass
+    state = load_state()
+    save(state, running=name)
+    start = time.time()
+    invocation = os.environ.get("INVOCATION_ID", "")     # set by systemd for the unit
+    with open(RUNNING, "w") as f:
+        json.dump({"service": name, "version": version, "invocation": invocation, "started": int(start)}, f)
+    if svc.get("kind") == "snapshots":
+        print("=== snapshot action %s, requested by %s ===" % (version, by), flush=True)
+        rc = snap_run(version, by)
+    else:
+        print("=== upgrading %s to %s (%s), requested by %s ===\n%s" % (name, version, target, by, " ".join(cmd)), flush=True)
+        rc = subprocess.run(cmd, cwd=os.path.join(BASE, "repo"), env=env).returncode
+    state[name] = {"version": version, "target": target, "ok": rc == 0, "by": by, "invocation": invocation,
+                   "finished": int(time.time()), "duration": int(time.time() - start)}
+    save(state)
+    try:
+        os.remove(RUNNING)
+    except OSError:
+        pass
+    if svc.get("kind") == "snapshots":
+        print("=== snapshots: %s %s ===" % (version, "done" if rc == 0 else "FAILED (rc=%d), see above" % rc), flush=True)
+        return 0 if rc == 0 else 1
+    if rc == 0 and svc.get("kind") != "host":   # rescan now: the new image's findings + update targets replace the stale ones
+        subprocess.run(["systemctl", "start", "--no-block", "trivy-metrics.service"], capture_output=True)
+    print("=== %s: %s ===" % (name, "upgraded to " + version if rc == 0 else
+                             "FAILED (rc=%d) — the playbook rolled back if it got that far, see above" % rc), flush=True)
+    return 0 if rc == 0 else 1
+
+
+def cmd_status():
+    """Last result per service + what is running right now (polled by the confirm page)."""
+    running = unit_active("app-upgrade@*")
+    progress = ""
+    if running:
+        r = subprocess.run(["journalctl", "-u", running[0], "-t", "app-upgrade", "-o", "cat", "--no-pager", "-n", "200"],
+                           capture_output=True, text=True)
+        tasks = [line for line in r.stdout.splitlines() if line.startswith(("TASK [", "RUNNING HANDLER ["))]
+        if tasks:
+            progress = tasks[-1].rstrip(" *")
+    print(json.dumps({"last": load_state(), "running": running, "progress": progress}, indent=1))
+    return 0
+
+
+def current_run():
+    """The running upgrade ({service, version, invocation, started}) or None."""
+    try:
+        with open(RUNNING) as f:
+            run = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return run if "app-upgrade@%s:%s.service" % (run.get("service"), run.get("version")) in unit_active("app-upgrade@*") else None
+
+
+def cmd_log(name, cursor):
+    """Log of the service's running (else last) upgrade as JSON: only what the upgrade itself
+    printed (ansible-playbook's output), not the module invocations Ansible logs to the journal
+    alongside — those carry module arguments."""
+    state, run = load_state(), current_run()
+    running = bool(run and run.get("service") == name)
+    rec = run if running else state.get(name)
+    out = {"service": name, "running": running, "id": "", "lines": [], "cursor": ""}
+    if not SAFE.match(name or "") or not rec:
+        print(json.dumps(out))
+        return 0
+    out.update(version=rec["version"], id=rec.get("invocation") or rec["version"])
+    if not running:
+        out.update(ok=rec["ok"], finished=rec["finished"], duration=rec["duration"])
+    match = (["_SYSTEMD_INVOCATION_ID=" + rec["invocation"]] if rec.get("invocation")
+             else ["-u", "app-upgrade@%s:%s.service" % (name, rec["version"])])
+    cmd = ["journalctl", "--no-pager", "-o", "cat", "--show-cursor", "-t", "app-upgrade"] + match
+    cmd += ["--after-cursor", cursor] if SAFE_CURSOR.match(cursor or "") else ["-n", "5000"]
+    lines = subprocess.run(cmd, capture_output=True, text=True).stdout.splitlines()
+    if lines and lines[-1].startswith("-- cursor: "):
+        out["cursor"] = lines.pop()[len("-- cursor: "):]
+    else:
+        out["cursor"] = cursor if SAFE_CURSOR.match(cursor or "") else ""
+    out["lines"] = lines
+    print(json.dumps(out))
+    return 0
+
+
+# --- snapshots (kind: snapshots) ---------------------------------------------------------------
+# The pseudo service `snapshots` reuses the whole machinery (request hook, run unit, lock,
+# state, log pages); its "version" is <snapper config>.<number>.<action>.
+SNAP_CONF = "/etc/app-upgrade/snapshots.json"       # {"pitr": {container: instance}, "stop": {config: [containers]}, "post": {config: [shell]}}
+SNAP_SIZES = "/var/lib/snapshot-metrics/state.json"  # written by snapshot-metrics (roles/monitoring)
+SNAP_HELPER = "/usr/local/bin/snapshot"
+SNAP_ACTIONS = {"rollback": "roll the volume back to this snapshot", "delete": "delete this snapshot",
+                "keep": "keep this snapshot permanently (exempt it from the automatic cleanup)",
+                "release": "hand this snapshot back to the automatic cleanup",
+                "create": "take a snapshot now"}
+SNAP_CFG = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def snap_conf():
+    try:
+        with open(SNAP_CONF) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def snap_configs():
+    """snapper config -> mountpoint of its subvolume."""
+    out = {}
+    try:
+        names = sorted(os.listdir("/etc/snapper/configs"))
+    except OSError:
+        return out
+    for name in names:
+        if not SNAP_CFG.match(name):
+            continue
+        try:
+            with open(os.path.join("/etc/snapper/configs", name)) as f:
+                for line in f:
+                    if line.startswith("SUBVOLUME="):
+                        out[name] = line.split("=", 1)[1].strip().strip('"').rstrip("/") or "/"
+        except OSError:
+            pass
+    return out
+
+
+def snap_list(cfg):
+    import csv
+    import io
+    r = subprocess.run(["snapper", "--csvout", "-c", cfg, "list", "--columns", "number,type,date,cleanup,description"],
+                       capture_output=True, text=True)
+    rows = []
+    for row in csv.DictReader(io.StringIO(r.stdout)):
+        if (row.get("number") or "").isdigit() and int(row["number"]) > 0:
+            rows.append({"number": int(row["number"]), "type": row.get("type", ""), "date": row.get("date", ""),
+                         "cleanup": row.get("cleanup", ""), "description": row.get("description", "")})
+    return sorted(rows, key=lambda s: s["number"])
+
+
+def snap_release_algorithm(snap):
+    """Cleanup algorithm a kept snapshot goes back to: the daily timeline snapshots to
+    `timeline` (kept by age), everything else (apt pairs, upgrades, manual ones) to `number`
+    (kept by count) — what snapper would have given them."""
+    return "timeline" if snap["description"] == "timeline" else "number"
+
+
+def snap_parse(version):
+    parts = (version or "").rsplit(".", 2)
+    if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in SNAP_ACTIONS or not SNAP_CFG.match(parts[0]):
+        raise Refused("not a snapshot action (expected <config>.<number>.<%s>)" % "|".join(SNAP_ACTIONS))
+    return parts[0], int(parts[1]), parts[2]
+
+
+def snap_validate(version):
+    cfg, n, action = snap_parse(version)
+    if cfg not in snap_configs():
+        raise Refused("unknown snapshot config %s" % cfg)
+    if not os.path.exists(SNAP_HELPER):
+        raise Refused("the snapshot helper is not installed on this host")
+    snap = next((s for s in snap_list(cfg) if s["number"] == n), None)
+    if action != "create" and not snap:
+        raise Refused("snapshot #%d does not exist in %s (any more)" % (n, cfg))
+    if action == "release":
+        if snap["cleanup"]:
+            raise Refused("snapshot #%d is already under automatic cleanup (%s)" % (n, snap["cleanup"]))
+        if snap["description"].startswith("ans_"):
+            raise Refused("#%d is a deploy checkpoint (%s) — those stay permanent" % (n, snap["description"]))
+    if action == "keep" and not snap["cleanup"]:
+        raise Refused("snapshot #%d is already permanent" % n)
+    return cfg, n, action
+
+
+def snap_users(sv):
+    """Running containers that bind something from the volume — they must be stopped for a rollback."""
+    if sv == "/":
+        return []
+    ids = subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True).stdout.split()
+    if not ids:
+        return []
+    r = subprocess.run(["docker", "inspect", "-f", "{{.Name}}|{{range .Mounts}}{{.Source}};{{end}}"] + ids,
+                       capture_output=True, text=True)
+    users, running = [], []
+    for line in r.stdout.splitlines():
+        name, _, mounts = line.partition("|")
+        running.append(name.lstrip("/"))
+        if any(m == sv or m.startswith(sv + "/") for m in mounts.split(";") if m):
+            users.append(name.lstrip("/"))
+    # plus the containers that depend on it without binding it (the apps of a database volume)
+    extra = [c for cfg, path in snap_configs().items() if path == sv for c in snap_conf().get("stop", {}).get(cfg, [])]
+    return sorted(set(users) | (set(extra) & set(running)))
+
+
+def human(b):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(b) < 1024 or unit == "TiB":
+            return ("%d %s" if unit == "B" else "%.1f %s") % (b, unit)
+        b /= 1024.0
+
+
+def sh(cmd, **kw):
+    """Run a command, its output goes to the run's log; returns the exit code."""
+    print("+ " + (cmd if isinstance(cmd, str) else " ".join(cmd)), flush=True)
+    return subprocess.run(cmd, **kw).returncode
+
+
+def snap_run(version, by):
+    cfg, n, action = snap_validate(version)
+    sv = snap_configs()[cfg]
+    helper = [SNAP_HELPER, "-c", cfg]
+    if action == "create":
+        return sh(helper + ["create", "--cleanup", "number", "portal (%s)" % by])
+    if action == "keep":
+        return sh(helper + ["keep", str(n)])
+    if action == "release":
+        snap = next(s for s in snap_list(cfg) if s["number"] == n)
+        return sh(["snapper", "-c", cfg, "modify", "-c", snap_release_algorithm(snap), str(n)])
+    if action == "delete":
+        return sh(helper + ["delete", str(n)])
+    # --- rollback ---
+    if sv == "/":
+        print("rolling the OS volume back to #%d — the server reboots when the swap is done" % n, flush=True)
+        return sh(helper + ["rollback", str(n), "-y"])
+    conf = snap_conf()
+    pitr = conf.get("pitr", {})
+    users = snap_users(sv)
+    dbs = [c for c in users if c in pitr]
+    apps = [c for c in users if c not in pitr]
+    print("volume %s (%s); containers using it: %s" % (cfg, sv, ", ".join(users) or "none"), flush=True)
+    if apps:
+        sh(["docker", "stop"] + apps)
+    if dbs:
+        sh(["docker", "stop"] + dbs)
+    rc = sh(helper + ["rollback", str(n), "-y"])
+    if rc != 0:
+        print("ROLLBACK FAILED — the volume was not changed if the message above says so; starting the containers again", flush=True)
+    for c in dbs:
+        sh(["docker", "start", c])
+        for _ in range(60):      # the archive step below needs a running instance
+            if subprocess.run(["docker", "exec", c, "pg_isready", "-q"], capture_output=True).returncode == 0:
+                break
+            time.sleep(2)
+        if rc == 0:
+            # the WAL archive still holds the discarded future under the same names: rotate it
+            # aside + take a fresh base backup, or archiving (and with it PITR) stalls
+            sh(["/usr/local/bin/pg-pitr-backup", "--after-rollback", pitr[c]])
+    if apps:
+        sh(["docker", "start"] + apps)
+    if rc == 0 and conf.get("post", {}).get(cfg):
+        time.sleep(20)           # let the apps come up before their follow-up commands
+        for cmd in conf["post"][cfg]:
+            if sh(cmd, shell=True, executable="/bin/bash") != 0:
+                print("WARNING: follow-up command failed (the rollback itself is done): %s" % cmd, flush=True)
+    time.sleep(5)
+    down = [c for c in users if subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", c],
+                                               capture_output=True, text=True).stdout.strip() != "true"]
+    if down:
+        print("NOT RUNNING after the rollback: %s" % ", ".join(down), flush=True)
+        return 1
+    return rc
+
+
+def page_snapshots(state):
+    try:
+        with open(SNAP_SIZES) as f:
+            sizes = json.load(f)
+    except (OSError, ValueError):
+        sizes = {}
+    run = current_run()
+    measuring = bool(unit_active("snapshot-metrics.service"))
+    age = int(time.time() - sizes.get("measured", 0)) if sizes.get("measured") else None
+    body = ["<h1>Snapshots</h1>",
+            '<p><button id=measure%s>Measure now</button> <span id=mstate class=muted>%s</span></p>' % (
+                " disabled" if measuring else "",
+                "measuring… takes several minutes, reload afterwards" if measuring
+                else "sizes not measured yet" if age is None
+                else "sizes measured %s ago (estimates, in steps of about %s; measured once a night — after deleting, use the button)" % (
+                    "%d min" % (age // 60) if age < 7200 else "%d h" % (age // 3600), human(sizes.get("sample_bytes", 0))))]
+    if run and run.get("service") == "snapshots":
+        body.append('<div class=card><b class="warn">running: %s</b> · <a href="/hooks/upgrade-log?service=snapshots">follow the log</a></div>'
+                    % esc(run["version"]))
+    elif state.get("snapshots"):
+        body.append('<p class=muted>Last action: %s</p>' % last_line("snapshots", state))
+    for cfg, sv in snap_configs().items():
+        snaps = snap_list(cfg)
+        sz = sizes.get("sizes", {}).get(cfg, {})
+        users = snap_users(sv)
+        sets = sizes.get("sets", {}).get(cfg, {})
+        rows = []
+        for s in reversed(snaps):
+            m = sz.get(str(s["number"]))
+            acts = " · ".join('<a href="/hooks/snapshots?version=%s.%d.%s">%s</a>' % (esc(cfg), s["number"], a, a)
+                              for a in (("rollback", "delete", "keep") if s["cleanup"] else
+                                        ("rollback", "delete") if s["description"].startswith("ans_") else
+                                        ("rollback", "delete", "release")))
+            rows.append("<tr><td>#%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                s["number"], esc(s["date"]), esc(s["type"]), esc(s["cleanup"] or "permanent"), esc(s["description"]),
+                ("<b>%s</b>" % human(m["exclusive"]) if m["exclusive"] >= 1 << 30 else human(m["exclusive"])) if m else
+                '<span class="muted">not measured yet</span>', acts))
+        summary = "%d snapshot(s)" % len(snaps)
+        if "all" in sets:
+            summary += ", together they hold %s" % human(sets["all"])
+        freed = ""
+        if sets:
+            freed = ("<p>Deleting <b>all</b> snapshots would free about <b>%s</b> · all automatic ones except the newest: "
+                     "<b>%s</b> · automatic ones older than 7 days: <b>%s</b></p>"
+                     % (human(sets.get("all", 0)), human(sets.get("auto_but_newest", 0)), human(sets.get("auto_older_7d", 0))))
+        body.append(
+            '<div class=card><details%s><summary><b>%s</b> <code>%s</code> — %s</summary>'
+            '%s<p class=muted>Used by: %s · <a href="/hooks/snapshots?version=%s.0.create">take a snapshot now</a></p>'
+            "<table><tr><th>#</th><th>Taken</th><th>Type</th><th>Cleanup</th><th>Description</th>"
+            "<th>Freed if deleted</th><th></th></tr>%s</table></details></div>" % (
+                "" if sv == "/" else " open", esc(cfg), esc(sv), esc(summary), freed,
+                esc(", ".join(users)) if users else ("the whole system" if sv == "/" else "no running container"),
+                esc(cfg), "".join(rows) or "<tr><td colspan=7 class=muted>no snapshots</td></tr>"))
+    left = subprocess.run("btrfs subvolume list / | awk '{print $NF}' | grep '_rollback_backup_' || true", shell=True,
+                          capture_output=True, text=True).stdout.split()
+    if left:
+        body.append('<div class=card><b>Kept from earlier rollbacks</b> (the volume as it was before; takes space until deleted — '
+                    "on the host: <code>mount -o subvolid=5 $(findmnt -no SOURCE / | sed 's/\\[.*//') /mnt &amp;&amp; btrfs subvolume delete /mnt/&lt;name&gt; ; umount /mnt</code>)"
+                    "<br>%s</div>" % "<br>".join("<code>%s</code>" % esc(x) for x in left))
+    body.append('<p class=muted>"Freed if deleted" is what only this one snapshot still references. Data it shares with '
+                "neighbouring snapshots is freed only when all of them are gone — that is why the sets above can be far "
+                "bigger than the single values added up. Sizes are estimates, measured nightly and with the button "
+                "(Grafana → Disk snapshots).</p>")
+    return "".join(body)
+
+
+def page_snap_confirm(version, state):
+    reason = ""
+    try:
+        cfg, n, action = snap_parse(version)
+        svc, _ = validate("snapshots", version)
+        prechecks(svc)
+    except Refused as e:
+        reason = str(e)
+        try:
+            cfg, n, action = snap_parse(version)
+        except Refused:
+            return '<h1>Snapshots</h1><div class=card><b class="bad">Not possible:</b> %s</div>' % esc(reason)
+    sv = snap_configs().get(cfg, "?")
+    snap = next((s for s in (snap_list(cfg) if sv != "?" else []) if s["number"] == n), None)
+    conf = snap_conf()
+    users = snap_users(sv)
+    rows = [("Action", "<b>%s</b> — %s" % (esc(action), esc(SNAP_ACTIONS[action]))),
+            ("Volume", "<b>%s</b> <code>%s</code>" % (esc(cfg), esc(sv)))]
+    if snap:
+        rows.append(("Snapshot", "#%d · %s · %s · %s" % (n, esc(snap["date"]), esc(snap["cleanup"] or "permanent"), esc(snap["description"]))))
+    expect = ""
+    if action == "rollback":
+        expect = "%s %d" % (cfg, n)
+        newer = [s["number"] for s in snap_list(cfg) if s["number"] > n] if sv != "?" else []
+        if sv == "/":
+            rows.append(("Effect", '<span class="warn"><b>The whole operating system goes back to this snapshot and the server '
+                                   "REBOOTS.</b> That includes /etc, /opt, the Docker images and container definitions and "
+                                   "this portal — but NOT the application data volumes. If an application was upgraded after "
+                                   "this snapshot, its OLD version will then start on its NEWER database; prefer a snapshot "
+                                   "taken after the last upgrade, or roll the data volumes back to the same time too.</span>"))
+        else:
+            dbs = [c for c in users if c in conf.get("pitr", {})]
+            rows.append(("Effect", "Stopped for the swap and started again: <b>%s</b>. No reboot. Everything written to this "
+                                   "volume since the snapshot is gone from it." % (esc(", ".join(users)) or "nothing is using it")))
+            if dbs:
+                rows.append(("Database", '<span class="warn">This volume holds %s: ALL its databases go back, while the files '
+                                         "of the applications (other volumes) do not. Afterwards the WAL archive is rotated and "
+                                         "a fresh base backup is taken (<code>pg-pitr-backup --after-rollback</code>), so "
+                                         "point-in-time recovery to a moment before this rollback is no longer possible from the "
+                                         "new archive.</span> For going back a few minutes or hours, PITR is the better tool."
+                             % esc(", ".join(dbs))))
+            if conf.get("post", {}).get(cfg):
+                rows.append(("Afterwards", "<br>".join("<code>%s</code>" % esc(c) for c in conf["post"][cfg])))
+        rows.append(("Also lost", ("snapshots newer than #%d of this volume are dropped: %s" % (n, esc(", ".join("#%d" % x for x in newer))))
+                     if newer else "no newer snapshots"))
+        rows.append(("Safety net", "the volume as it is now is kept as <code>…_rollback_backup_&lt;date&gt;</code> (listed on the "
+                                   "snapshot page; delete it once you are sure)"))
+    elif action == "delete":
+        expect = "%s %d" % (cfg, n)
+        try:
+            with open(SNAP_SIZES) as f:
+                m = json.load(f).get("sizes", {}).get(cfg, {}).get(str(n))
+        except (OSError, ValueError):
+            m = None
+        rows.append(("Frees", ("about <b>%s</b> now (what only this snapshot references)" % human(m["exclusive"])) if m else "not measured yet"))
+        rows.append(("Effect", "the snapshot is gone for good — there is no undo"))
+    elif action == "keep":
+        rows.append(("Effect", "snapper's automatic cleanup will no longer remove it; delete it by hand when it is not needed "
+                               "any more, or hand it back with <b>release</b>"))
+    elif action == "release":
+        alg = snap_release_algorithm(snap) if snap else "?"
+        rows.append(("Effect", "cleanup goes back to <b>%s</b>: snapper's retention decides again when it is removed — %s. "
+                               "If it is already past that limit, the next cleanup run (daily) deletes it."
+                     % (esc(alg), "by age, like the other daily snapshots" if alg == "timeline"
+                        else "by count, like the snapshots around package runs and upgrades")))
+    else:
+        rows.append(("Effect", "a snapshot of the volume as it is right now (cleanup: number — removed by the normal retention)"))
+        if any(c in conf.get("pitr", {}) for c in users):
+            rows.append(("Note", "a snapshot of a RUNNING database is crash-consistent (like after a power cut) — fine for "
+                                 "Postgres, but for a planned point use PITR"))
+    body = "<h1>Snapshots: %s?</h1><div class=card><table>%s</table></div>" % (
+        esc(action), "".join("<tr><th>%s</th><td>%s</td></tr>" % r for r in rows))
+    if reason:
+        body += '<div class=card><b class="bad">Not possible right now:</b> %s</div>' % esc(reason)
+    elif expect:
+        body += ('<p>Type <code>%s</code> to confirm: <input id=confirm data-expect="%s" autocomplete=off '
+                 'style="font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)"></p>'
+                 % (esc(expect), esc(expect)))
+    body += ('<button id=go data-service="snapshots" data-version="%s"%s>%s</button><div id=out></div><div id=log></div>'
+             % (esc(version), " disabled data-blocked=1" if reason else "", esc(action.capitalize() + " now")))
+    return body
+
+
+MEASURESCRIPT = """<script>
+const mb = document.getElementById('measure'), ms = document.getElementById('mstate');
+mb.addEventListener('click', async () => {
+  mb.disabled = true; ms.textContent = 'starting…';
+  try {
+    const r = await fetch('/hooks/snapshot-measure', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    ms.textContent = r.ok ? 'measuring started — takes several minutes, reload afterwards'
+                          : 'could not start (HTTP ' + r.status + ')';
+    if (!r.ok) mb.disabled = false;
+  } catch (e) { ms.textContent = 'could not start: ' + e; mb.disabled = false; }
+});
+</script>"""
+SNAPSCRIPT = """<script>
+const cf = document.getElementById('confirm');
+if (cf && !go.dataset.blocked) { go.disabled = true; cf.addEventListener('input', () => { go.disabled = cf.value.trim() !== cf.dataset.expect; }); }
+</script>"""
+
+
+# --- the confirm page (GET /hooks/upgrade) --------------------------------------------------
+KIND = {"same-major": "minor update", "next-major": "next major version", "latest": "newest major version"}
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%(title)s</title>
+<style>
+:root { color-scheme: light dark; --bg:#f6f7f9; --card:#fff; --ink:#1c2330; --muted:#667085; --line:#d9dee7;
+        --ok:#1a7f4b; --bad:#b42318; --warn:#b54708; --btn:#1f6feb; }
+@media (prefers-color-scheme: dark) { :root { --bg:#111418; --card:#1a1f26; --ink:#e6e9ee; --muted:#98a2b3;
+        --line:#2c333d; --ok:#4ac98a; --bad:#ff7b72; --warn:#f0a35c; --btn:#388bfd; } }
+body { margin:0; padding:16px; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui,sans-serif; }
+main { max-width:760px; margin:0 auto; }
+h1 { font-size:20px; margin:8px 0 4px; } .muted { color:var(--muted); } .ok { color:var(--ok); } .bad { color:var(--bad); }
+.warn { color:var(--warn); }
+.card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin:12px 0; }
+table { border-collapse:collapse; width:100%%; } td, th { text-align:left; padding:6px 10px 6px 0; vertical-align:top;
+        border-bottom:1px solid var(--line); } tr:last-child td { border-bottom:0; } th { color:var(--muted); font-weight:500; }
+code { font:13px ui-monospace,monospace; overflow-wrap:anywhere; } a { color:var(--btn); }
+button { font:inherit; font-weight:600; padding:10px 18px; border:0; border-radius:6px; background:var(--btn); color:#fff; cursor:pointer; }
+button:disabled { background:var(--line); color:var(--muted); cursor:not-allowed; }
+#out { white-space:pre-wrap; overflow-wrap:anywhere; margin-top:12px; }
+#log { display:none; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin:12px 0;
+       font:12px/1.45 ui-monospace,monospace; white-space:pre-wrap; overflow-wrap:anywhere; overflow-y:auto; max-height:65vh; }
+main.wide { max-width:1100px; }
+</style></head><body><main class="%(cls)s">
+<p class="muted">%(host)s · signed in as %(user)s · <a href="/">upgrades</a> · <a href="/hooks/snapshots">snapshots</a></p>
+%(body)s
+</main>%(script)s</body></html>
+"""
+FOLLOW = """<script>
+// Follows the log of a service's running / last upgrade: asks for the lines after the last
+// cursor every 2 s while it runs. A new run (other id) starts the view from scratch.
+function follow(svc, onState) {
+  const log = document.getElementById('log'); let cur = '', id = null;
+  log.style.display = 'block';
+  async function tick() {
+    let wait = 2000;
+    try {
+      const d = await (await fetch('/hooks/upgrade-logdata?service=' + encodeURIComponent(svc) + '&cursor=' + encodeURIComponent(cur),
+                                   {cache: 'no-store'})).json();
+      if (id !== null && d.id !== id) { log.textContent = ''; cur = ''; id = d.id; }
+      else {
+        id = d.id;
+        if (d.lines.length) {
+          const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+          log.append(d.lines.join('\\n') + '\\n');
+          if (stick) log.scrollTop = log.scrollHeight;
+        }
+        if (d.cursor) cur = d.cursor;
+        if (onState) onState(d);
+        if (!d.running) wait = 10000;
+      }
+    } catch (e) { wait = 5000; }
+    setTimeout(tick, wait);
+  }
+  tick();
+}
+</script>"""
+LOGSCRIPT = """<script>
+const st = document.getElementById('state');
+follow(document.getElementById('log').dataset.service, d => {
+  if (!d.id) { st.className = 'muted'; st.textContent = 'No upgrade of this service was run on the host yet.'; }
+  else if (d.running) { st.className = ''; st.textContent = 'Running: upgrade to ' + d.version + ' …'; }
+  else { st.className = d.ok ? 'ok' : 'bad';
+         st.textContent = (d.ok ? 'Upgraded to ' : 'FAILED / rolled back: upgrade to ') + d.version + ' — finished '
+           + new Date(d.finished * 1000).toLocaleString() + ' after ' + d.duration + ' s'; }
+});
+</script>"""
+SCRIPT = """<script>
+const go = document.getElementById('go'), out = document.getElementById('out');
+const svc = go.dataset.service, ver = go.dataset.version, unit = 'app-upgrade@' + svc + ':' + ver + '.service';
+let since = 0, seen = false;
+async function poll() {
+  try {
+    const s = await (await fetch('/hooks/upgrade-status', {cache: 'no-store'})).json();
+    const last = s.last[svc];
+    if (s.running.includes(unit)) { seen = true; out.className = ''; out.textContent = 'Running… ' + (s.progress || ''); }
+    else if (last && last.version === ver && last.finished >= since) {
+      out.className = last.ok ? 'ok' : 'bad';
+      out.textContent = last.ok ? ((last.target === 'host' || last.target === 'snapshots') ? 'Done: ' + ver + ' (' + last.duration + ' s).'
+                                                                : 'Done: ' + svc + ' is now on ' + ver + ' (' + last.duration + ' s).')
+        : (last.target === 'snapshots' ? 'FAILED after ' + last.duration + ' s — see the log below.'
+           : 'FAILED after ' + last.duration + ' s — the playbook rolled back if it got that far. Details on the host: journalctl -u ' + unit);
+      return;
+    } else if (seen) { out.className = 'bad'; out.textContent = 'The run ended without a result — see: journalctl -u ' + unit; return; }
+  } catch (e) { out.className = 'warn'; out.textContent = 'Server not reachable right now (normal while the login service itself restarts) — retrying…'; }
+  setTimeout(poll, 5000);
+}
+go.addEventListener('click', async () => {
+  go.disabled = true; since = Math.floor(Date.now() / 1000) - 10; out.className = ''; out.textContent = 'Requesting…';
+  try {
+    const r = await fetch('/hooks/app-upgrade', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                 body: JSON.stringify({service: svc, version: ver})});
+    const a = JSON.parse((await r.text()).trim().split('\\n').pop());   // the JSON answer is the last line
+    if (a.status !== 'started') { out.className = 'bad'; out.textContent = 'Refused: ' + a.reason; go.disabled = false; return; }
+    out.textContent = 'Started.'; setTimeout(poll, 3000); setTimeout(() => follow(svc), 3000);
+  } catch (e) { out.className = 'bad'; out.textContent = 'Request failed: ' + e; go.disabled = false; }
+});
+</script>"""
+
+
+def esc(value):
+    return html.escape(str(value), quote=True)
+
+
+def resolve(what, cat):
+    """Service name for a service name or an image reference (what a dashboard row links with)."""
+    if what in cat:
+        return what
+    repo = what.rsplit(":", 1)[0] if ":" in what.rsplit("/", 1)[-1] else what
+    for name, svc in cat.items():
+        if repo in svc["images"]:
+            return name
+    return None
+
+
+def findings(svc, version):
+    """{severity: (now, after)} summed over the service's images; after = None if not scanned."""
+    out = {}
+    for sev in ("CRITICAL", "HIGH"):
+        now = sum(v for lbl, v in prom("trivy_image_vulnerabilities")
+                  if lbl.get("severity") == sev and lbl.get("image", "").rsplit(":", 1)[0] in svc["images"])
+        after = [v for lbl, v in prom("trivy_image_newer_vulnerabilities")
+                 if lbl.get("severity") == sev and lbl.get("version") == version
+                 and lbl.get("image", "").rsplit(":", 1)[0] in svc["images"]]
+        out[sev] = (int(now), int(sum(after)) if after else None)
+    return out
+
+
+def last_line(name, state):
+    r = state.get(name)
+    if not r:
+        return '<span class="muted">never upgraded here</span>'
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["finished"]))
+    host = r.get("target") in ("host", "snapshots")
+    return '<span class="%s">%s</span> %s <code>%s</code> on %s (by %s) · <a href="/hooks/upgrade-log?service=%s">log</a>' % (
+        "ok" if r["ok"] else "bad", ("done" if host else "upgraded") if r["ok"] else ("FAILED" if host else "FAILED / rolled back"),
+        ":" if host else "to", esc(r["version"]), when,
+        esc(r.get("by", "local")), esc(name))
+
+
+def no_targets(svc, scanning):
+    """Why the overview offers no upgrade: really up to date, or just not compared (yet)?"""
+    running = running_images(svc)
+    compared = {lbl.get("image") for lbl, v in prom("trivy_image_newer_check_success") if v == 1}
+    if running and all(i in compared for i in running):
+        return '<span class="muted">up to date</span>'
+    if scanning:
+        return '<span class="warn">checking for newer versions… (scan running, reload in a few minutes)</span>'
+    return '<span class="muted">not compared with the registry yet (next scan)</span>'
+
+
+def page_index(cat, state):
+    rows, run = [], current_run()
+    scanning = bool(unit_active("trivy-metrics.service"))
+    for name, svc in sorted(cat.items(), key=lambda kv: (kv[1].get("kind") != "host", kv[0])):
+        if not svc.get("local") or svc.get("kind") == "snapshots":
+            continue
+        if svc.get("kind") == "host":
+            pending, reboot = host_state()
+            links = " · ".join('<a href="/hooks/upgrade?image=%s&amp;version=%s">%s</a>' % (esc(name), esc(m), esc(m))
+                               for m in HOST_MODES)
+            rows.append("<tr><td><b>server</b></td><td><code>kernel %s</code><br>%s%s</td><td>%s</td><td>%s</td></tr>" % (
+                esc(os.uname().release), "%d package(s) pending" % len(pending) if pending else "packages up to date",
+                '<br><b class="warn">restart required</b>' if reboot else "", links,
+                '<b class="warn">running: %s</b> · <a href="/hooks/upgrade-log?service=%s">follow the log</a>'
+                % (esc(run["version"]), esc(name)) if run and run.get("service") == name else last_line(name, state)))
+            continue
+        tags = ", ".join(sorted({i.rsplit(":", 1)[-1] for i in running_images(svc)})) or "–"
+        links = ", ".join('<a href="/hooks/upgrade?image=%s&amp;version=%s">%s</a> <span class="muted">(%s)</span>'
+                          % (esc(name), esc(v), esc(v), esc(KIND.get(k, k)))
+                          for v, k in sorted(targets(svc).items(), key=lambda t: list(KIND).index(t[1]) if t[1] in KIND else 9))
+        rows.append("<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+                    % (esc(name), esc(tags), links or no_targets(svc, scanning),
+                       '<b class="warn">running: upgrade to %s</b> · <a href="/hooks/upgrade-log?service=%s">follow the log</a>'
+                       % (esc(run["version"]), esc(name)) if run and run.get("service") == name else last_line(name, state)))
+    other = sorted(n for n, s in cat.items() if not s.get("local") and s.get("kind", "image") == "image")
+    return ("<h1>On-host upgrades</h1><div class=card><table><tr><th>Service</th><th>Running</th><th>Upgrade to</th>"
+            "<th>Last upgrade</th></tr>%s</table></div><p class=muted>Versions come from the nightly registry "
+            "comparison (Grafana → Vulnerabilities). Only from the laptop: %s.</p>" % ("".join(rows), esc(", ".join(other))))
+
+
+def page_host(name, version, state):
+    pending, reboot = host_state()
+    reason = ""
+    try:
+        svc, _ = validate(name, version)
+        prechecks(svc)
+    except Refused as e:
+        reason = str(e)
+    restarts = sorted({p.split()[0] for p in pending} & {"docker-ce", "containerd.io"})
+    rows = [("Action", "<b>%s</b> — %s" % (esc(version), esc(HOST_MODES.get(version, "?")))),
+            ("Running", "<code>kernel %s</code>, restart required: <b>%s</b>" % (esc(os.uname().release), "yes" if reboot else "no"))]
+    if version != "reboot":
+        rows.append(("Packages", ("%d pending (as of apt's last list refresh; refreshed again before the upgrade):<br>" % len(pending)
+                                  + "<br>".join("<code>%s</code>" % esc(p) for p in pending[:60])
+                                  + ("<br>… and %d more" % (len(pending) - 60) if len(pending) > 60 else ""))
+                     if pending else "none pending"))
+        rows.append(("Effect", ('<span class="warn">%s is upgraded: the Docker daemon restarts and with it EVERY container — everything '
+                                "is unreachable for about a minute, this page too (reload it afterwards).</span>" % esc(" + ".join(restarts)))
+                     if restarts else "no Docker upgrade pending — containers keep running"))
+        rows.append(("Caddy", "the newest release is built with the same plugins; it replaces the running one only if it "
+                              "accepts the live configuration, and the previous one is put back if it does not come up"))
+    if version != "packages":
+        rows.append(("Restart", '<span class="warn">The server restarts %s. Everything is down for a few minutes.</span>'
+                     % ("one minute after you confirm" if version == "reboot"
+                        else "one minute after the upgrade — only if a restart is required then")))
+    rows.append(("Safety net", "a snapshot pair of the root filesystem frames the run (normal retention); "
+                               "to go back: <code>snapper -c root list</code> / rollback from the laptop"))
+    rows.append(("Last run", last_line(name, state)))
+    body = "<h1>Server: %s?</h1><div class=card><table>%s</table></div>" % (
+        esc(version), "".join("<tr><th>%s</th><td>%s</td></tr>" % r for r in rows))
+    if reason:
+        body += '<div class=card><b class="bad">Not possible right now:</b> %s</div>' % esc(reason)
+    body += ('<button id=go data-service="%s" data-version="%s"%s>%s</button><div id=out></div><div id=log></div>'
+             % (esc(name), esc(version), " disabled" if reason else "",
+                "Restart now" if version == "reboot" else "Upgrade now"))
+    return body
+
+
+def page_confirm(name, version, cat, state):
+    svc = cat[name]
+    if svc.get("kind") == "host":
+        return page_host(name, version, state)
+    reason, target = "", ""
+    try:
+        svc, target = validate(name, version)
+        prechecks(svc)
+    except Refused as e:
+        reason = str(e)
+    rows = [("Service", "<b>%s</b>" % esc(name)),
+            ("Running", "<br>".join("<code>%s</code>" % esc(i) for i in running_images(svc)) or "–"),
+            ("Upgrade to", "<code>%s</code> %s" % (esc(version), '<span class="muted">(%s)</span>' % esc(KIND.get(target, target))
+                                                    if target else ""))]
+    if target:
+        f = findings(svc, version)
+        rows.append(("Findings", " · ".join("%s %d → %s" % (sev.capitalize(), now, "?" if after is None else after)
+                                             for sev, (now, after) in f.items())
+                     + ' <span class="muted">(now → in the new version, as scanned)</span>'))
+    rows.append(("If it fails", "the database is rolled back to the restore point set right before the upgrade (PITR, "
+                 "instance <code>%s</code>) and the old images are started again" % esc(svc["pitr"]) if svc.get("pitr")
+                 else "the previous image is started again (no database of its own)"))
+    rows.append(("Last upgrade", last_line(name, state)))
+    if target == "latest":
+        rows.append(("Note", '<span class="warn">This is the newest major version — it may skip major versions in '
+                             'between. Check the application\'s upgrade path first.</span>'))
+    body = "<h1>Upgrade %s to %s?</h1><div class=card><table>%s</table></div>" % (
+        esc(name), esc(version), "".join("<tr><th>%s</th><td>%s</td></tr>" % r for r in rows))
+    if reason:
+        body += '<div class=card><b class="bad">Not possible right now:</b> %s</div>' % esc(reason)
+    body += ('<button id=go data-service="%s" data-version="%s"%s>Upgrade now</button><div id=out></div><div id=log></div>'
+             % (esc(name), esc(version), " disabled" if reason else ""))
+    return body
+
+
+def cmd_page(what, version):
+    cat, state = catalog(), load_state()
+    name = resolve(what, cat) if what else None
+    script = ""
+    if not what:
+        title, body = "On-host upgrades", page_index(cat, state)
+    elif not name:
+        title = "Unknown service"
+        body = '<h1>Unknown service</h1><div class=card>No upgradable service runs <code>%s</code>.</div>' % esc(what)
+    elif cat[name].get("kind") == "snapshots":
+        if not cat[name].get("local"):
+            title, body = "Snapshots", "<h1>Snapshots</h1><div class=card>Not enabled on this host.</div>"
+        elif version:
+            title, body, script = "Snapshots", page_snap_confirm(version, state), FOLLOW + SCRIPT + SNAPSCRIPT
+        else:
+            title, body, script = "Snapshots", page_snapshots(state), MEASURESCRIPT
+    else:
+        title, body, script = "Upgrade %s" % name, page_confirm(name, version, cat, state), FOLLOW + SCRIPT
+    wide = bool(name) and cat[name].get("kind") == "snapshots" and not version
+    sys.stdout.write(PAGE % {"title": esc(title), "host": esc(os.uname().nodename), "user": esc(requester()),
+                             "body": body, "script": script, "cls": "wide" if wide else ""})
+    return 0
+
+
+def cmd_logpage(name):
+    known = SAFE.match(name or "") and name in catalog()
+    body = ('<h1>Upgrade log: %s</h1><p id=state class=muted>Loading…</p><div id=log data-service="%s"></div>'
+            % (esc(name), esc(name)) if known else "<h1>Unknown service</h1>")
+    sys.stdout.write(PAGE % {"title": esc("Upgrade log"), "host": esc(os.uname().nodename), "user": esc(requester()),
+                             "body": body, "script": FOLLOW + LOGSCRIPT if known else "", "cls": "wide"})
+    return 0
+
+
+def main(argv):
+    if len(argv) == 4 and argv[1] == "request":
+        return cmd_request(argv[2], argv[3])
+    if len(argv) == 3 and argv[1] == "run":
+        return cmd_run(argv[2])
+    if len(argv) == 2 and argv[1] == "status":
+        return cmd_status()
+    if len(argv) in (3, 4) and argv[1] == "log":
+        return cmd_log(argv[2], (argv[3:] + [""])[0])
+    if len(argv) in (2, 3) and argv[1] == "logpage":
+        return cmd_logpage((argv[2:] + [""])[0])
+    if len(argv) in (2, 3, 4) and argv[1] == "page":
+        return cmd_page(*(argv[2:] + ["", ""])[:2])
+    print("usage: app-upgrade request <service> <version> | run <service>:<version> | status | "
+          "page [<service|image> <version>] | logpage <service> | log <service> [<cursor>]", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

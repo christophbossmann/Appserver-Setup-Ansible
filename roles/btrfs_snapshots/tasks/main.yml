@@ -11,3 +11,12 @@
 - name: Take a checkpoint snapshot
   ansible.builtin.include_tasks: snapshot.yml
   when: (btrfs_snapshot | default('')) | length > 0
+
+# Once per play (the role is called for every checkpoint): keep the root config's retention
+# at btrfs_root_retention.
+- name: Root snapshot retention
+  ansible.builtin.include_tasks: retention.yml
+  when:
+    - btrfs_root_retention_manage | bool
+    - (btrfs_snapshots_enable | string | lower) != 'false'
+    - not (_btrfs_retention_done | default(false))

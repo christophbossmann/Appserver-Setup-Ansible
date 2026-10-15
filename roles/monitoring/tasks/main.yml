@@ -5,6 +5,26 @@
   ansible.builtin.set_fact:
     deployed_services: "{{ (deployed_services | default([])) + ['monitoring'] }}"
 
+# One-time move of the Prometheus data to prometheus_data_dir (see defaults). Reflink copy:
+# instant and without extra space on the same btrfs filesystem, a plain copy elsewhere.
+- name: Move the Prometheus data from a legacy location (one-time)
+  ansible.builtin.shell: |
+    set -e
+    src="{{ item }}"; dst="{{ prometheus_data_dir }}"
+    [ "$src" != "$dst" ] && [ -d "$src" ] || { echo skip; exit 0; }
+    [ -z "$(ls -A "$dst" 2>/dev/null)" ] || { echo "skip: $dst is not empty, $src left untouched"; exit 0; }
+    docker stop -t 120 prometheus >/dev/null 2>&1 || true      # let it close its database cleanly
+    mkdir -p "$dst"
+    cp -a --reflink=auto "$src/." "$dst/"
+    rm -rf "$src"
+    echo "moved $src -> $dst"
+  args:
+    executable: /bin/bash
+  loop: "{{ prometheus_data_legacy_dirs }}"
+  register: _prom_move
+  changed_when: "'moved' in _prom_move.stdout"
+  when: not ansible_check_mode
+
 - name: Create monitoring directories
   ansible.builtin.file:
     path: "{{ item.path }}"
@@ -206,6 +226,7 @@
     - authentik.json            # Authentik logins (flow stages), outposts, tasks, latency
     - access-logs.json          # Caddy access logs per host (top IPs/paths, recent requests) + headscale
     - vulnerabilities.json      # trivy: CRITICAL/HIGH vulnerabilities of the running images (trivy-metrics)
+    - snapshots.json            # btrfs/snapper snapshots: age, retention, space freed by deleting (snapshot-metrics)
   # No restart needed: the provider auto-reloads (updateIntervalSeconds). The fix
   # script below normalises the datasource uid in-place before Grafana picks it up.
 
@@ -250,6 +271,15 @@
         exec: "/usr/local/bin/disk-usage-metrics {{ monitoring_disk_usage_paths | join(' ') }}"
         oncalendar: "{{ monitoring_disk_usage_oncalendar }}"
         enabled: "{{ monitoring_disk_usage_enabled | bool }}"
+      - name: disk-discover-metrics
+        description: Nightly search for big directories anywhere on the local filesystems (node_exporter)
+        exec: "/usr/local/bin/disk-discover-metrics {{ monitoring_disk_discover_threshold_gib }}"
+        oncalendar: "{{ monitoring_disk_discover_oncalendar }}"
+        enabled: "{{ monitoring_disk_discover_enabled | bool }}"
+        onboot: false      # walks every local filesystem once (a minute or two of idle I/O):
+        kickoff: false     # nightly only
+        service_extra:
+          - "TimeoutStartSec=2h"
       - name: immich-storage-metrics
         description: Immich DB/file consistency for node_exporter (orphan + missing files)
         exec: >-
@@ -267,6 +297,15 @@
           {% for i in postgres_pitr_instances | default([]) | selectattr('container', 'in', _mon_running.stdout_lines) %}{{ i.name }}:{{ i.host_archive }} {% endfor %}
         oncalendar: "{{ monitoring_pitr_metrics_oncalendar }}"
         enabled: "{{ monitoring_pitr_metrics_enabled | bool }}"
+      - name: snapshot-metrics
+        description: btrfs/snapper snapshots for node_exporter (age, retention, space freed by deleting)
+        exec: "/usr/local/bin/snapshot-metrics {{ monitoring_snapshot_metrics_samples }}"
+        oncalendar: "{{ monitoring_snapshot_metrics_oncalendar }}"
+        enabled: "{{ monitoring_snapshot_metrics_enabled | bool }}"
+        onboot: false      # a few minutes of idle-priority work: nightly (and on demand), not at
+        kickoff: false     # boot or on every deploy
+        service_extra:
+          - "TimeoutStartSec=2h"
       - name: trivy-metrics
         description: Vulnerabilities of the running container images for node_exporter (trivy)
         exec: "/usr/local/bin/trivy-metrics {{ monitoring_trivy_cache_dir }} /etc/trivy-update-rules.tsv"
@@ -316,7 +355,7 @@
         state: present
       when: monitoring_trivy_enabled | bool
 
-    - name: Deploy the image update rules (repository <TAB> version tag pattern)
+    - name: Deploy the image update rules (repository <TAB> tag pattern [<TAB> tags_from [<TAB> major_parts]])
       ansible.builtin.copy:
         dest: /etc/trivy-update-rules.tsv
         owner: root
@@ -324,7 +363,7 @@
         mode: "0644"
         content: |
           {% for r in monitoring_trivy_update_rules | default([]) %}
-          {{ r.image }}	{{ r.tags }}{{ ('	' ~ r.tags_from) if r.tags_from is defined else '' }}
+          {{ r.image }}	{{ r.tags }}{{ ('	' ~ (r.tags_from | default('')) ~ (('	' ~ r.major_parts) if r.major_parts is defined else '')) if (r.tags_from is defined or r.major_parts is defined) else '' }}
           {% endfor %}
       when: monitoring_trivy_enabled | bool
 
@@ -351,13 +390,21 @@
         group: root
         mode: "0644"
         content: |
-          {{ [{'id': 'trivy-scan',
+          {{ ([{'id': 'trivy-scan',
                'execute-command': '/usr/bin/systemctl',
                'pass-arguments-to-command': [{'source': 'string', 'name': 'start'},
                                              {'source': 'string', 'name': '--no-block'},
                                              {'source': 'string', 'name': 'trivy-metrics.service'}],
                'http-methods': ['POST'],
-               'response-message': 'scan started'}] | to_nice_json }}
+               'response-message': 'scan started'}]
+             + ([{'id': 'snapshot-measure',
+                  'execute-command': '/usr/bin/systemctl',
+                  'pass-arguments-to-command': [{'source': 'string', 'name': 'start'},
+                                                {'source': 'string', 'name': '--no-block'},
+                                                {'source': 'string', 'name': 'snapshot-metrics.service'}],
+                  'http-methods': ['POST'],
+                  'response-message': 'measuring started'}] if (monitoring_snapshot_metrics_enabled | bool) else []))
+             | to_nice_json }}
       register: _webhook_conf
       when: (monitoring_trivy_enabled | bool) and (monitoring_scan_button_enabled | bool)
 
@@ -377,7 +424,7 @@
           # Managed by Ansible (roles/monitoring)
           [Service]
           ExecStart=
-          ExecStart=/usr/bin/webhook -nopanic -hooks /etc/webhook.conf -ip 127.0.0.1 -port {{ monitoring_webhook_port }}
+          ExecStart=/usr/bin/webhook -nopanic -hooks /etc/webhook.conf{{ ' -hooks /etc/webhook-upgrade.conf' if (local_upgrade_enabled | default(false) | bool) else '' }} -ip 127.0.0.1 -port {{ monitoring_webhook_port }}
       register: _webhook_dropin
       when: (monitoring_trivy_enabled | bool) and (monitoring_scan_button_enabled | bool)
 

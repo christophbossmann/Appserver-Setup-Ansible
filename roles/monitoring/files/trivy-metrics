@@ -125,14 +125,26 @@ scan() {   # <image ref> [extra trivy args...] -> $work/scan.json
 }
 cleanup_scan() { rm -rf "$work/scan.json" "$CACHE"/tmp/*; }
 rule_for() { [ -n "$RULES" ] && [ -r "$RULES" ] && awk -F'\t' -v r="$1" -v c="$2" '$1 == r { print $c; exit }' "$RULES"; }   # <repo> <column>
-# Tags of a repository, cached per run (images released together share one list).
+# Tags of a repository. Listed from the registry during a registry comparison (once per run:
+# images released together share one list) and kept with its results; in between they are
+# read from that cache, so a NEW running version (after an upgrade) gets its update targets
+# without asking the registry again.
 tags_of() {
-  local cache="$work/tags.$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
-  [ -e "$cache" ] || timeout 240 skopeo list-tags "docker://$1" 2>/dev/null \
-      | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin).get("Tags") or []))' > "$cache" 2>/dev/null
+  local name cache; name=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'); cache="$work/tags.$name"
+  if [ ! -e "$cache" ]; then
+    if [ "$registry" = 1 ]; then
+      timeout 240 skopeo list-tags "docker://$1" 2>/dev/null \
+        | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin).get("Tags") or []))' > "$cache" 2>/dev/null
+      [ -s "$cache" ] && { mkdir -p "$work/tagstore"; cp "$cache" "$work/tagstore/$name"; }
+    else
+      cat "$REG_STATE/tags/$name" > "$cache" 2>/dev/null
+    fi
+  fi
   cat "$cache"
 }
-major_of() { sed -E 's/^[^0-9]*([0-9]+).*/\1/' <<<"$1"; }
+# "Major" of a tag = its first <n> numeric components (n from the rule's 4th column, default 1;
+# 2 for calendar versions such as authentik's 2026.5.3, where 2026.5 -> 2026.6 is the release step).
+major_of() { sed -E "s/^[^0-9]*([0-9]+(\.[0-9]+){0,$(( ${2:-1} - 1 ))}).*/\1/" <<<"$1"; }
 is_newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]; }   # $2 newer than $1
 
 # Refresh the vulnerability DB once, then scan with --skip-db-update (one download per run).
@@ -141,24 +153,41 @@ trivy image --download-db-only --cache-dir "$CACHE" --quiet >/dev/null 2>"$work/
 
 mapfile -t images < <(docker ps --format '{{.Image}}' | sort -u)
 
-# The registry comparisons (3. + 4.) cost registry requests on EVERY run (digest lookups,
+# The registry comparisons (3. + 4.) cost registry requests (digest lookups, tag lists,
 # manifests of the candidate versions) — Docker Hub allows an anonymous IP only ~100 per 6h
-# and answers 429 beyond that, which also blocks real `docker pull`s (deploys!). So they run
-# at most once per REG_MAX_AGE; in between (e.g. the dashboard's scan button) the previous
-# registry results are reused and only the LOCAL images are rescanned, which costs nothing.
-# They are refreshed early when the set of running images or the rules changed.
+# and answers 429 beyond that, which also blocks real `docker pull`s (deploys, upgrades!).
+# So their results are a CACHE: fetched once, then used by every run until they are
+# REG_TTL old — whatever happens in between (scan button, scans after upgrades, changed
+# images). A failed attempt (registry down / rate-limited) is not repeated before REG_RETRY.
+# Only changed rules / a changed comparison logic refresh early; TRIVY_FORCE_REGISTRY=1 forces.
 REG_STATE="$CACHE/registry-state"
-REG_MAX_AGE="${TRIVY_REGISTRY_MAX_AGE:-72000}"      # 20h: the nightly run refreshes, daytime runs reuse
+REG_TTL="${TRIVY_REGISTRY_TTL:-43200}"        # 12h: the nightly run refreshes, everything else reuses
+REG_RETRY="${TRIVY_REGISTRY_RETRY:-3600}"     # 1h between attempts while the registry refuses
 REG_FILES="upd_avail upd_vulns newer_info newer_vulns in_newer newer_check"
-REG_FORMAT=2      # bump when the registry logic changes (new targets …) so stored results are refreshed
-reg_sig=$( { echo "$REG_FORMAT $DETAIL_SEVERITIES"; printf '%s\n' "${images[@]}"; cat "$RULES" 2>/dev/null; } | sha256sum | cut -d' ' -f1)
+REG_FORMAT=3      # bump when the registry logic changes (new targets …) so stored results are refreshed
+reg_sig=$( { echo "$REG_FORMAT $DETAIL_SEVERITIES"; cat "$RULES" 2>/dev/null; } | sha256sum | cut -d' ' -f1)
+printf '%s\n' "${images[@]}" > "$work/running"
+# Cached results, reduced to the images that are running now (an upgraded image's old entries go).
+load_reg() {
+  local f
+  for f in $REG_FILES; do
+    awk 'NR == FNR { r[$0] = 1; next }
+         match($0, /image="[^"]*"/) { if (substr($0, RSTART + 7, RLENGTH - 8) in r) print }' \
+      "$work/running" "$REG_STATE/$f" > "$work/$f" 2>/dev/null
+  done
+}
 registry=1; reg_failed=0
-if [ "${TRIVY_FORCE_REGISTRY:-0}" != 1 ] && [ -f "$REG_STATE/stamp" ] \
-   && [ "$(cat "$REG_STATE/sig" 2>/dev/null)" = "$reg_sig" ] \
-   && [ $(( start - $(cat "$REG_STATE/stamp") )) -lt "$REG_MAX_AGE" ]; then
-  registry=0
-  for f in $REG_FILES; do cat "$REG_STATE/$f" > "$work/$f" 2>/dev/null; done
+reg_age=$(( start - $(cat "$REG_STATE/stamp" 2>/dev/null || echo 0) ))
+att_age=$(( start - $(cat "$REG_STATE/attempt" 2>/dev/null || echo 0) ))
+if [ "${TRIVY_FORCE_REGISTRY:-0}" != 1 ]; then
+  if [ -f "$REG_STATE/stamp" ] && [ "$(cat "$REG_STATE/sig" 2>/dev/null)" = "$reg_sig" ] && [ "$reg_age" -lt "$REG_TTL" ]; then
+    registry=0
+  elif [ "$att_age" -lt "$REG_RETRY" ]; then
+    registry=0; echo "registry comparison skipped: last attempt ${att_age}s ago (retry after ${REG_RETRY}s)" >&2
+  fi
 fi
+if [ "$registry" = 1 ]; then mkdir -p "$REG_STATE"; echo "$start" > "$REG_STATE/attempt"
+elif [ -f "$REG_STATE/stamp" ]; then load_reg; fi
 
 for running in "${images[@]}"; do
   # --- 1./2. what is running ---
@@ -175,11 +204,19 @@ for running in "${images[@]}"; do
   # counts say. Reproducible builds carry a fake epoch date (1970/1980): skipped.
   created=$(date -d "$(docker image inspect "$running" --format '{{.Created}}' 2>/dev/null)" +%s 2>/dev/null || echo 0)
   [ "$created" -gt 1420070400 ] && echo "trivy_image_created_timestamp_seconds{image=\"$running\"} $created" >> "$work/created"
-  [ "$registry" = 1 ] || continue
-
-  # --- 3. newer build of the SAME tag? (no answer = local build / registry down) ---
+  # Between registry comparisons: an image the cache already covers is done; a NEW one (after
+  # an upgrade) gets its update targets from the cached tag lists — no registry request, and
+  # therefore no scan of those versions (their finding counts follow with the next comparison).
+  cached_only=0
+  if [ "$registry" != 1 ]; then
+    grep -qF "{image=\"$running\"}" "$work/newer_check" && continue
+    cached_only=1
+  fi
   repo="${running%:*}"; tag="${running##*:}"
   rx=""; [ "$repo" = "$running" ] || rx=$(rule_for "$repo" 2) || true
+
+  # --- 3. newer build of the SAME tag? (no answer = local build / registry down) ---
+  if [ "$cached_only" = 0 ]; then
   local_digest=$(docker image inspect "$running" --format '{{range .RepoDigests}}{{.}} {{end}}' 2>/dev/null \
                    | tr ' ' '\n' | sed -n 's/.*@//p' | head -1)
   remote_digest=$(timeout 30 docker buildx imagetools inspect "$running" --format '{{.Manifest.Digest}}' 2>/dev/null)
@@ -194,7 +231,8 @@ for running in "${images[@]}"; do
     fi
   elif [ -n "${rx:-}" ]; then
     # an image with an update rule comes from a registry — no digest = registry unreachable / rate-limited
-    echo "no registry digest for $running (registry unreachable or rate-limited)" >&2; reg_failed=1
+    echo "no registry digest for $running (registry unreachable or rate-limited)" >&2; reg_failed=1; echo "$running" >> "$work/failed_imgs"
+  fi
   fi
 
   # --- 4. newer VERSION? (only for images with a rule whose pattern the running tag matches) ---
@@ -202,43 +240,54 @@ for running in "${images[@]}"; do
   tags_repo=$(rule_for "$repo" 3) || true      # optional 3rd column: list ANOTHER repository's tags
   tags=$(tags_of "${tags_repo:-$repo}" | grep -E -- "$rx" | sort -V)
   if [ -z "$tags" ]; then
-    echo "could not list the tags of $repo" >&2; reg_failed=1
+    [ "$cached_only" = 0 ] || continue          # no cached list for this repository yet
+    echo "could not list the tags of $repo" >&2; reg_failed=1; echo "$running" >> "$work/failed_imgs"
     echo "trivy_image_newer_check_success{image=\"$running\"} 0" >> "$work/newer_check"
     continue
   fi
   echo "trivy_image_newer_check_success{image=\"$running\"} 1" >> "$work/newer_check"
   latest=$(tail -1 <<<"$tags")
-  maj=$(major_of "$tag")
-  same=$(while read -r t; do [ "$(major_of "$t")" = "$maj" ] && echo "$t"; done <<<"$tags" | tail -1)
+  mparts=$(rule_for "$repo" 4) || true; mparts="${mparts:-1}"
+  maj=$(major_of "$tag" "$mparts")
+  same=$(while read -r t; do [ "$(major_of "$t" "$mparts")" = "$maj" ] && echo "$t"; done <<<"$tags" | tail -1)
   # next major = the smallest major above the running one; its newest version is the realistic
   # next step for apps that must not skip majors (Nextcloud: 31 -> 32, not 31 -> 35)
-  nextmaj=$(while read -r t; do m=$(major_of "$t"); [ -n "$m" ] && [ "$m" -gt "$maj" ] 2>/dev/null && echo "$m"; done <<<"$tags" | sort -n | head -1)
-  next=""; [ -z "$nextmaj" ] || next=$(while read -r t; do [ "$(major_of "$t")" = "$nextmaj" ] && echo "$t"; done <<<"$tags" | tail -1)
+  nextmaj=$(while read -r t; do m=$(major_of "$t" "$mparts"); [ -n "$m" ] && is_newer "$maj" "$m" && echo "$m"; done <<<"$tags" | sort -V | head -1)
+  next=""; [ -z "$nextmaj" ] || next=$(while read -r t; do [ "$(major_of "$t" "$mparts")" = "$nextmaj" ] && echo "$t"; done <<<"$tags" | tail -1)
   for target in same-major next-major latest; do
     case "$target" in
       same-major) cand="$same" ;;
       next-major) cand="$next" ;;
       latest)     cand="$latest"   # only when it is neither of the two above
-                  [ "$(major_of "$latest")" != "$maj" ] && [ "$latest" != "$next" ] || continue ;;
+                  [ "$(major_of "$latest" "$mparts")" != "$maj" ] && [ "$latest" != "$next" ] || continue ;;
     esac
     [ -n "$cand" ] && is_newer "$tag" "$cand" || continue
     echo "trivy_image_newer_version_info{image=\"$running\",target=\"$target\",version=\"$cand\"} 1" >> "$work/newer_info"
+    [ "$cached_only" = 0 ] || continue
     if scan "$repo:$cand" --image-src remote; then summarize newer "$target" "$cand"
-    else echo "scan of $repo:$cand failed — $(tail -1 "$work/scan.err" 2>/dev/null)" >&2; reg_failed=1; fi
+    else echo "scan of $repo:$cand failed — $(tail -1 "$work/scan.err" 2>/dev/null)" >&2; reg_failed=1; echo "$running" >> "$work/failed_imgs"; fi
     cleanup_scan
   done
 done
 
-# Keep the registry results for the next runs — only when they are complete (a rate-limited
-# or offline run is retried next time instead of being reused for REG_MAX_AGE).
-if [ "$registry" = 1 ] && [ "$reg_failed" = 0 ]; then
-  mkdir -p "$REG_STATE"
+# Keep the registry results for the next runs — per IMAGE: an image whose comparison failed
+# (its registry down or rate-limited) keeps its cached entries, the others get the fresh ones.
+# So one registry refusing requests does not hold back what the others answered. Only a
+# complete run renews the cache's age (stamp); an incomplete one is retried after REG_RETRY.
+if [ "$registry" = 1 ]; then
+  if [ -s "$work/failed_imgs" ]; then
+    sort -u "$work/failed_imgs" | while read -r img; do
+      for f in $REG_FILES; do
+        { grep -vF "image=\"$img\"" "$work/$f"; grep -F "image=\"$img\"" "$REG_STATE/$f" 2>/dev/null; } > "$work/$f.merged" || true
+        mv "$work/$f.merged" "$work/$f"
+      done
+    done
+  fi
+  mkdir -p "$REG_STATE/tags"
   for f in $REG_FILES; do cp "$work/$f" "$REG_STATE/$f"; done
-  echo "$reg_sig" > "$REG_STATE/sig"; echo "$start" > "$REG_STATE/stamp"
+  [ ! -d "$work/tagstore" ] || cp "$work/tagstore"/* "$REG_STATE/tags/" 2>/dev/null || true
   echo "$DETAIL_SEVERITIES" > "$REG_STATE/in_newer_sevs"   # which severities in_newer covers
-elif [ "$registry" = 1 ] && [ -f "$REG_STATE/stamp" ]; then
-  # incomplete now, but an older complete result exists: show that one rather than fragments
-  for f in $REG_FILES; do cat "$REG_STATE/$f" > "$work/$f" 2>/dev/null; done
+  if [ "$reg_failed" = 0 ]; then echo "$reg_sig" > "$REG_STATE/sig"; echo "$start" > "$REG_STATE/stamp"; fi
 fi
 reg_stamp=$(cat "$REG_STATE/stamp" 2>/dev/null || echo 0)
 

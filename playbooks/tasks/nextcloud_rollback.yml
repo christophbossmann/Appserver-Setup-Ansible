@@ -4,7 +4,7 @@
 # path (after a successful upgrade). Does NOT fail the play — the caller decides that.
 # Expects the play vars: _occ, _biz, _snap_dir, _pitr_target, _rollback_version, upgrade_keep_old.
 - name: Freeze nextcloud again (best effort) and stop it before the DB restore
-  ansible.builtin.shell: "{{ _occ | join(' ') }} maintenance:mode --on || true; docker stop nextcloud || true"
+  ansible.builtin.shell: "{{ _occ | join(' ') }} maintenance:mode --on || true; docker stop nextcloud nextcloud-cron || true"
   changed_when: true
 
 - name: PITR the business instance back to the pre-upgrade anchor
@@ -14,11 +14,41 @@
     pitr_target_time: "{{ _pitr_target }}"
     pitr_keep_old: "{{ upgrade_keep_old }}"
 
-- name: Restore the pre-upgrade nextcloud config
+# The upgraded CODE sits in the persistent html dir; the old image will not start on it
+# ("downgrading is not supported"). Swap the pre-upgrade copy back in (code + config +
+# custom_apps as they were). Both containers that mount it are stopped at this point.
+- name: Check for the pre-upgrade copy of the program dir
+  ansible.builtin.stat:
+    path: "{{ nextcloud_html_dir }}.pre-upgrade"
+  register: _nc_pre
+
+- name: Put the pre-upgrade program dir back
+  ansible.builtin.shell: |
+    set -e
+    rm -rf "{{ nextcloud_html_dir }}.rolled-back"
+    mv "{{ nextcloud_html_dir }}" "{{ nextcloud_html_dir }}.rolled-back"
+    mv "{{ nextcloud_html_dir }}.pre-upgrade" "{{ nextcloud_html_dir }}"
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: _nc_pre.stat.exists
+
+# Fallback (no copy, e.g. a rollback of an upgrade started by an older playbook): at least
+# the config as it was.
+- name: Restore the pre-upgrade nextcloud config (no program dir copy available)
   ansible.builtin.command:
     argv: [tar, -xzf, "{{ _snap_dir }}/nextcloud-config-pre-{{ _rollback_version }}.tgz",
            -C, "{{ nextcloud_html_dir }}"]
   changed_when: true
+  when: not _nc_pre.stat.exists
+
+# The failed upgrade's program dir is kept for inspection like the pre-rollback DB dir
+# (upgrade_keep_old); the next upgrade attempt clears it.
+- name: Drop the rolled-back program dir
+  ansible.builtin.file:
+    path: "{{ nextcloud_html_dir }}.rolled-back"
+    state: absent
+  when: not (upgrade_keep_old | default(true) | bool)
 
 # NOTE: group_vars needs NO revert here — the upgrade playbook only persists the new
 # version AFTER a fully verified, kept upgrade, so on any rollback the file still holds

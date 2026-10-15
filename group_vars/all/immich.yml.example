@@ -6,7 +6,7 @@
 # VectorChord extension Immich requires (see group_vars/all/postgres.yml).
 # Releases: https://github.com/immich-app/immich/releases — Immich moves fast
 # and migrations are one-way; read the release notes before bumping.
-immich_version: "v3.0.2"
+immich_version: "v3.3.1"
 immich_image: "ghcr.io/immich-app/immich-server:{{ immich_version }}"
 immich_ml_image: "ghcr.io/immich-app/immich-machine-learning:{{ immich_version }}"
 # RAM cap for the machine-learning container (Docker mem_limit). ML is idle most of the time

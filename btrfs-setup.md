@@ -106,7 +106,7 @@ sudo apt-get install -y snapper btrfs-progs inotify-tools grub2-common bzip2 git
 sudo snapper -c root create-config /            # legt zunächst ein NESTED @/.snapshots an
 # Timeline = EIN Snapshot pro Tag (keine Stunden-Stufe): 7 täglich, 4 wöchentlich, 6 monatlich
 sudo snapper -c root set-config TIMELINE_CREATE=yes TIMELINE_LIMIT_HOURLY=0 \
-     TIMELINE_LIMIT_DAILY=7 TIMELINE_LIMIT_WEEKLY=4 TIMELINE_LIMIT_MONTHLY=6 TIMELINE_LIMIT_YEARLY=0
+     TIMELINE_LIMIT_DAILY=30 TIMELINE_LIMIT_WEEKLY=0 TIMELINE_LIMIT_MONTHLY=0 TIMELINE_LIMIT_YEARLY=0 NUMBER_LIMIT=20
 # snapper-timeline.timer läuft standardmäßig STÜNDLICH -> per Drop-in auf täglich
 sudo mkdir -p /etc/systemd/system/snapper-timeline.timer.d
 printf '[Timer]\nOnCalendar=\nOnCalendar=daily\n' | sudo tee /etc/systemd/system/snapper-timeline.timer.d/daily.conf

@@ -17,7 +17,9 @@ records = [
 debug = false
 
 [database]
-engine = "sqlite3"
+# acme-dns v2 renamed the sqlite driver ("sqlite3" -> "sqlite"; same database file). With the
+# old name v2 starts, answers /health, and dies on the first DNS query — so follow the image.
+engine = "{{ 'sqlite3' if ((acme_dns_image | regex_search(':v?([0-9]+)', '\\1') | default(['2'], true) | first | int) < 2) else 'sqlite' }}"
 connection = "/var/lib/acme-dns/acme-dns.db"
 
 [api]
