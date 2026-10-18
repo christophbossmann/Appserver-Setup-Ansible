@@ -1,0 +1,45 @@
+#!/bin/sh
+# Managed by Ansible (roles/monitoring). OS update state for node_exporter's textfile collector
+# -> the "Reboot pending" / "Security updates pending" hints (Grafana alerting). Hourly.
+# Read-only: apt-check uses the package lists apt-daily refreshes; nothing is installed.
+#
+#   updates_apt_upgradable              packages with a newer version available
+#   updates_apt_security_upgradable     ...of them from a -security pocket (unattended-upgrades
+#                                       installs these daily — pending for days = it is stuck)
+#   updates_apt_held                    packages on hold (e.g. caddy: custom build, host-upgrade.yml)
+#   updates_reboot_required             1 = /var/run/reboot-required exists (e.g. new kernel)
+#   updates_reboot_required_since_timestamp_seconds   when that file appeared
+#   updates_metrics_last_run_timestamp_seconds
+set -eu
+OUT=/var/lib/node_exporter/textfile/updates.prom
+TMP=$(mktemp "$OUT.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+
+# apt-check prints "<upgradable>;<security>" on stderr (update-notifier-common)
+counts=$(/usr/lib/update-notifier/apt-check 2>&1 >/dev/null || echo "-1;-1")
+up=${counts%%;*}; sec=${counts##*;}
+held=$(apt-mark showhold 2>/dev/null | grep -c . || true)
+if [ -e /var/run/reboot-required ]; then reboot=1; since=$(stat -c %Y /var/run/reboot-required); else reboot=0; since=0; fi
+
+{
+  echo "# HELP updates_apt_upgradable Packages with a newer version available (-1 = apt-check failed)."
+  echo "# TYPE updates_apt_upgradable gauge"
+  echo "updates_apt_upgradable $up"
+  echo "# HELP updates_apt_security_upgradable Upgradable packages from a security pocket."
+  echo "# TYPE updates_apt_security_upgradable gauge"
+  echo "updates_apt_security_upgradable $sec"
+  echo "# HELP updates_apt_held Packages on hold."
+  echo "# TYPE updates_apt_held gauge"
+  echo "updates_apt_held $held"
+  echo "# HELP updates_reboot_required 1 = the system asks for a reboot (/var/run/reboot-required)."
+  echo "# TYPE updates_reboot_required gauge"
+  echo "updates_reboot_required $reboot"
+  echo "# HELP updates_reboot_required_since_timestamp_seconds When the reboot request appeared (0 = none)."
+  echo "# TYPE updates_reboot_required_since_timestamp_seconds gauge"
+  echo "updates_reboot_required_since_timestamp_seconds $since"
+  echo "# TYPE updates_metrics_last_run_timestamp_seconds gauge"
+  echo "updates_metrics_last_run_timestamp_seconds $(date +%s)"
+} > "$TMP"
+chmod 0644 "$TMP"
+mv "$TMP" "$OUT"
+trap - EXIT

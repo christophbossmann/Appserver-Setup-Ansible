@@ -12,7 +12,8 @@
 #   security_ufw_blocked_total{proto}           counter: UFW BLOCK kernel log lines
 #   Per-window gauges, window = 1h | 24h | 7d | 30d (the dashboard's "window" selector):
 #   security_events{kind,window}                totals: ssh_attempts, ssh_logins, ufw_blocks
-#   security_top_source{source,ip,window}       top-10 IPs per source (ssh|ufw)
+#   security_top_source{source,ip,window}       top-10 IPs per source (ssh|ufw|spamhaus|blocklist —
+#       the last two from the rate-limited "[SPAMHAUS DROP] " / "[BLOCKLIST DROP] " log rules)
 #   security_top_port{proto,port,window}        top-10 UFW-blocked destination ports
 #   security_top_ssh_user{user,window}          top-10 usernames tried
 #   security_ssh_login_timestamp{user,ip,method,window}  last ACCEPTED login per user+ip
@@ -20,6 +21,8 @@
 #   security_fail2ban_failed{jail}              gauge: currently failed (in findtime)
 #   security_fail2ban_banned_since_start{jail}  gauge: total banned since fail2ban start
 #   security_spamhaus_dropped_packets_total{chain}  counter: dropped by Spamhaus DROP rules
+#   security_blocklist_dropped_packets_total{chain} counter: dropped by the own blocklist rules
+#   (+ blocklist.prom, written by `blocklist metrics`: one series per blocklist entry)
 #   security_sshd_password_auth_enabled         gauge: 1 = sshd accepts passwords (BAD)
 #   security_sshd_root_login_enabled            gauge: 1 = root may log in (BAD)
 #   security_metrics_last_run_timestamp_seconds gauge
@@ -127,8 +130,8 @@ def main():
     if entries:
         st["cursor_ssh"] = entries[-1]["__CURSOR"]
 
-    # --- UFW blocks (kernel log) ---
-    entries = journal(["-k", "--grep", "UFW BLOCK"], st.get("cursor_ufw"))
+    # --- UFW blocks + Spamhaus / blocklist drops (kernel log) ---
+    entries = journal(["-k", "--grep", "UFW BLOCK|SPAMHAUS DROP|BLOCKLIST DROP"], st.get("cursor_ufw"))
     for e in entries:
         msg = e.get("MESSAGE", "")
         m = UFW_RE.search(msg) if isinstance(msg, str) else None
@@ -136,8 +139,14 @@ def main():
             continue
         ts = int(e.get("__REALTIME_TIMESTAMP", now * 1e6)) / 1e6
         ip, proto, port = m.group(1), m.group(2).lower(), m.group(3)
-        inc(st["ufw_total"], proto)
         bs = buckets(ts)
+        if "[SPAMHAUS DROP]" in msg:       # rate-limited log rules: sampled, not every packet
+            add(bs, "spamhaus", ip)
+            continue
+        if "[BLOCKLIST DROP]" in msg:
+            add(bs, "blocklist", ip)
+            continue
+        inc(st["ufw_total"], proto)
         add(bs, "ufw", ip)
         add(bs, "tot", "ufw_blocks")
         if port:
@@ -184,7 +193,7 @@ def main():
             for w in W for k in ("ssh_attempts", "ssh_logins", "ufw_blocks")])
     metric("security_top_source", "Top source IPs per window", "gauge",
            [({"source": src, "ip": ip, "window": w}, n)
-            for w in W for src in ("ssh", "ufw") for ip, n in top(w, src)])
+            for w in W for src in ("ssh", "ufw", "spamhaus", "blocklist") for ip, n in top(w, src)])
     metric("security_top_port", "Top UFW-blocked destination ports per window", "gauge",
            [({"proto": k.split("/")[0], "port": k.split("/")[1], "window": w}, n)
             for w in W for k, n in top(w, "port")])
@@ -220,6 +229,20 @@ def main():
         sp.append(({"chain": chain}, pk))
     metric("security_spamhaus_dropped_packets_total",
            "Packets dropped by the Spamhaus DROP ipset rules (resets on firewall reload)", "counter", sp)
+
+    # --- own blocklist (roles/hardening): same, plus the per-entry textfile ---
+    bl = []
+    for binary, chain in (("iptables", "ufw-before-input"), ("ip6tables", "ufw6-before-input"),
+                          ("iptables", "DOCKER-USER")):
+        pk = 0
+        for line in run([binary, "-w", "-nvxL", chain]).splitlines():
+            if "match-set blocklist" in line and line.split()[2:3] == ["DROP"]:
+                pk += int(line.split()[0])
+        bl.append(({"chain": chain}, pk))
+    metric("security_blocklist_dropped_packets_total",
+           "Packets dropped by the own blocklist ipset rules (resets on firewall reload)", "counter", bl)
+    if os.path.exists("/usr/local/sbin/blocklist"):
+        run(["/usr/local/sbin/blocklist", "metrics"])
 
     # --- effective sshd policy (sshd -T) — the config that ACTUALLY applies ---
     eff = run(["/usr/sbin/sshd", "-T"]).splitlines()

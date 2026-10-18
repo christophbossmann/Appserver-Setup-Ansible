@@ -1,0 +1,194 @@
+---
+# healthchecks.io dead man's switch — see defaults/main.yml for what and why.
+- name: healthchecks.io dead man's switch
+  when: healthchecks_enabled | default(false) | bool
+  block:
+    - name: Require the keys from the vault
+      ansible.builtin.assert:
+        that:
+          - healthchecks_api_key | length > 0
+          - healthchecks_ping_key | length > 0
+        fail_msg: "healthchecks_enabled needs vault_healthchecks_api_key and vault_healthchecks_ping_key in the vault."
+        quiet: true
+
+    - name: Find the job timers enabled on this host
+      ansible.builtin.command: "systemctl is-enabled {{ item.unit }}.timer"
+      loop: "{{ healthchecks_jobs }}"
+      loop_control: { label: "{{ item.unit }}" }
+      register: _hc_timers
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Read the host's time zone (the timers fire in it)
+      ansible.builtin.command: timedatectl show -p Timezone --value
+      register: _hc_tz
+      changed_when: false
+      check_mode: false
+
+    - name: Work out the checks this host wants
+      ansible.builtin.set_fact:
+        _hc_active: "{{ _hc_timers.results | selectattr('stdout', 'equalto', 'enabled') | map(attribute='item') | list }}"
+        _hc_checks: >-
+          {%- set out = [] -%}
+          {%- set tz = _hc_tz.stdout | trim or 'UTC' -%}
+          {%- set _ = out.append({'slug': healthchecks_prefix ~ '-heartbeat', 'desc': 'Heartbeat of ' ~ inventory_hostname,
+                'timeout': healthchecks_heartbeat_minutes * 60, 'grace': healthchecks_heartbeat_grace_minutes * 60}) -%}
+          {%- for r in _hc_timers.results if r.stdout == 'enabled' -%}
+          {%- set _ = out.append({'slug': healthchecks_prefix ~ '-' ~ r.item.slug, 'desc': r.item.desc ~ ' on ' ~ inventory_hostname,
+                'schedule': r.item.schedule, 'tz': tz, 'grace': r.item.grace * 60}) -%}
+          {%- endfor -%}
+          {%- for c in healthchecks_extra_checks -%}
+          {%- set _ = out.append({'slug': healthchecks_prefix ~ '-' ~ c.slug, 'desc': c.desc | default(c.slug),
+                'timeout': c.timeout * 60, 'grace': c.grace * 60}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    # --- the checks at healthchecks.io (from the controller: the API key never reaches the host)
+    - name: Create or update the checks
+      ansible.builtin.uri:
+        url: "{{ healthchecks_api_url }}/checks/"
+        method: POST
+        headers: { X-Api-Key: "{{ healthchecks_api_key }}" }
+        body_format: json
+        body: "{{ item | combine({'name': item.slug, 'tags': 'ansible ' ~ healthchecks_prefix, 'channels': '*', 'unique': ['slug']}) }}"
+        status_code: [200, 201]
+      loop: "{{ _hc_checks }}"
+      loop_control: { label: "{{ item.slug }}" }
+      delegate_to: localhost
+      become: false
+      no_log: true
+      changed_when: _hc_put.status == 201
+      register: _hc_put
+      when: not ansible_check_mode
+
+    - name: List this host's checks
+      ansible.builtin.uri:
+        url: "{{ healthchecks_api_url }}/checks/?tag=ansible&tag={{ healthchecks_prefix }}"
+        headers: { X-Api-Key: "{{ healthchecks_api_key }}" }
+        return_content: true
+      delegate_to: localhost
+      become: false
+      no_log: true
+      register: _hc_list
+      when: not ansible_check_mode
+
+    - name: Delete the checks no longer wanted
+      ansible.builtin.uri:
+        url: "{{ item.update_url }}"
+        method: DELETE
+        headers: { X-Api-Key: "{{ healthchecks_api_key }}" }
+      loop: "{{ _hc_list.json.checks | rejectattr('slug', 'in', _hc_checks | map(attribute='slug') | list) | list }}"
+      loop_control: { label: "{{ item.slug }}" }
+      delegate_to: localhost
+      become: false
+      no_log: true
+      changed_when: true
+      when: not ansible_check_mode
+
+    # --- the pings on the host
+    - name: Ping key directory (root only)
+      ansible.builtin.file:
+        path: /etc/healthchecks
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Ping base URL (carries the ping key)
+      ansible.builtin.copy:
+        dest: /etc/healthchecks/ping.env
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Managed by Ansible (roles/healthchecks)
+          HC_PING_BASE={{ healthchecks_ping_url }}/{{ healthchecks_ping_key }}
+      no_log: true
+
+    - name: Install hc-ping
+      ansible.builtin.copy:
+        src: hc-ping
+        dest: /usr/local/bin/hc-ping
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Drop-in directories of the reporting jobs
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ item.unit }}.service.d"
+        state: directory
+        mode: "0755"
+      loop: "{{ _hc_active }}"
+      loop_control: { label: "{{ item.unit }}" }
+
+    - name: Report every job's end (drop-in; removed where the job's timer is off)
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item.unit }}.service.d/healthchecks.conf"
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/healthchecks) — success or /fail to healthchecks.io
+          [Service]
+          ExecStopPost=-/usr/local/bin/hc-ping {{ healthchecks_prefix }}-{{ item.slug }}
+      loop: "{{ _hc_active }}"
+      loop_control: { label: "{{ item.unit }}" }
+      register: _hc_dropins
+
+    - name: Remove the drop-in of jobs whose timer is off
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ item.unit }}.service.d/healthchecks.conf"
+        state: absent
+      loop: "{{ healthchecks_jobs | difference(_hc_active) }}"
+      loop_control: { label: "{{ item.unit }}" }
+      register: _hc_dropins_off
+
+    - name: Heartbeat service + timer
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/healthchecks-heartbeat.{{ item.ext }}"
+        mode: "0644"
+        content: "{{ item.content }}"
+      loop:
+        - ext: service
+          content: |
+            # Managed by Ansible (roles/healthchecks)
+            [Unit]
+            Description=Heartbeat to healthchecks.io
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/bin/hc-ping {{ healthchecks_prefix }}-heartbeat
+        - ext: timer
+          content: |
+            # Managed by Ansible (roles/healthchecks)
+            [Unit]
+            Description=Heartbeat to healthchecks.io every {{ healthchecks_heartbeat_minutes }} min
+
+            [Timer]
+            OnBootSec=2min
+            OnCalendar=*:0/{{ healthchecks_heartbeat_minutes }}
+            RandomizedDelaySec=60
+
+            [Install]
+            WantedBy=timers.target
+      loop_control: { label: "healthchecks-heartbeat.{{ item.ext }}" }
+      register: _hc_units
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: _hc_dropins.changed or _hc_dropins_off.changed or _hc_units.changed
+
+    - name: Enable the heartbeat
+      ansible.builtin.systemd:
+        name: healthchecks-heartbeat.timer
+        enabled: true
+        state: started
+      when: not ansible_check_mode
+
+    - name: First heartbeat now
+      ansible.builtin.systemd:
+        name: healthchecks-heartbeat.service
+        state: started
+      when: _hc_units.changed and not ansible_check_mode

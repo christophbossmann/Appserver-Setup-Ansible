@@ -1,0 +1,12 @@
+#!/bin/sh
+# Managed by Ansible (roles/healthchecks) — report to a healthchecks.io check.
+#   hc-ping <slug>
+# As a unit's ExecStopPost= it reports /fail unless systemd says SERVICE_RESULT=success;
+# called anywhere else it reports success. The URL (it carries the ping key) goes to curl on
+# stdin, never on a command line other users could read in ps. Never fails the caller.
+. /etc/healthchecks/ping.env 2>/dev/null || exit 0
+case "${SERVICE_RESULT:-success}" in
+  success) s= ;;
+  *) s=/fail ;;
+esac
+printf 'url = "%s/%s%s"\n' "$HC_PING_BASE" "$1" "$s" | curl -fsS -m 10 --retry 3 -o /dev/null -K - || true

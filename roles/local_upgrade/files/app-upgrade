@@ -9,9 +9,13 @@
 #   app-upgrade status                        last result per service + what is running (JSON)
 #   app-upgrade page [<service|image> <version>]   the HTML confirm page (no args: overview)
 #   app-upgrade page snapshots [<config>.<N>.<action>]   the snapshot page / its confirm page
+#   app-upgrade expire                        remove late-rollback records + what they kept, once over
 #   app-upgrade logpage <service>             HTML page that follows the log of the service's
 #                                             running / last upgrade
 #   app-upgrade log <service> [<cursor>]      that log as JSON (new lines after <cursor>)
+#   app-upgrade blockpage                     the "Blocked IPs" page (own firewall blocklist)
+#   app-upgrade block add|remove <net> [<comment>]   change it (roles/hardening: blocklist —
+#                                             which refuses anything that could lock you out)
 #
 # It can do exactly ONE thing: run the catalog's upgrade playbook for a service the catalog
 # marks as locally upgradable, to a version the nightly registry comparison (trivy-metrics)
@@ -39,6 +43,7 @@ STATE_DIR = "/var/lib/app-upgrade"
 STATE = os.path.join(STATE_DIR, "last.json")
 REQUEST = os.path.join(STATE_DIR, "request.json")
 RUNNING = os.path.join(STATE_DIR, "running.json")
+ROLLBACK_DIR = os.path.join(STATE_DIR, "rollback")     # tasks/rollback_record.yml writes them
 LOCK = "/run/app-upgrade.lock"
 LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -62,7 +67,7 @@ def prom(name):
         try:
             with open(os.path.join(TEXTFILE, fn)) as f:
                 for line in f:
-                    if line.startswith(name + "{"):
+                    if line.startswith(name + "{") or line.startswith(name + " "):
                         out.append((dict(LABEL.findall(line)), float(line.rsplit(" ", 1)[1])))
         except OSError:
             pass
@@ -140,6 +145,36 @@ def allowed(svc, found):
     return {v: k for v, k in found.items() if not kinds or k in kinds}
 
 
+def rollback_records():
+    """service -> late-rollback record (valid or expired)."""
+    out = {}
+    try:
+        names = os.listdir(ROLLBACK_DIR)
+    except OSError:
+        return out
+    for fn in names:
+        if fn.endswith(".json"):
+            try:
+                with open(os.path.join(ROLLBACK_DIR, fn)) as f:
+                    rec = json.load(f)
+                out[rec["service"]] = rec
+            except (OSError, ValueError, KeyError):
+                pass
+    return out
+
+
+def rollback_valid(name, recs=None):
+    rec = (recs if recs is not None else rollback_records()).get(name)
+    return rec if rec and rec.get("expires", 0) > time.time() else None
+
+
+def rollback_joint(rec, recs):
+    """The record + every other service on the same postgres instance upgraded after it."""
+    others = [r for n, r in recs.items() if n != rec["service"] and rec.get("pitr")
+              and r.get("pitr") == rec["pitr"] and r.get("created", 0) >= rec.get("created", 0)]
+    return [rec] + sorted(others, key=lambda r: r["created"])
+
+
 def validate(name, version):
     cat = catalog()
     if not SAFE.match(name or "") or name not in cat:
@@ -152,6 +187,10 @@ def validate(name, version):
     if svc.get("kind") == "snapshots":
         snap_validate(version)
         return svc, "snapshots"
+    if version == "rollback":
+        if not rollback_valid(name):
+            raise Refused("no rollback available for %s (none recorded, or its %s window is over)" % (name, "72 h"))
+        return svc, "rollback"
     known = targets(svc)
     if version not in known:
         raise Refused("%s is not a known update target for %s (known: %s) — the registry comparison "
@@ -295,7 +334,11 @@ def cmd_run(instance):
     cmd = ["ansible-playbook", "-i", os.path.join(BASE, "config", "inventory.ini"),
            os.path.join("playbooks", svc["playbook"]),
            "-e", "upgrade_confirm=YES", "-e", "upgrade_local_run=true"]
-    if svc.get("arg"):       # (for kind: host the "version" is the mode)
+    if version == "rollback":
+        cmd = ["ansible-playbook", "-i", os.path.join(BASE, "config", "inventory.ini"),
+               os.path.join("playbooks", "upgrade-rollback.yml"),
+               "-e", "upgrade_confirm=YES", "-e", "upgrade_local_run=true", "-e", "rollback_service=%s" % name]
+    elif svc.get("arg"):       # (for kind: host the "version" is the mode)
         cmd += ["-e", "%s=%s" % (svc["arg"], version)]
     else:
         cmd += ["-e", "upgrade_service=%s" % name, "-e", "upgrade_version=%s" % version]
@@ -336,6 +379,57 @@ def cmd_run(instance):
     print("=== %s: %s ===" % (name, "upgraded to " + version if rc == 0 else
                              "FAILED (rc=%d) — the playbook rolled back if it got that far, see above" % rc), flush=True)
     return 0 if rc == 0 else 1
+
+
+def cmd_expire():
+    """Hourly (app-upgrade-expire.timer): drop late-rollback records whose window is over,
+    with the snapshots and state copies they kept; also pre-upgrade snapshots and state copies
+    no record refers to any more (a later upgrade of the same service replaced the record)."""
+    now = time.time()
+    recs = rollback_records()
+    keep_snaps, keep_paths = set(), set()
+    for name, rec in recs.items():
+        if rec.get("expires", 0) > now:
+            keep_snaps |= {(c, str(n)) for c, n in rec.get("snapshots", {}).items()}
+            keep_paths |= {"%s.pre-upgrade-%s" % (p, rec.get("stamp")) for p in rec.get("state_paths", [])}
+            continue
+        for p in rec.get("state_paths", []):
+            path = "%s.pre-upgrade-%s" % (p, rec.get("stamp"))
+            if rec.get("stamp") and os.path.exists(path):
+                subprocess.run(["rm", "-rf", path])
+                print("removed state copy %s" % path)
+        for cfg, n in rec.get("snapshots", {}).items():
+            if subprocess.run(["snapper", "-c", cfg, "delete", str(n)], capture_output=True).returncode == 0:
+                print("deleted snapshot %s #%s" % (cfg, n))
+        os.remove(os.path.join(ROLLBACK_DIR, "%s.json" % name))
+        print("rollback of %s expired (%s -> %s)" % (name, rec.get("to"), rec.get("from")))
+    # strays: pre-upgrade snapshots older than the window that nothing refers to
+    window = 72 * 3600
+    for cfg in snap_configs():
+        for sn in snap_list(cfg):
+            if not sn["description"].startswith("pre-upgrade ") or (cfg, str(sn["number"])) in keep_snaps:
+                continue
+            try:
+                age = now - time.mktime(time.strptime(sn["date"], "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                continue
+            if age > window + 3600:
+                subprocess.run(["snapper", "-c", cfg, "delete", str(sn["number"])], capture_output=True)
+                print("deleted stray pre-upgrade snapshot %s #%d" % (cfg, sn["number"]))
+    # strays: state copies of catalog services older than the window
+    for svc in catalog().values():
+        for p in svc.get("state_paths", []):
+            parent, base = os.path.dirname(p), os.path.basename(p)
+            try:
+                entries = os.listdir(parent)
+            except OSError:
+                continue
+            for e in entries:
+                full = os.path.join(parent, e)
+                if e.startswith(base + ".pre-upgrade-") and full not in keep_paths and now - os.path.getmtime(full) > window + 3600:
+                    subprocess.run(["rm", "-rf", full])
+                    print("removed stray state copy %s" % full)
+    return 0
 
 
 def cmd_status():
@@ -727,6 +821,18 @@ mb.addEventListener('click', async () => {
   } catch (e) { ms.textContent = 'could not start: ' + e; mb.disabled = false; }
 });
 </script>"""
+SCANSCRIPT = """<script>
+const sb = document.getElementById('scan'), ss = document.getElementById('sstate');
+sb.addEventListener('click', async () => {
+  sb.disabled = true; ss.textContent = 'starting…';
+  try {
+    const r = await fetch('/hooks/trivy-scan', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    ss.textContent = r.ok ? 'scan started — takes a few minutes, reload afterwards'
+                          : 'could not start (HTTP ' + r.status + ')';
+    if (!r.ok) sb.disabled = false;
+  } catch (e) { ss.textContent = 'could not start: ' + e; sb.disabled = false; }
+});
+</script>"""
 SNAPSCRIPT = """<script>
 const cf = document.getElementById('confirm');
 if (cf && !go.dataset.blocked) { go.disabled = true; cf.addEventListener('input', () => { go.disabled = cf.value.trim() !== cf.dataset.expect; }); }
@@ -758,7 +864,7 @@ button:disabled { background:var(--line); color:var(--muted); cursor:not-allowed
        font:12px/1.45 ui-monospace,monospace; white-space:pre-wrap; overflow-wrap:anywhere; overflow-y:auto; max-height:65vh; }
 main.wide { max-width:1100px; }
 </style></head><body><main class="%(cls)s">
-<p class="muted">%(host)s · signed in as %(user)s · <a href="/">upgrades</a> · <a href="/hooks/snapshots">snapshots</a></p>
+<p class="muted">%(host)s · signed in as %(user)s · <a href="/">upgrades</a> · <a href="/hooks/snapshots">snapshots</a> · <a href="/hooks/blocklist">blocked IPs</a></p>
 %(body)s
 </main>%(script)s</body></html>
 """
@@ -812,7 +918,7 @@ async function poll() {
     if (s.running.includes(unit)) { seen = true; out.className = ''; out.textContent = 'Running… ' + (s.progress || ''); }
     else if (last && last.version === ver && last.finished >= since) {
       out.className = last.ok ? 'ok' : 'bad';
-      out.textContent = last.ok ? ((last.target === 'host' || last.target === 'snapshots') ? 'Done: ' + ver + ' (' + last.duration + ' s).'
+      out.textContent = last.ok ? ((last.target === 'host' || last.target === 'snapshots' || last.target === 'rollback') ? 'Done: ' + ver + ' (' + last.duration + ' s).'
                                                                 : 'Done: ' + svc + ' is now on ' + ver + ' (' + last.duration + ' s).')
         : (last.target === 'snapshots' ? 'FAILED after ' + last.duration + ' s — see the log below.'
            : 'FAILED after ' + last.duration + ' s — the playbook rolled back if it got that far. Details on the host: journalctl -u ' + unit);
@@ -862,12 +968,21 @@ def findings(svc, version):
     return out
 
 
+def rollback_link(name, recs):
+    rec = rollback_valid(name, recs)
+    if not rec:
+        return ""
+    return (' · <a href="/hooks/upgrade?image=%s&amp;version=rollback">roll back to <code>%s</code></a> '
+            '<span class="muted">(until %s)</span>' % (esc(name), esc(rec["from"].rsplit(":", 1)[-1]),
+                                                       time.strftime("%a %H:%M", time.localtime(rec["expires"]))))
+
+
 def last_line(name, state):
     r = state.get(name)
     if not r:
         return '<span class="muted">never upgraded here</span>'
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["finished"]))
-    host = r.get("target") in ("host", "snapshots")
+    host = r.get("target") in ("host", "snapshots", "rollback")
     return '<span class="%s">%s</span> %s <code>%s</code> on %s (by %s) · <a href="/hooks/upgrade-log?service=%s">log</a>' % (
         "ok" if r["ok"] else "bad", ("done" if host else "upgraded") if r["ok"] else ("FAILED" if host else "FAILED / rolled back"),
         ":" if host else "to", esc(r["version"]), when,
@@ -888,6 +1003,7 @@ def no_targets(svc, scanning):
 def page_index(cat, state):
     rows, run = [], current_run()
     scanning = bool(unit_active("trivy-metrics.service"))
+    recs = rollback_records()
     for name, svc in sorted(cat.items(), key=lambda kv: (kv[1].get("kind") != "host", kv[0])):
         if not svc.get("local") or svc.get("kind") == "snapshots":
             continue
@@ -907,10 +1023,19 @@ def page_index(cat, state):
                           for v, k in sorted(targets(svc).items(), key=lambda t: list(KIND).index(t[1]) if t[1] in KIND else 9))
         rows.append("<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
                     % (esc(name), esc(tags), links or no_targets(svc, scanning),
-                       '<b class="warn">running: upgrade to %s</b> · <a href="/hooks/upgrade-log?service=%s">follow the log</a>'
-                       % (esc(run["version"]), esc(name)) if run and run.get("service") == name else last_line(name, state)))
+                       '<b class="warn">running: %s</b> · <a href="/hooks/upgrade-log?service=%s">follow the log</a>'
+                       % (esc(run["version"]), esc(name)) if run and run.get("service") == name
+                       else last_line(name, state) + rollback_link(name, recs)))
     other = sorted(n for n, s in cat.items() if not s.get("local") and s.get("kind", "image") == "image")
-    return ("<h1>On-host upgrades</h1><div class=card><table><tr><th>Service</th><th>Running</th><th>Upgrade to</th>"
+    last = max((v for _, v in prom("trivy_scan_timestamp_seconds")), default=0)
+    age = int(time.time() - last) if last else None
+    scan = ('<p><button id=scan%s>Scan now</button> <span id=sstate class=muted>%s</span></p>' % (
+        " disabled" if scanning else "",
+        "scan running — reload in a few minutes" if scanning else
+        "never scanned yet" if age is None else
+        "last scan %s ago (nightly; registry tag lists are reused for 12 h — Docker Hub limits)" % (
+            "%d min" % (age // 60) if age < 7200 else "%d h" % (age // 3600))))
+    return ("<h1>On-host upgrades</h1>" + scan + "<div class=card><table><tr><th>Service</th><th>Running</th><th>Upgrade to</th>"
             "<th>Last upgrade</th></tr>%s</table></div><p class=muted>Versions come from the nightly registry "
             "comparison (Grafana → Vulnerabilities). Only from the laptop: %s.</p>" % ("".join(rows), esc(", ".join(other))))
 
@@ -953,8 +1078,61 @@ def page_host(name, version, state):
     return body
 
 
+LOSS = {
+    "postgres-business": "the Immich AND Nextcloud databases go back to that moment (they share the instance), and so "
+                         "do their data volumes (snapshots taken at that moment). Photos uploaded to Immich since then "
+                         "are imported again afterwards (they stay, albums / favourites / faces set since then do not). "
+                         "Nextcloud files changed since then are lost.",
+    "authentik": "the Authentik database goes back to that moment: logins, sessions and second factors set up since "
+                 "then are lost.",
+}
+
+
+def page_rollback(name, state):
+    recs = rollback_records()
+    rec = rollback_valid(name, recs)
+    reason = ""
+    try:
+        svc, _ = validate(name, "rollback")
+        prechecks(svc)
+    except Refused as e:
+        reason = str(e)
+    if not rec:
+        return '<h1>Roll back %s?</h1><div class=card><b class="bad">Not possible:</b> %s</div>' % (esc(name), esc(reason))
+    joint = rollback_joint(rec, recs)
+    tag = lambda v: v.rsplit(":", 1)[-1]
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["created"]))
+    rows = [("Roll back", "<b>%s</b>: <code>%s</code> → <code>%s</code>" % (esc(name), esc(tag(rec["to"])), esc(tag(rec["from"])))),
+            ("Upgraded", "%s · possible until %s" % (when, time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["expires"]))))]
+    if len(joint) > 1:
+        rows.append(("Goes back too", '<span class="warn">%s — upgraded after it on the same database instance; its new '
+                                      "version would not work on the old database</span>"
+                     % esc(", ".join("%s %s → %s" % (r["service"], tag(r["to"]), tag(r["from"])) for r in joint[1:]))))
+    if rec.get("anchor"):
+        rows.append(("Data", '<span class="warn">%s</span>' % esc(LOSS.get(rec.get("pitr"), "the database goes back to that moment."))))
+        rows.append(("Point in time", "<code>%s</code>%s" % (esc(rec["anchor"]), (" · volumes: " + esc(", ".join(
+            "%s #%s" % kv for kv in rec.get("snapshots", {}).items()))) if rec.get("snapshots") else "")))
+    else:
+        rows.append(("Data", "the previous image" + (" and the state copy taken right before the upgrade (changes since are lost)"
+                                                     if rec.get("state_paths") else "; no database of its own")))
+    rows.append(("First", "the images of the previous versions are downloaded — if that fails, nothing is changed"))
+    body = "<h1>Roll back %s?</h1><div class=card><table>%s</table></div>" % (
+        esc(name), "".join("<tr><th>%s</th><td>%s</td></tr>" % r for r in rows))
+    if reason:
+        body += '<div class=card><b class="bad">Not possible right now:</b> %s</div>' % esc(reason)
+    else:
+        body += ('<p>Type <code>%s rollback</code> to confirm: <input id=confirm data-expect="%s rollback" autocomplete=off '
+                 'style="font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)"></p>'
+                 % (esc(name), esc(name)))
+    body += ('<button id=go data-service="%s" data-version="rollback"%s>Roll back now</button><div id=out></div><div id=log></div>'
+             % (esc(name), " disabled data-blocked=1" if reason else ""))
+    return body
+
+
 def page_confirm(name, version, cat, state):
     svc = cat[name]
+    if version == "rollback":
+        return page_rollback(name, state)
     if svc.get("kind") == "host":
         return page_host(name, version, state)
     reason, target = "", ""
@@ -993,7 +1171,7 @@ def cmd_page(what, version):
     name = resolve(what, cat) if what else None
     script = ""
     if not what:
-        title, body = "On-host upgrades", page_index(cat, state)
+        title, body, script = "On-host upgrades", page_index(cat, state), SCANSCRIPT
     elif not name:
         title = "Unknown service"
         body = '<h1>Unknown service</h1><div class=card>No upgradable service runs <code>%s</code>.</div>' % esc(what)
@@ -1005,7 +1183,7 @@ def cmd_page(what, version):
         else:
             title, body, script = "Snapshots", page_snapshots(state), MEASURESCRIPT
     else:
-        title, body, script = "Upgrade %s" % name, page_confirm(name, version, cat, state), FOLLOW + SCRIPT
+        title, body, script = "Upgrade %s" % name, page_confirm(name, version, cat, state), FOLLOW + SCRIPT + SNAPSCRIPT
     wide = bool(name) and cat[name].get("kind") == "snapshots" and not version
     sys.stdout.write(PAGE % {"title": esc(title), "host": esc(os.uname().nodename), "user": esc(requester()),
                              "body": body, "script": script, "cls": "wide" if wide else ""})
@@ -1021,6 +1199,80 @@ def cmd_logpage(name):
     return 0
 
 
+# --- the "Blocked IPs" page (own firewall blocklist, roles/hardening) ------------------------
+BLOCKLIST = "/usr/local/sbin/blocklist"
+SAFE_NET = re.compile(r"^[0-9A-Fa-f:.]{2,45}(/[0-9]{1,3})?$")
+SAFE_COMMENT = re.compile(r"^[A-Za-z0-9 ._:/@+,()#-]{0,120}$")
+BLOCKSCRIPT = """<script>
+const bo = document.getElementById('bout');
+async function change(action, net, comment) {
+  bo.className = ''; bo.textContent = (action === 'add' ? 'Blocking ' : 'Removing ') + net + ' …';
+  try {
+    const r = await fetch('/hooks/blocklist-change', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                     body: JSON.stringify({action: action, net: net, comment: comment || ''})});
+    const a = JSON.parse((await r.text()).trim().split('\\n').pop());
+    if (a.status === 'ok') { bo.className = 'ok'; bo.textContent = net + ': ' + a.note + ' — reloading…'; setTimeout(() => location.reload(), 900); }
+    else { bo.className = 'bad'; bo.textContent = 'Refused: ' + (a.reason || 'unknown answer'); }
+  } catch (e) { bo.className = 'bad'; bo.textContent = 'Request failed (check the address format): ' + e; }
+}
+document.getElementById('badd').addEventListener('click', () =>
+  change('add', document.getElementById('bnet').value.trim(), document.getElementById('bcom').value.trim()));
+document.querySelectorAll('button[data-remove]').forEach(b => b.addEventListener('click', () => {
+  if (confirm('Remove ' + b.dataset.remove + ' from the blocklist?')) change('remove', b.dataset.remove, '');
+}));
+</script>"""
+
+
+def page_blocklist():
+    if not os.path.exists(BLOCKLIST):
+        return "<h1>Blocked IPs</h1><div class=card>The blocklist is not enabled on this host (hardening_blocklist_enabled).</div>"
+    try:
+        entries = json.loads(subprocess.run([BLOCKLIST, "list"], capture_output=True, text=True).stdout or "[]")
+    except ValueError:
+        entries = []
+    rows = "".join(
+        "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%s</td></tr>" % (
+            esc(e["net"]), esc(e["source"]), esc(e.get("comment", "")), esc(e.get("by", "")),
+            esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("added", 0)))), e.get("packets", 0),
+            '<button data-remove="%s" style="padding:4px 10px">remove</button>' % esc(e["net"]) if e["source"] in ("portal", "auto")
+            else '<span class="muted">in hardening_blocked_sources</span>')
+        for e in sorted(entries, key=lambda e: -e.get("added", 0)))
+    inp = 'style="font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)"'
+    return ("<h1>Blocked IPs</h1>"
+            "<p class=muted>Sources dropped at the firewall for good (all ports, also the Docker-published ones). "
+            "Entries from Ansible (<code>hardening_blocked_sources</code>) are changed there; entries added here stay until "
+            "removed here; <b>auto</b> entries come from blocklist-auto (systematic attackers) — one removed here is never "
+            "added again. Refused automatically: private / tailnet ranges, this server, your fail2ban exceptions, the public "
+            "addresses of your tailnet devices, SSH sources of the last 30 days, networks broader than /16 (IPv6: /32).</p>"
+            '<div class=card><b>Block</b><p><input id=bnet placeholder="203.0.113.7 or 198.51.100.0/24" size=28 %s> '
+            '<input id=bcom placeholder="note (optional)" size=28 maxlength=120 %s> <button id=badd>Block</button></p>'
+            "<div id=bout></div></div>"
+            "<div class=card><table><tr><th>Network</th><th>Source</th><th>Note</th><th>By</th><th>Added</th>"
+            "<th>Dropped packets</th><th></th></tr>%s</table></div>"
+            % (inp, inp, rows or "<tr><td colspan=7 class=muted>no entries</td></tr>"))
+
+
+def cmd_blockpage():
+    sys.stdout.write(PAGE % {"title": "Blocked IPs", "host": esc(os.uname().nodename), "user": esc(requester()),
+                             "body": page_blocklist(), "script": BLOCKSCRIPT if os.path.exists(BLOCKLIST) else "",
+                             "cls": "wide"})
+    return 0
+
+
+def cmd_block(action, net, comment=""):
+    if action not in ("add", "remove") or not SAFE_NET.match(net) or not SAFE_COMMENT.match(comment):
+        print(json.dumps({"status": "refused", "reason": "invalid request"}))
+        return 1
+    if not os.path.exists(BLOCKLIST):
+        print(json.dumps({"status": "refused", "reason": "the blocklist is not enabled on this host"}))
+        return 1
+    args = [BLOCKLIST, "add", net, comment, requester()] if action == "add" else [BLOCKLIST, "remove", net, requester()]
+    r = subprocess.run(args, capture_output=True, text=True)
+    out = (r.stdout.strip().splitlines() or [""])[-1]
+    print(out if out.startswith("{") else json.dumps({"status": "refused", "reason": (r.stderr or out).strip()[:300]}))
+    return r.returncode
+
+
 def main(argv):
     if len(argv) == 4 and argv[1] == "request":
         return cmd_request(argv[2], argv[3])
@@ -1028,10 +1280,16 @@ def main(argv):
         return cmd_run(argv[2])
     if len(argv) == 2 and argv[1] == "status":
         return cmd_status()
+    if len(argv) == 2 and argv[1] == "expire":
+        return cmd_expire()
     if len(argv) in (3, 4) and argv[1] == "log":
         return cmd_log(argv[2], (argv[3:] + [""])[0])
     if len(argv) in (2, 3) and argv[1] == "logpage":
         return cmd_logpage((argv[2:] + [""])[0])
+    if len(argv) == 2 and argv[1] == "blockpage":
+        return cmd_blockpage()
+    if len(argv) in (4, 5) and argv[1] == "block":
+        return cmd_block(*argv[2:5])
     if len(argv) in (2, 3, 4) and argv[1] == "page":
         return cmd_page(*(argv[2:] + ["", ""])[:2])
     print("usage: app-upgrade request <service> <version> | run <service>:<version> | status | "

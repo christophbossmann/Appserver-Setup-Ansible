@@ -287,6 +287,16 @@
   when: hardening_fail2ban_caddy_immich_enabled | default(false)
   notify: Restart Fail2Ban
 
+- name: Deploy Caddy/ntfy login fail2ban filter
+  ansible.builtin.template:
+    src: filter-caddy-ntfy.conf.j2
+    dest: /etc/fail2ban/filter.d/caddy-ntfy.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: hardening_fail2ban_caddy_ntfy_enabled | default(false)
+  notify: Restart Fail2Ban
+
 - name: Configure Fail2Ban jail
   ansible.builtin.template:
     src: jail.local.j2
@@ -484,12 +494,195 @@
       register: _spamhaus_fill
       changed_when: "'FILLED' in _spamhaus_fill.stdout"
 
+# --- Own blocklist (see defaults): ipsets first, then the UFW rules that use them ----------
+- name: Own blocklist
+  when: hardening_blocklist_enabled | default(true) | bool
+  block:
+    - name: Install ipset (blocklist)
+      ansible.builtin.apt:
+        name: ipset
+        state: present
+
+    - name: Install the blocklist script
+      ansible.builtin.copy:
+        src: blocklist
+        dest: /usr/local/sbin/blocklist
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Blocklist config directory
+      ansible.builtin.file:
+        path: /etc/blocklist
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Protected ranges the blocklist refuses (fail2ban ignoreip, full-access ranges)
+      ansible.builtin.copy:
+        dest: /etc/blocklist/protected.txt
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/hardening) — never accepted on the blocklist
+          {% for r in (hardening_fail2ban_ignoreip | default([])) + ((hardening_ufw_full_access_ranges | default([])) | map(attribute='from_ip') | select('defined') | list) %}
+          {{ r }}
+          {% endfor %}
+
+    - name: Blocklist ipset unit (restore before ufw at boot)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/blocklist-ipset.service
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/hardening). Creates/restores the blocklist ipsets BEFORE ufw
+          # starts — ufw's rule files reference them and would fail to load without them.
+          [Unit]
+          Description=Own blocklist ipsets (restore before ufw)
+          DefaultDependencies=no
+          After=local-fs.target
+          Before=network-pre.target ufw.service
+          Wants=network-pre.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/blocklist restore
+
+          [Install]
+          WantedBy=multi-user.target ufw.service
+      register: _blocklist_unit
+
+    - name: Create/restore the blocklist ipsets now and at every boot
+      ansible.builtin.systemd:
+        name: blocklist-ipset.service
+        enabled: true
+        state: started
+        daemon_reload: "{{ _blocklist_unit.changed }}"
+      when: not ansible_check_mode
+
+    - name: Ansible's own entries = hardening_blocked_sources (a set; portal entries untouched)
+      ansible.builtin.command:
+        argv: "{{ ['/usr/local/sbin/blocklist', 'sync'] + (hardening_blocked_sources | map('string') | list) }}"
+      register: _blocklist_sync
+      changed_when: "'CHANGED' in _blocklist_sync.stdout"
+      when: not ansible_check_mode
+
+# ctstate NEW: only connections FROM a blocked source are dropped — replies to connections the
+# server opens itself pass (an auto-blocked data-centre /24 may share a provider with the Storage
+# Box, a registry or an API this host talks to).
+- name: Automatic blocking of systematic attackers (blocklist-auto)
+  when:
+    - hardening_blocklist_enabled | default(true) | bool
+    - hardening_blocklist_auto_enabled | default(false) | bool
+  block:
+    - name: Install blocklist-auto
+      ansible.builtin.copy:
+        src: blocklist-auto
+        dest: /usr/local/sbin/blocklist-auto
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: blocklist-auto settings
+      ansible.builtin.copy:
+        dest: /etc/blocklist/auto.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: "{{ hardening_blocklist_auto | combine({'enabled': true, 'dry_run': hardening_blocklist_auto_dry_run | bool}) | to_nice_json }}\n"
+
+    - name: AbuseIPDB key for blocklist-auto (root only; removed when unset)
+      ansible.builtin.copy:
+        dest: /etc/blocklist/abuseipdb.key
+        content: "{{ hardening_abuseipdb_api_key }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      when: hardening_abuseipdb_api_key | length > 0
+
+    - name: No AbuseIPDB key -> no key file
+      ansible.builtin.file:
+        path: /etc/blocklist/abuseipdb.key
+        state: absent
+      when: hardening_abuseipdb_api_key | length == 0
+
+    - name: blocklist-auto service + timer (hourly)
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/blocklist-auto.{{ item.ext }}"
+        mode: "0644"
+        content: "{{ item.content }}"
+      loop:
+        - ext: service
+          content: |
+            # Managed by Ansible (roles/hardening)
+            [Unit]
+            Description=Put systematic attackers on the own blocklist
+            After=network-online.target
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/blocklist-auto
+            Nice=10
+            IOSchedulingClass=idle
+        - ext: timer
+          content: |
+            # Managed by Ansible (roles/hardening)
+            [Unit]
+            Description=Put systematic attackers on the own blocklist (hourly)
+
+            [Timer]
+            OnCalendar=hourly
+            RandomizedDelaySec=5min
+            Persistent=true
+
+            [Install]
+            WantedBy=timers.target
+      loop_control: { label: "blocklist-auto.{{ item.ext }}" }
+      register: _bla_units
+
+    - name: Enable blocklist-auto
+      ansible.builtin.systemd:
+        name: blocklist-auto.timer
+        enabled: true
+        state: started
+        daemon_reload: "{{ _bla_units.changed }}"
+      when: not ansible_check_mode
+
+- name: Switch blocklist-auto off where it is disabled
+  ansible.builtin.systemd:
+    name: blocklist-auto.timer
+    enabled: false
+    state: stopped
+  failed_when: false
+  when:
+    - not (hardening_blocklist_auto_enabled | default(false) | bool)
+    - not ansible_check_mode
+
+- name: Drop (and log, rate-limited) own blocklist sources at the start of UFW's input chains
+  ansible.builtin.blockinfile:
+    path: "/etc/ufw/{{ item.file }}"
+    marker: "# {mark} OWN BLOCKLIST"
+    insertafter: "^# End required lines"
+    block: |
+      -A {{ item.chain }} -m set --match-set {{ item.set }} src ! --update-counters -m conntrack --ctstate NEW -m limit --limit {{ hardening_drop_log_limit }} -j LOG --log-prefix "[BLOCKLIST DROP] "
+      -A {{ item.chain }} -m set --match-set {{ item.set }} src -m conntrack --ctstate NEW -j DROP
+  loop:
+    - { file: before.rules, chain: ufw-before-input, set: blocklist4 }
+    - { file: before6.rules, chain: ufw6-before-input, set: blocklist6 }
+  loop_control: { label: "{{ item.file }}" }
+  when: hardening_blocklist_enabled | default(true) | bool
+  notify: Reload UFW
+
 - name: Drop Spamhaus DROP sources at the start of UFW's input chains (v4 + v6)
   ansible.builtin.blockinfile:
     path: "/etc/ufw/{{ item.file }}"
     marker: "# {mark} SPAMHAUS DROP"
     insertafter: "^# End required lines"
     block: |
+      -A {{ item.chain }} -m set --match-set {{ item.set }} src -m limit --limit {{ hardening_drop_log_limit }} -j LOG --log-prefix "[SPAMHAUS DROP] "
       -A {{ item.chain }} -m set --match-set {{ item.set }} src -j DROP
   loop:
     # NB: the IPv6 file names its chains ufw6-*, not ufw-*
@@ -508,6 +701,9 @@
       :DOCKER-USER - [0:0]
       {% if hardening_spamhaus_drop_enabled | default(false) | bool %}
       -A DOCKER-USER -m set --match-set spamhaus-drop4 src -j DROP
+      {% endif %}
+      {% if hardening_blocklist_enabled | default(true) | bool %}
+      -A DOCKER-USER -m set --match-set blocklist4 src -m conntrack --ctstate NEW -j DROP
       {% endif %}
       -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
       {% for item in hardening_ufw_full_access_ranges | default([]) %}

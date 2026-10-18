@@ -15,3 +15,6 @@ providers:
     allowUiUpdates: true
     options:
       path: /etc/grafana/provisioning/dashboards/json
+      # a subdirectory = a Grafana folder (json/Alerting/ -> next to the alert rules);
+      # files directly in json/ stay at the top level
+      foldersFromFilesStructure: true

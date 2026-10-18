@@ -29,6 +29,7 @@ local_upgrade_services:
   - prometheus
   - node_exporter
   - blackbox_exporter
+  - ntfy                   # alert push (only where monitoring_alerting_enabled)
   - postgres_exporter
   - cadvisor
   - dozzle

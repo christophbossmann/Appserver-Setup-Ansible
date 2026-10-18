@@ -10,3 +10,15 @@ shell_type = unix
 # Hetzner Storage Box provides these checksum helpers; lets rclone verify without reading.
 md5sum_command = md5 -r
 sha1sum_command = sha1 -r
+{% for c in storagebox_crypt_remotes | default([]) %}
+
+# Encrypted folder on the box (contents encrypted, names readable: *.bin). The two passwords
+# live in the vault (+ a second safe place) — without BOTH the data is lost.
+[{{ c.name }}]
+type = crypt
+remote = {{ storagebox_remote_name }}:{{ c.path }}
+filename_encryption = {{ c.filename_encryption | default('off') }}
+directory_name_encryption = {{ c.directory_name_encryption | default('false') }}
+password = {{ _sb_crypt_obscured[c.name].password }}
+password2 = {{ _sb_crypt_obscured[c.name].password2 }}
+{% endfor %}

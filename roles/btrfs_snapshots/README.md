@@ -1,7 +1,8 @@
 # btrfs_snapshots
 
-Takes **deploy-time checkpoint snapshots** (`ans_before_hardening`, `ans_after_hardening`,
-`ans_after_ansible`) via **snapper** on a host that is **already prepared** for btrfs
+Takes **deploy-time snapshots** — `ans_pre_run` at the start of every `server-all.yml` run
+(the newest `btrfs_pre_run_keep`, default 5, are kept) plus the one-time anchors
+`ans_pre_setup` / `ans_subvols_ready` / `ans_after_ansible` (after the first complete run) via **snapper** on a host that is **already prepared** for btrfs
 snapshots. It does **not** set anything up — no filesystem conversion, no snapper install,
 no grub-btrfs. That one-time foundation (the `@`-layout + snapper + grub-btrfs, which needs
 a reboot and is a one-way migration) is done **outside Ansible** by

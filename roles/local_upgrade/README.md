@@ -44,6 +44,26 @@ forward-auth, admins only (so the SSO's MFA applies).
 It is not a web application: `webhook` runs `app-upgrade` once per request and returns its
 output. Nothing listens besides `webhook` on `127.0.0.1`.
 
+## Late rollback
+
+For 72 hours after an upgrade the overview shows "roll back to <previous version> (until …)"
+next to the service. The confirm page says what goes back and what is lost — for Immich and
+Nextcloud that both apps' data since the upgrade goes back, because they share one database
+instance — and asks you to type `<service> rollback`. It runs
+`playbooks/upgrade-rollback.yml` (see playbooks/README.md); `app-upgrade expire`
+(hourly, `app-upgrade-expire.timer`) cleans up when the window is over.
+
+## Blocked IPs
+
+`/hooks/blocklist` lists the own firewall blocklist (roles/hardening, `blocklist`) and adds or
+removes entries — all ports, also the Docker-published ones. Entries from
+`hardening_blocked_sources` are managed by Ansible (shown, not removable here); entries added on
+the page stay until removed on the page. The `blocklist` script refuses private / tailnet
+ranges, this server, the fail2ban exceptions, the public addresses of the tailnet's devices, SSH
+sources of the last 30 days and networks broader than /16 (IPv6 /32). Changes go through
+`POST /hooks/blocklist-change` with the same Origin rule as upgrades. The Security dashboard
+shows the list ("Blocked IPs") and the sources Spamhaus DROP and the blocklist drop.
+
 ## The snapshot page
 
 `https://upgrade.<internal domain>/hooks/snapshots` (link in the page header) lists the btrfs

@@ -1,0 +1,64 @@
+---
+# Dead man's switch at healthchecks.io: the host reports in, healthchecks.io alarms when it
+# stops. This is the one alarm that still works when the server itself is gone — everything
+# that runs on the server (Grafana alerting) dies with it.
+#
+#   heartbeat  a timer pings every healthchecks_heartbeat_minutes — silence = host down,
+#              hung, or offline
+#   jobs       every scheduled job in healthchecks_jobs whose timer is enabled on the host
+#              reports when it finishes (success, or /fail) — silence = it never ran
+#
+# The checks themselves are declared here and created/updated through the healthchecks.io
+# API from the controller (name, schedule, grace); checks tagged for this host that are no
+# longer wanted are deleted. Notifications (ntfy, ...) are set up once in the healthchecks.io
+# UI as integrations — every check gets all of the project's integrations.
+#
+# Secrets (vault): vault_healthchecks_api_key  read-write API key of the project (controller only)
+#                  vault_healthchecks_ping_key project ping key (lands on the host, root-only)
+# Nothing but "this check pinged" and the host's IP reaches healthchecks.io.
+# HOST-GATED: off unless healthchecks_enabled is set in host_vars.
+healthchecks_enabled: false
+
+healthchecks_api_url: https://healthchecks.io/api/v3
+healthchecks_ping_url: https://hc-ping.com
+healthchecks_api_key: "{{ vault_healthchecks_api_key | default('') }}"
+healthchecks_ping_key: "{{ vault_healthchecks_ping_key | default('') }}"
+# Optional: Prometheus scrapes the project's status for the "Alerts overview" dashboard
+# (roles/monitoring). Project UUID = the part after /projects/ in the address bar of the
+# project's check list; key = a READ-ONLY API key (Settings -> API Access).
+healthchecks_project_uuid: ""
+healthchecks_readonly_key: "{{ vault_healthchecks_readonly_key | default('') }}"
+
+# Prefix of this host's check slugs (prod-heartbeat, prod-pitr-basebackup, ...) and its tag.
+healthchecks_prefix: "{{ inventory_hostname | lower }}"
+
+healthchecks_heartbeat_minutes: 15
+healthchecks_heartbeat_grace_minutes: 15
+
+# slug (without prefix) / systemd unit (without .service) / schedule = the timer's OnCalendar
+# (healthchecks.io understands it directly) / grace in minutes. Jobs whose timer is not
+# enabled on the host are skipped (and their check deleted).
+# Grace = how long after the scheduled time a missing report becomes an alarm (a failing job
+# reports /fail at once). Sized from measured runs on PROD (Oct 2026) plus the timers' random
+# delay (storagebox: up to 10 min): pitr ~20 s, snapshot-metrics ~6 min, trivy ~3 min,
+# thumbs ~1-5 min (longer after big imports), dumps ~30 s per set.
+healthchecks_jobs:
+  - { slug: pitr-basebackup, unit: pg-pitr-backup, schedule: "{{ postgres_pitr_basebackup_oncalendar | default('daily') }}", grace: 30,
+      desc: "PITR base backup + retention (pg-pitr-backup)" }
+  - { slug: snapshot-metrics, unit: snapshot-metrics, schedule: "{{ monitoring_snapshot_metrics_oncalendar | default('daily') }}", grace: 45,
+      desc: "Nightly snapshot size measurement" }
+  - { slug: trivy-scan, unit: trivy-metrics, schedule: "{{ monitoring_trivy_oncalendar | default('daily') }}", grace: 60,
+      desc: "Nightly vulnerability scan of the running images" }
+  - { slug: storagebox-thumbs, unit: storagebox-backup-thumbs, schedule: "{{ storagebox_backup_thumbs_oncalendar | default('daily') }}", grace: 90,
+      desc: "Immich thumbnails mirrored to the Storage Box" }
+  # runs daily; the script itself dumps only every few days — the check says it ran without error
+  - { slug: storagebox-dumps, unit: storagebox-backup-dumps, schedule: "{{ storagebox_backup_dumps_oncalendar | default('daily') }}", grace: 60,
+      desc: "Database dumps to the Storage Box (daily run, dumps every few days)" }
+
+# Further checks pinged by something other than a job unit (timeout/grace in minutes). With
+# Grafana alerting on (roles/monitoring), its always-firing Watchdog pings every 5 min while
+# the whole alerting path works.
+healthchecks_extra_checks: >-
+  {{ [{'slug': 'grafana-watchdog', 'timeout': 15, 'grace': 15,
+       'desc': 'Grafana alerting path alive (Grafana evaluates, Prometheus answers, ntfy reachable)'}]
+     if (monitoring_alerting_enabled | default(false) | bool) else [] }}

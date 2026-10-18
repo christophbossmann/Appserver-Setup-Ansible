@@ -229,13 +229,14 @@ Dedicated roles:
 
 | Role | What it does |
 |------|--------------|
-| `hardening` | UFW, Fail2Ban, SSH hardening, unattended-upgrades, swap, Docker/UFW compat, clock-sync gate, auto-rollback safety window |
+| `hardening` | UFW, Fail2Ban, SSH hardening, unattended-upgrades, swap, Docker/UFW compat, clock-sync gate, auto-rollback safety window, Spamhaus DROP and an own blocklist (`hardening_blocked_sources` + the portal's "Blocked IPs" page; refuses anything that could lock you out) |
 | `users` | Human users (name from `admin_user`), SSH keys, sudo policy |
 | `docker` | Docker CE + Compose plugin; `docker_users` group membership |
 | `tailscale` | Tailscale VPN with identity backup/restore |
 | `compose_stack` | Generic deployer for everything under `stacks/` |
 | `n8n` | n8n workflow engine, reverse-proxy env, WebDAV brain access, agent dirs |
-| `monitoring` | Prometheus + Grafana with provisioned datasource/dashboards; host-side collectors incl. a nightly vulnerability scan of the running images (trivy) that also reports which newer version would fix what, and a snapshot overview with the space each btrfs snapshot would free |
+| `monitoring` | Prometheus + Grafana with provisioned datasource/dashboards; host-side collectors incl. a nightly vulnerability scan of the running images (trivy) that also reports which newer version would fix what, and a snapshot overview with the space each btrfs snapshot would free; optional alerting (Grafana rules -> self-hosted ntfy -> phone app, see [Alerting](#alerting)) |
+| `healthchecks` | Dead man's switch at healthchecks.io: heartbeat + a report from every scheduled job — the alarm that still works when the server is gone |
 | `local_upgrade` | Upgrades started **on the server itself** from a login-protected page — no controller, no third party holding keys; the same page lists the btrfs snapshots and can delete them or roll a volume back ([README](roles/local_upgrade/README.md)) |
 | `postgres_pitr` | WAL archiving + daily base backups (point-in-time recovery) per postgres instance |
 | `storagebox` | Hetzner Storage Box mounted via rclone (large immich originals live there) |
@@ -278,6 +279,36 @@ controller, or, with `roles/local_upgrade`, from a page on the server itself.
 
 ---
 
+## Alerting
+
+Two paths, because one of them must work when the server itself is gone:
+
+- **From the outside — `roles/healthchecks`.** The host pings healthchecks.io: a heartbeat
+  every 15 minutes, and every scheduled job (PITR base backup, Storage Box backups, trivy,
+  snapshot measurement) when it finishes, with success or failure. Silence or a failure ->
+  healthchecks.io alarms through the notification channels set up in its UI (e.g. ntfy.sh).
+  The checks are created through its API from the controller (`vault_healthchecks_api_key`,
+  never on the host); only the ping key lands on the host.
+- **From the inside — Grafana alerting (`monitoring_alerting_enabled`).** Rules provisioned
+  from `roles/monitoring/templates/alerting.yml.j2`: services/containers down (a configurable
+  list is critical, the rest warning), disk, memory, certificates, PITR, Storage Box backups,
+  failed jobs, restart loops, failed upgrades, plus daily hints (fixable vulnerabilities, old
+  images, unattributed disk space). Critical goes out immediately, warnings are held at night,
+  hints come in the morning — to a self-hosted **ntfy** (own container, own network, no root,
+  deny-all with declared users, fail2ban on its login) and from there to the phone app.
+- **The link between them:** an always-firing Watchdog rule pings healthchecks.io only while
+  Grafana evaluates, Prometheus answers and ntfy is reachable from outside — a broken
+  alerting path is alarmed like a dead server.
+
+All thresholds, quiet hours and the critical list are variables (`monitoring_alert_*`,
+`roles/monitoring/defaults/main.yml`). The **"Alerts overview"** dashboard (folder Alerting)
+puts both in one place: what fires now, when each rule last fired, every rule's last/next
+evaluation, and every healthchecks.io check with its last ping and when the next is due.
+It reads Grafana's API as a Viewer service account and healthchecks.io with a read-only key
+(`vault_healthchecks_readonly_key`) — never with credentials that can change anything.
+
+---
+
 ## Secrets
 
 Every secret is a `vault_*` variable in `group_vars/all/vault.yml` of the private config dir (`../ansible-private`) — consumers
@@ -299,6 +330,25 @@ Notes:
   stored credentials are lost on a rebuild.
 - Generate strong secrets with `openssl rand -hex 32`; basic-auth hashes with
   `caddy hash-password`.
+- **Storage Box encryption (rclone crypt):** the vault holds the two keys in **plaintext**
+  (`vault_storagebox_crypt_password`, `vault_storagebox_crypt_salt`). An `rclone.conf`
+  never takes plaintext there: `password =` / `password2 =` expect the *obscured* form.
+  `rclone obscure` adds 16 random bytes, so the result is longer (a 30-character key
+  becomes 62 characters) and different on every call — every variant works, because
+  `rclone reveal` turns each one back into the same key. Obscuring is only an encoding
+  (the key is in rclone's source), not protection: treat the obscured value as secret.
+  The role obscures once and keeps the existing string as long as it reveals to the vault
+  value. For another machine (e.g. a Windows client with WinFsp):
+
+  ```bash
+  rclone obscure '<vault_storagebox_crypt_password>'   # -> password  = ...
+  rclone obscure '<vault_storagebox_crypt_salt>'       # -> password2 = ...
+  rclone reveal  '<obscured value>'                    # check: prints the vault value again
+  ```
+
+  Or run `rclone config` interactively — it asks for the plaintext and obscures it itself.
+  Pasting the plaintext straight into `rclone.conf` does not fail loudly: rclone "reveals"
+  it into a wrong key and file names come out as garbage.
 
 ---
 

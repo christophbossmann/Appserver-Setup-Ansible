@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+# Managed by Ansible (roles/hardening). Own blocklist: sources dropped at the firewall for good.
+#
+#   blocklist restore                     create the ipsets and load the saved entries — runs
+#                                         BEFORE ufw at boot (blocklist-ipset.service)
+#   blocklist sync <net>...               make the Ansible-managed entries exactly these
+#                                         (hardening_blocked_sources): add missing, drop the
+#                                         Ansible entries no longer listed; others untouched
+#   blocklist add <net> [comment] [by]    add one entry (the upgrade portal's "Blocked IPs")
+#   blocklist auto-add <net> <comment>    add an entry found by blocklist-auto (source "auto";
+#                                         refused if it was removed by hand before)
+#   blocklist remove <net> [by]           remove a portal or auto entry (Ansible entries are
+#                                         removed from the variable instead; a removed auto entry
+#                                         is remembered so blocklist-auto never adds it again)
+#   blocklist expire <net>                release an auto entry found harmless (blocklist-auto;
+#                                         no "never again" — it may come back if it attacks again)
+#   blocklist check <net>                 would it be accepted? (exit 0 / message + exit 1)
+#   blocklist list                        the entries as JSON (with dropped packets)
+#   blocklist metrics                     write the node_exporter textfile (security-metrics
+#                                         calls it every minute)
+#
+# Sets: blocklist4 / blocklist6 (hash:net, with per-entry packet counters). The DROP rules live
+# in UFW's rule files (before.rules / before6.rules / after.rules DOCKER-USER), like Spamhaus.
+#
+# An entry is REFUSED when it could lock the owner out or is a mistake: private / reserved /
+# CGNAT (tailnet) ranges, this server's own addresses, the protected ranges Ansible writes to
+# /etc/blocklist/protected.txt (fail2ban ignoreip, full-access ranges), the public addresses of
+# the tailnet's devices, the source of any current SSH connection or of an SSH login in the
+# last 30 days, and networks broader than /16 (IPv4) or /32 (IPv6).
+import fcntl, ipaddress, json, os, re, subprocess, sys, time
+
+STATE = "/var/lib/blocklist/entries.json"
+PROTECTED = "/etc/blocklist/protected.txt"
+METRICS = "/var/lib/node_exporter/textfile/blocklist.prom"
+LOCK = "/run/blocklist.lock"
+REMOVED = "/var/lib/blocklist/auto-removed.json"     # auto entries removed by hand: never again
+SETS = {4: ("blocklist4", "inet"), 6: ("blocklist6", "inet6")}
+MIN_PREFIX = {4: 16, 6: 32}
+SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._:/@+,()#-]")
+
+
+class Refused(Exception):
+    pass
+
+
+def run(cmd, stdin=None):
+    return subprocess.run(cmd, input=stdin, text=True, capture_output=True)
+
+
+def ipset(*args, stdin=None):
+    return run(["ipset", *args], stdin=stdin)
+
+
+def load():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def save(entries):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(entries, f, indent=1)
+    os.replace(STATE + ".tmp", STATE)
+
+
+def net(text):
+    try:
+        return ipaddress.ip_network(text.strip(), strict=False)
+    except ValueError:
+        raise Refused("not an IP address or network: %r" % text[:60])
+
+
+# --- what must never be blocked -----------------------------------------------------------
+def own_addresses():
+    out = run(["ip", "-o", "addr", "show"]).stdout
+    return [ipaddress.ip_interface(m).ip for m in re.findall(r"inet6? (\S+)", out)]
+
+
+def tailnet_endpoints():
+    """Public addresses the tailnet's devices currently come from (tailscale status)."""
+    try:
+        st = json.loads(run(["tailscale", "status", "--json"]).stdout or "{}")
+    except ValueError:
+        return []
+    ips = []
+    for peer in (st.get("Peer") or {}).values():
+        for a in (peer.get("Addrs") or []) + [peer.get("CurAddr") or ""]:
+            host = a.rsplit(":", 1)[0].strip("[]") if a else ""
+            try:
+                ips.append(ipaddress.ip_address(host))
+            except ValueError:
+                pass
+    return ips
+
+
+def ssh_sources():
+    """Sources of current SSH connections and of accepted SSH logins in the last 30 days."""
+    ips = []
+    for line in run(["ss", "-Htn", "state", "established", "( sport = :22 )"]).stdout.splitlines():
+        peer = line.split()[-1] if line.split() else ""
+        try:
+            ips.append(ipaddress.ip_address(peer.rsplit(":", 1)[0].strip("[]").replace("::ffff:", "")))
+        except ValueError:
+            pass
+    log = run(["journalctl", "-u", "ssh", "--since", "-30d", "--grep", "Accepted ", "-o", "cat", "--no-pager"]).stdout
+    for m in re.findall(r"Accepted \S+ for \S+ from (\S+)", log):
+        try:
+            ips.append(ipaddress.ip_address(m))
+        except ValueError:
+            pass
+    return ips
+
+
+def protected_ranges():
+    out = []
+    try:
+        for line in open(PROTECTED):
+            line = line.split("#")[0].strip()
+            if line:
+                try:
+                    out.append(ipaddress.ip_network(line, strict=False))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def check(n):
+    if n.prefixlen < MIN_PREFIX[n.version]:
+        raise Refused("%s is too broad (at most /%d for IPv%d)" % (n, MIN_PREFIX[n.version], n.version))
+    first = n.network_address
+    if (first.is_private or first.is_loopback or first.is_link_local or first.is_multicast or first.is_reserved
+            or first.is_unspecified or n.overlaps(ipaddress.ip_network("100.64.0.0/10") if n.version == 4 else
+                                                  ipaddress.ip_network("fd7a:115c:a1e0::/48"))):
+        raise Refused("%s is a private / reserved / tailnet range — never blocked here" % n)
+    for r in protected_ranges():
+        if r.version == n.version and n.overlaps(r):
+            raise Refused("%s overlaps the protected range %s (fail2ban ignoreip / full-access ranges)" % (n, r))
+    for why, ips in (("this server's own address", own_addresses()),
+                     ("the public address of a tailnet device", tailnet_endpoints()),
+                     ("the source of an SSH connection / login of the last 30 days", ssh_sources())):
+        for ip in ips:
+            if ip.version == n.version and ip in n:
+                raise Refused("%s contains %s — %s (blocking it could lock you out)" % (n, ip, why))
+
+
+# --- ipsets ---------------------------------------------------------------------------------
+def ensure_sets():
+    for name, family in SETS.values():
+        ipset("create", name, "hash:net", "family", family, "counters", "-exist")
+
+
+def apply(entries):
+    """Load the entries into fresh sets and swap them in (atomic for the firewall)."""
+    ensure_sets()
+    for v, (name, family) in SETS.items():
+        tmp = name + "-tmp"
+        ipset("destroy", tmp)
+        lines = ["create %s hash:net family %s counters" % (tmp, family)]
+        lines += ["add %s %s -exist" % (tmp, e["net"]) for e in entries if net(e["net"]).version == v]
+        r = ipset("restore", stdin="\n".join(lines) + "\n")
+        if r.returncode != 0:
+            ipset("destroy", tmp)
+            raise RuntimeError("ipset restore %s: %s" % (tmp, r.stderr.strip()))
+        ipset("swap", tmp, name)
+        ipset("destroy", tmp)
+
+
+def update(entries):
+    """Bring the live sets to the entries one member at a time — unlike apply() this keeps the
+    per-entry packet counters of everything that stays."""
+    ensure_sets()
+    for v, (name, _) in SETS.items():
+        live = set(re.findall(r"^(\S+) packets", ipset("list", name).stdout, re.M))
+        want = {str(net(e["net"])) for e in entries if net(e["net"]).version == v}
+        for n in sorted(want - live):
+            ipset("add", name, n, "-exist")
+        for n in sorted(live - want):
+            ipset("del", name, n, "-exist")
+
+
+def packets():
+    out = {}
+    for name, _ in SETS.values():
+        for m in re.finditer(r"^(\S+) packets (\d+)", ipset("list", name).stdout, re.M):
+            out[m.group(1)] = int(m.group(2))
+    return out
+
+
+def write_metrics(entries):
+    if not os.path.isdir(os.path.dirname(METRICS)):
+        return
+    esc = lambda s: str(s).replace("\\", "\\\\").replace('"', '\\"')
+    pk = packets()
+    lines = ["# HELP blocklist_entry_added_timestamp_seconds Own blocklist: one series per entry (when it was added)",
+             "# TYPE blocklist_entry_added_timestamp_seconds gauge"]
+    lines += ['blocklist_entry_added_timestamp_seconds{net="%s",source="%s",comment="%s",by="%s"} %d'
+              % (esc(e["net"]), esc(e["source"]), esc(e.get("comment", "")), esc(e.get("by", "")), e.get("added", 0))
+              for e in entries]
+    lines += ["# HELP blocklist_entry_packets Packets dropped per entry since the set was last loaded",
+              "# TYPE blocklist_entry_packets gauge"]
+    lines += ['blocklist_entry_packets{net="%s"} %d' % (esc(e["net"]), pk.get(e["net"], 0)) for e in entries]
+    lines += ["# TYPE blocklist_entries gauge", "blocklist_entries %d" % len(entries)]
+    with open(METRICS + ".tmp", "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(METRICS + ".tmp", 0o644)
+    os.replace(METRICS + ".tmp", METRICS)
+
+
+def changed(entries):
+    save(entries)
+    update(entries)
+    write_metrics(entries)
+
+
+# --- commands -------------------------------------------------------------------------------
+def cmd_sync(nets):
+    wanted = []
+    for t in nets:
+        n = net(t)
+        check(n)
+        wanted.append(str(n))
+    entries = load()
+    have = {e["net"] for e in entries}
+    keep = [e for e in entries if e["source"] != "ansible" or e["net"] in wanted]
+    add = [{"net": n, "source": "ansible", "comment": "hardening_blocked_sources", "by": "ansible",
+            "added": int(time.time())} for n in dict.fromkeys(wanted) if n not in have]
+    new = keep + add
+    if new != entries or not os.path.exists(STATE):
+        changed(new)
+        print("CHANGED: +%d -%d" % (len(add), len(entries) - len(keep)))
+    else:
+        update(new)      # make sure the live sets match the file (keeps the counters)
+        print("unchanged: %d entries" % len(new))
+
+
+def cmd_add(text, comment="", by=""):
+    n = net(text)
+    check(n)
+    entries = load()
+    if any(e["net"] == str(n) for e in entries):
+        print(json.dumps({"status": "ok", "net": str(n), "note": "already on the list"}))
+        return 0
+    entries.append({"net": str(n), "source": "portal", "comment": SAFE_TEXT.sub("", comment)[:120],
+                    "by": SAFE_TEXT.sub("", by)[:60] or "local", "added": int(time.time())})
+    changed(entries)
+    print(json.dumps({"status": "ok", "net": str(n), "note": "blocked"}))
+    return 0
+
+
+def removed_auto():
+    try:
+        with open(REMOVED) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def cmd_auto_add(text, comment):
+    n = net(text)
+    if any(n.overlaps(ipaddress.ip_network(r)) for r in removed_auto()):
+        raise Refused("%s was removed by hand before — not added again" % n)
+    check(n)
+    entries = load()
+    if any(e["net"] == str(n) for e in entries):
+        print(json.dumps({"status": "ok", "net": str(n), "note": "already on the list"}))
+        return 0
+    entries.append({"net": str(n), "source": "auto", "comment": SAFE_TEXT.sub("", comment)[:160],
+                    "by": "blocklist-auto", "added": int(time.time())})
+    changed(entries)
+    print(json.dumps({"status": "ok", "net": str(n), "note": "blocked"}))
+    return 0
+
+
+def cmd_remove(text, by=""):
+    n = str(net(text))
+    entries = load()
+    e = next((e for e in entries if e["net"] == n), None)
+    if not e:
+        raise Refused("%s is not on the list" % n)
+    if e["source"] == "ansible":
+        raise Refused("%s comes from hardening_blocked_sources — remove it there (and run Ansible)" % n)
+    if e["source"] == "auto":
+        rem = removed_auto()
+        if n not in rem:
+            os.makedirs(os.path.dirname(REMOVED), exist_ok=True)
+            with open(REMOVED + ".tmp", "w") as f:
+                json.dump(rem + [n], f)
+            os.replace(REMOVED + ".tmp", REMOVED)
+    changed([x for x in entries if x["net"] != n])
+    print(json.dumps({"status": "ok", "net": n, "note": "removed"}))
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__ if __doc__ else "usage: see the header of this file", file=sys.stderr)
+        return 2
+    cmd, args = argv[1], argv[2:]
+    if cmd == "restore":
+        ensure_sets()
+        apply(load())
+        write_metrics(load())
+        return 0
+    if cmd == "list":
+        pk = packets()
+        print(json.dumps([dict(e, packets=pk.get(e["net"], 0)) for e in load()]))
+        return 0
+    if cmd == "metrics":
+        write_metrics(load())
+        return 0
+    lock = open(LOCK, "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        if cmd == "sync":
+            cmd_sync(args)
+            return 0
+        if cmd == "check" and len(args) == 1:
+            check(net(args[0]))
+            print("ok")
+            return 0
+        if cmd == "add" and 1 <= len(args) <= 3:
+            return cmd_add(*args)
+        if cmd == "remove" and 1 <= len(args) <= 2:
+            return cmd_remove(*args)
+        if cmd == "auto-add" and len(args) == 2:
+            return cmd_auto_add(*args)
+        if cmd == "expire" and len(args) == 1:
+            n = str(net(args[0]))
+            entries = load()
+            if not any(e["net"] == n and e["source"] == "auto" for e in entries):
+                raise Refused("%s is not an auto entry" % n)
+            changed([e for e in entries if e["net"] != n])
+            print("released %s" % n)
+            return 0
+    except Refused as e:
+        if cmd in ("add", "remove", "auto-add"):
+            print(json.dumps({"status": "refused", "reason": str(e)}))
+        else:
+            print("REFUSED: %s" % e, file=sys.stderr)
+        return 1
+    print("usage: blocklist restore | sync <net>... | add <net> [comment] [by] | auto-add <net> <comment> | remove <net> [by] | "
+          "check <net> | list | metrics", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

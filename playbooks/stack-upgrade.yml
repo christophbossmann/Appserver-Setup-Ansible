@@ -123,14 +123,31 @@
             rec_previous: "{{ _old_value }}"
           when: not (force_rollback | default(false) | bool)
 
-        - name: Drop the pre-upgrade state copy (upgrade kept)
+        - name: Record the late rollback ({{ rollback_window_hours | default(72) }} h)
+          ansible.builtin.include_tasks: tasks/rollback_record.yml
+          vars:
+            rb_service: "{{ upgrade_service }}"
+            rb_from: "{{ _old_value }}"
+            rb_to: "{{ _new_value }}"
+            rb_var: "{{ _svc.var }}"
+            rb_file: "{{ _svc.file }}"
+            rb_anchor: ""
+            rb_pitr: ""
+            rb_snapshots: {}
+            rb_state_paths: "{{ _svc.state_paths | default([]) }}"
+            rb_stamp: "{{ _stamp }}"
+          when: not (force_rollback | default(false) | bool)
+
+        # Kept for the late rollback (upgrade-rollback.yml); `app-upgrade expire` removes it when
+        # the window is over. Dropped right away only with the late rollback switched off.
+        - name: Drop the pre-upgrade state copy (late rollback off)
           ansible.builtin.file:
             path: "{{ item }}.pre-upgrade-{{ _stamp }}"
             state: absent
           loop: "{{ _svc.state_paths | default([]) }}"
           when:
             - not (force_rollback | default(false) | bool)
-            - not (upgrade_keep_old | default(false) | bool)
+            - (rollback_window_hours | default(72) | int) == 0
 
         # ---- force_rollback DRILL: undo the (successful) upgrade on purpose ----------------
         - name: force_rollback — roll the just-upgraded service back (drill)

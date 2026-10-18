@@ -90,6 +90,67 @@ hardening_fail2ban_caddy_immich_maxretry: 20     # >20 failed basic-auth ...
 hardening_fail2ban_caddy_immich_findtime: "15m"  # ... within 15 min ...
 hardening_fail2ban_caddy_immich_bantime: "10m"   # ... => 10 min IP ban
 
+# --- Own blocklist: sources dropped for good (roles/hardening files/blocklist) ------------
+# ipsets blocklist4/6 + DROP rules in UFW (input and DOCKER-USER), like Spamhaus. Entries come
+# from hardening_blocked_sources (Ansible keeps exactly these as its own entries: missing ones
+# added, removed ones dropped) and from the upgrade portal's "Blocked IPs" page (kept until
+# removed there). Refused, so nobody locks themselves out: private / tailnet ranges, this
+# server, hardening_fail2ban_ignoreip + full-access ranges, the tailnet devices' public
+# addresses, SSH sources of the last 30 days, anything broader than /16 (v4) or /32 (v6).
+hardening_blocklist_enabled: true
+hardening_blocked_sources: []        # e.g. [203.0.113.7, 198.51.100.0/24]
+# Automatic blocking of SYSTEMATIC attackers (files/blocklist-auto, hourly). Counts SSH attempts
+# (security-metrics, roles/monitoring) + refused logins on the public routes below, per IP and
+# day; blocks when > threshold_7d in 7 days AND active (>= active_min) on >= active_days days
+# (burst_24h: optional extra rule, 0 = off) AND AbuseIPDB confirms it (score >= min_score, when
+# a key is set). Data centre -> /24, big clouds + residential -> /32. Not confirmed by AbuseIPDB
+# (or residential in exempt_residential_countries) -> not blocked, only the hint "Attacker for a
+# manual decision". Internal ranges can never be blocked (the blocklist's own checks). AS + country from IPtoASN (offline,
+# public domain), hosting ASNs from the bad-asn-list + name keywords.
+hardening_blocklist_auto_enabled: false
+hardening_blocklist_auto_dry_run: false     # true = only log what would be blocked (journalctl -u blocklist-auto)
+hardening_abuseipdb_api_key: "{{ vault_abuseipdb_api_key | default('') }}"
+hardening_blocklist_auto:
+  threshold_7d: 100
+  active_min: 5
+  active_days: 2
+  burst_24h: 0
+  max_per_day: 20
+  # AbuseIPDB (used when vault_abuseipdb_api_key is set; free tier: 1000 checks + 100 block checks/day)
+  abuseipdb:
+    min_score: 25             # block only what AbuseIPDB confirms
+    confirm_days: 90          # ... from reports of the last N days
+    release_ip_days: 90       # /32 released: score 0 over this many days ...
+    release_net_days: 180     # /24 released: no reported address for this long ...
+    quiet_days: 30            # ... and nothing from it at our firewall for this long
+    release_residential_days: 30   # residential /32 (dynamic addresses change hands): score 0 over 30 days ...
+    quiet_residential_days: 14     # ... and quiet at our firewall for 14 days
+    recheck_days: 7           # each auto entry re-checked weekly
+    checks_per_run: 5
+  exempt_residential_countries: []     # e.g. [DE]: residential lines there never automatically
+  big_cloud_asns: [16509, 14618, 15169, 396982, 8075, 13335, 31898, 20940]   # AWS, Google, Microsoft, Cloudflare, Oracle, Akamai
+  hosting_asns_extra: []
+  hosting_keywords: "hosting|hoster|cloud|idc|go-?daddy|server|data ?cent|datacenter|colo|vps|dedicated|digitalocean|linode|vultr|choopa|ovh|hetzner|contabo|leaseweb|m247|scaleway|ionos|alibaba|tencent|huawei|aliyun|amazon|google|microsoft|oracle|akamai"
+  asn_url: https://iptoasn.com/data/ip2asn-combined.tsv.gz
+  hosting_asn_url: https://raw.githubusercontent.com/brianhama/bad-asn-list/master/bad-asn-list.csv
+  # refused logins on the public routes that count as attempts (host, path regex, statuses)
+  web: >-
+    {{ ([{'host': svc_edge_host['immich'], 'path': '^/share/', 'status': [401]}] if 'immich' in (svc_edge_host | default({})) else [])
+       + ([{'host': svc_edge_host['ntfy'], 'path': '', 'status': [401, 403]}] if 'ntfy' in (svc_edge_host | default({})) else []) }}
+
+# Dropped packets of Spamhaus DROP and the blocklist are also LOGGED (rate-limited, prefixes
+# "[SPAMHAUS DROP] " / "[BLOCKLIST DROP] ") so the Security dashboard can show their sources.
+hardening_drop_log_limit: "20/min"
+
+# --- Optional jail: Caddy public ntfy route (alert push, roles/monitoring) ----------
+# Bans IPs that keep failing ntfy's login (401) or touching topics they may not (403).
+# The phone app with a wrong password would be banned too — then fix the password in the app.
+# The server's own addresses are never banned (Grafana posts through the public route).
+hardening_fail2ban_caddy_ntfy_enabled: false
+hardening_fail2ban_caddy_ntfy_maxretry: 10
+hardening_fail2ban_caddy_ntfy_findtime: "15m"
+hardening_fail2ban_caddy_ntfy_bantime: "1h"
+
 # Max tolerated clock skew (seconds) vs online/controller time before hardening hard-fails.
 clock_skew_max_seconds: 120
 

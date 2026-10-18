@@ -1,0 +1,9 @@
+---
+# Nextcloud's data directory on the Storage Box instead of the server's disk.
+# HOST-GATED: off unless nextcloud_data_external is set in host_vars (needs storagebox_enabled
+# and the storagebox_extra_mounts entry for nextcloud, group_vars/all/storagebox.yml).
+nextcloud_data_external: false
+# Where roles/storagebox mounts the box folder (owner www-data, 0770).
+nextcloud_box_mountpoint: /mnt/storagebox-nextcloud
+# The data dir on the server's disk (source of the one-time migration).
+nextcloud_local_data_dir: "{{ data_root_business | default('/srv/business') }}/nextcloud/data"

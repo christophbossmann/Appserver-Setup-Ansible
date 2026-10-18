@@ -1,0 +1,8 @@
+# fail2ban filter — managed by Ansible (roles/hardening).
+# A refused request (401 wrong login / 403 topic not allowed) on the public ntfy route, from
+# Caddy's JSON access log (stderr -> journald, backend=systemd). In each line client_ip and
+# host (inside request{}) come before the top-level status.
+[Definition]
+failregex = "client_ip":"<HOST>".*"host":"ntfy\.[^"]*".*"status":40[13]
+journalmatch = _SYSTEMD_UNIT=caddy.service
+ignoreregex =

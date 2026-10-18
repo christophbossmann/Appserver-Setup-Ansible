@@ -136,6 +136,7 @@
                                                'kind': item.value.kind | default('image'),
                                                'pitr': item.value.pitr | default(''),
                                                'targets': item.value.targets | default([]),
+                                               'state_paths': item.value.state_paths | default([]),
                                                'local': (item.key in local_upgrade_services)}}) }}
       loop: "{{ _lu_cat.upgrade_catalog | dict2items }}"
       loop_control:
@@ -171,6 +172,44 @@
         owner: root
         group: root
         mode: "0750"
+
+    # Late rollbacks (playbooks/upgrade-rollback.yml) are offered for a limited time; this
+    # removes the records and what they kept (snapshots, state copies) once it is over.
+    - name: Install the expiry job for late rollbacks
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/app-upgrade-expire.{{ item.ext }}"
+        mode: "0644"
+        content: "{{ item.content }}"
+      loop:
+        - ext: service
+          content: |
+            # Managed by Ansible (roles/local_upgrade)
+            [Unit]
+            Description=Remove expired late-rollback records and what they kept
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/bin/app-upgrade expire
+        - ext: timer
+          content: |
+            # Managed by Ansible (roles/local_upgrade)
+            [Unit]
+            Description=Hourly expiry of late-rollback records
+            [Timer]
+            OnCalendar=hourly
+            Persistent=true
+            [Install]
+            WantedBy=timers.target
+      loop_control:
+        label: "app-upgrade-expire.{{ item.ext }}"
+      register: _lu_expire
+
+    - name: Enable the expiry timer
+      ansible.builtin.systemd:
+        name: app-upgrade-expire.timer
+        enabled: true
+        state: started
+        daemon_reload: "{{ _lu_expire.changed }}"
+      when: not ansible_check_mode
 
     - name: Install the upgrade unit (one instance per <service>:<version>)
       ansible.builtin.copy:
@@ -219,6 +258,9 @@
     #   GET  /hooks/upgrade-status                              last results + running upgrade (JSON)
     #   GET  /hooks/upgrade-log?service=<s>                     page following the log of the running / last upgrade
     #   GET  /hooks/upgrade-logdata?service=<s>&cursor=<c>      its new lines (JSON, polled by the pages)
+    #   GET  /hooks/blocklist                                   the "Blocked IPs" page (own firewall blocklist)
+    #   POST /hooks/blocklist-change {"action","net","comment"} add / remove an entry (same Origin rule;
+    #        roles/hardening's `blocklist` refuses anything that could lock you out)
     #   POST /hooks/app-upgrade {"service","version"}           start it — only with this site's
     #        Origin (a foreign page cannot make the browser send it), and the entry point
     #        validates both fields itself. The forward-auth user name is passed on for the record.
@@ -280,6 +322,29 @@
                'include-command-output-in-response': true,
                'response-headers': [{'name': 'Content-Type', 'value': 'application/json'},
                                     {'name': 'Cache-Control', 'value': 'no-store'}]},
+              {'id': 'blocklist',
+               'execute-command': '/usr/local/bin/app-upgrade',
+               'pass-arguments-to-command': [{'source': 'string', 'name': 'blockpage'}],
+               'pass-environment-to-command': [{'source': 'header', 'name': 'X-Authentik-Username', 'envname': 'APP_UPGRADE_USER'}],
+               'http-methods': ['GET'],
+               'include-command-output-in-response': true,
+               'response-headers': [{'name': 'Content-Type', 'value': 'text/html; charset=utf-8'},
+                                    {'name': 'Cache-Control', 'value': 'no-store'}]},
+              {'id': 'blocklist-change',
+               'execute-command': '/usr/local/bin/app-upgrade',
+               'pass-arguments-to-command': [{'source': 'string', 'name': 'block'},
+                                             {'source': 'payload', 'name': 'action'},
+                                             {'source': 'payload', 'name': 'net'},
+                                             {'source': 'payload', 'name': 'comment'}],
+               'pass-environment-to-command': [{'source': 'header', 'name': 'X-Authentik-Username', 'envname': 'APP_UPGRADE_USER'}],
+               'http-methods': ['POST'],
+               'include-command-output-in-response': true,
+               'include-command-output-in-response-on-error': true,
+               'trigger-rule': {'and': [
+                   {'match': {'type': 'value', 'value': local_upgrade_origin, 'parameter': {'source': 'header', 'name': 'Origin'}}},
+                   {'match': {'type': 'regex', 'regex': '^(add|remove)$', 'parameter': {'source': 'payload', 'name': 'action'}}},
+                   {'match': {'type': 'regex', 'regex': '^[0-9A-Fa-f:.]{2,45}(/[0-9]{1,3})?$', 'parameter': {'source': 'payload', 'name': 'net'}}},
+                   {'match': {'type': 'regex', 'regex': '^[A-Za-z0-9 ._:/@+,()#-]{0,120}$', 'parameter': {'source': 'payload', 'name': 'comment'}}}]}},
               {'id': 'upgrade-status',
                'execute-command': '/usr/local/bin/app-upgrade',
                'pass-arguments-to-command': [{'source': 'string', 'name': 'status'}],

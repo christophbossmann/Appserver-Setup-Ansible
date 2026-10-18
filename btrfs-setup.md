@@ -9,7 +9,7 @@ Diese Anleitung beschreibt das komplette btrfs-Setup für einen Ubuntu-Server: s
 | Wer | Was | Wann |
 |---|---|---|
 | **`./btrfs-bootstrap.sh`** (Controller-Script, außerhalb Ansible) | Einmaliges **Fundament**: `@`-Layout + snapper + grub-btrfs | **Einmal** pro Host, mit Reboot |
-| **Ansible-Rolle `btrfs_snapshots`** | Nur **Checkpoint-Snapshots** (`ans_before_hardening`, …) beim Deploy | Bei jedem `server-all.yml`-Lauf |
+| **Ansible-Rolle `btrfs_snapshots`** | Nur **Deploy-Snapshots**: `ans_pre_run` zu Beginn jedes Laufs (die letzten 5 bleiben) + einmalige Anker (`ans_pre_setup`, `ans_subvols_ready`, `ans_after_ansible` nach dem ersten kompletten Lauf) | Bei jedem `server-all.yml`-Lauf |
 
 Der `@`-Umzug braucht einen Reboot und ist eine Einweg-Migration — deshalb gehört er **nicht**
 in ein idempotentes Ansible-Deploy, sondern in ein separates Bootstrap-Script (wie
@@ -157,7 +157,7 @@ sudo /etc/grub.d/41_snapshots-btrfs             # grub-btrfs.cfg gleich erzeugen
   `snapper-cleanup.timer` räumt alte auf (1× täglich).
 - **apt:** der snapper-apt-Hook macht `pre`/`post`-Snapshots bei jeder Paketaktion.
 - **Deploy-Checkpoints (Ansible):** `server-all.yml` zieht über die Rolle `btrfs_snapshots`:
-  `ans_before_hardening` → *(hardening)* → `ans_after_hardening` → … → `ans_after_ansible`
+  `ans_pre_run` (jeder Lauf) → *(Rollen)* … → `ans_after_ansible` (nur beim ersten Lauf, dauerhaft)
   (`ans` = ansible). `btrfs_checkpoint_skip_if_exists=true` → höchstens ein `ans_<label>_*` pro Host.
 
 btrfs-Snapshots sind **copy-on-write** → ein frischer Snapshot kostet ~0 Platz und wächst erst,

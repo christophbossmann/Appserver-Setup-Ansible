@@ -17,6 +17,9 @@
 #   file       group_vars/all/<file> of the PRIVATE config the version is persisted to
 #   targets    update targets that may be started on the host (same-major | next-major |
 #              latest); default: all. Restrict it where a bigger step needs manual work.
+#   snapshots  snapper configs of the data volumes to snapshot at the upgrade's anchor, so a
+#              LATE rollback (upgrade-rollback.yml) takes the files back to the same moment
+#              as the database — for apps whose files and database must match
 #   pitr       postgres PITR instance behind the app (on-host upgrades refuse to start without
 #              a recent base backup + a live WAL archive of it)
 #   --- only for playbook: stack-upgrade.yml ---
@@ -48,6 +51,7 @@ upgrade_catalog:
     var: immich_version
     file: immich.yml
     pitr: postgres-business
+    snapshots: [immich_data, nextcloud_data]   # both apps: the instance is rolled back as a whole
   nextcloud:
     playbook: nextcloud-upgrade.yml
     arg: nextcloud_upgrade_version
@@ -55,6 +59,7 @@ upgrade_catalog:
     var: nextcloud_version
     file: nextcloud.yml
     pitr: postgres-business
+    snapshots: [immich_data, nextcloud_data]   # both apps: the instance is rolled back as a whole
   authentik:
     playbook: authentik-upgrade.yml
     arg: authentik_upgrade_version
@@ -72,6 +77,7 @@ upgrade_catalog:
     value: "ghcr.io/immich-app/postgres:{v}"
     file: postgres.yml
     pitr: postgres-business
+    snapshots: [immich_data, nextcloud_data]   # both apps: the instance is rolled back as a whole
     targets: [same-major]
 
   # --- no database of their own: the generic playbook (new image -> verify -> old image) ---
@@ -82,6 +88,7 @@ upgrade_catalog:
     file: monitoring.yml
     role: monitoring
     containers: [grafana]
+    state_paths: ["{{ grafana_data_dir | default('/opt/monitoring/grafana-data') }}"]   # sqlite db (dashboards, users), migrated by new versions
   prometheus:
     playbook: stack-upgrade.yml
     images: [prom/prometheus]
@@ -96,6 +103,14 @@ upgrade_catalog:
     file: monitoring.yml
     role: monitoring
     containers: [node-exporter]
+  ntfy:
+    playbook: stack-upgrade.yml
+    images: [binwiederhier/ntfy]
+    var: ntfy_version
+    file: monitoring.yml
+    role: monitoring
+    containers: [ntfy]
+    state_paths: ["{{ ntfy_data_dir | default('/opt/monitoring/ntfy-data') }}"]   # sqlite (users, tokens, message cache), migrated by new versions
   blackbox_exporter:
     playbook: stack-upgrade.yml
     images: [prom/blackbox-exporter]

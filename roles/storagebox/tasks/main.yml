@@ -123,6 +123,41 @@
       no_log: true
       notify: Restart storagebox mount
 
+    # rclone wants the crypt passwords "obscured" — and `rclone obscure` gives a different string
+    # each time. Reuse the value already in the config when it still reveals to the vault's
+    # password, so the file (and the mounts) only change when a password really changes.
+    - name: Obscure the crypt passwords (reuse unchanged ones)
+      ansible.builtin.shell: |
+        set -eu
+        conf='{{ storagebox_config_file }}'
+        get() { awk -v s="[{{ item.name }}]" -v k="$1" '$0==s {f=1; next} /^\[/ {f=0} f && $1==k {print $3}' "$conf" 2>/dev/null; }
+        for k in password password2; do
+          want=$( [ "$k" = password ] && printf '%s' "$P1" || printf '%s' "$P2" )
+          have=$(get "$k")
+          if [ -n "$have" ] && [ "$(rclone reveal "$have" 2>/dev/null)" = "$want" ]; then echo "$k=$have"
+          else echo "$k=$(rclone obscure "$want")"; fi
+        done
+      args:
+        executable: /bin/bash
+      environment:
+        P1: "{{ item.password }}"
+        P2: "{{ item.password2 }}"
+      loop: "{{ storagebox_crypt_remotes | default([]) }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _sb_crypt_obs
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Collect the obscured crypt passwords
+      ansible.builtin.set_fact:
+        _sb_crypt_obscured: >-
+          {{ dict(_sb_crypt_obs.results | map(attribute='item.name')
+                  | zip(_sb_crypt_obs.results | map(attribute='stdout_lines')
+                        | map('map', 'split', '=', 1) | map('items2dict', key_name=0, value_name=1))) }}
+      no_log: true
+      when: storagebox_crypt_remotes | default([]) | length > 0
+
     - name: Deploy the rclone config for the Storage Box
       ansible.builtin.template:
         src: storagebox.conf.j2
@@ -130,6 +165,8 @@
         owner: root
         group: root
         mode: "0600"
+      no_log: "{{ storagebox_crypt_remotes | default([]) | length > 0 }}"
+      register: _sb_conf
       notify: Restart storagebox mount
 
     - name: Ensure the mountpoint exists
@@ -181,6 +218,80 @@
       register: _sb_restart_ctr
       changed_when: "'CHANGED' in _sb_restart_ctr.stdout"
       when: _sb_cache_move is changed
+
+    # --- extra mounts (storagebox_extra_mounts) -------------------------------------------
+    - name: Extra mounts — the folder on the box
+      ansible.builtin.file:
+        path: "{{ storagebox_mountpoint }}/{{ item.subdir }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ storagebox_extra_mounts }}"
+      loop_control: { label: "{{ item.name }}" }
+
+    - name: Extra mounts — VFS cache dir
+      ansible.builtin.file:
+        path: "{{ item.cache_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop: "{{ storagebox_extra_mounts }}"
+      loop_control: { label: "{{ item.name }}" }
+
+    # The EMPTY mountpoint is immutable: while the box is not mounted, an application bound to
+    # it cannot write its data onto the server's disk by mistake (mounting over it still works).
+    - name: Extra mounts — immutable empty mountpoint
+      ansible.builtin.shell: |
+        set -eu
+        mp='{{ item.mountpoint }}'
+        if mountpoint -q "$mp"; then echo "OK mounted"; exit 0; fi
+        mkdir -p "$mp"
+        if lsattr -d "$mp" | cut -c1-20 | grep -q i; then echo "OK immutable"; exit 0; fi
+        [ -z "$(ls -A "$mp")" ] || { echo "FAILED $mp is not empty"; exit 1; }
+        chmod 0700 "$mp"
+        chattr +i "$mp"
+        echo "CHANGED immutable"
+      args:
+        executable: /bin/bash
+      loop: "{{ storagebox_extra_mounts }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _sb_extra_mp
+      changed_when: "'CHANGED' in _sb_extra_mp.stdout"
+      when: not ansible_check_mode
+
+    - name: Extra mounts — systemd units
+      ansible.builtin.template:
+        src: storagebox-extra-mount.service.j2
+        dest: "/etc/systemd/system/{{ storagebox_service_name }}-{{ item.name }}.service"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ storagebox_extra_mounts }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _sb_extra_units
+
+    # also restarted when the rclone config changed (a remote's target or keys) — a running mount
+    # keeps the config it was started with
+    - name: Extra mounts — enable, (re)start on change
+      ansible.builtin.systemd:
+        name: "{{ storagebox_service_name }}-{{ item.item.name }}.service"
+        enabled: true
+        state: "{{ 'restarted' if (item.changed or (_sb_conf.changed | default(false))) else 'started' }}"
+        daemon_reload: "{{ item.changed }}"
+      loop: "{{ _sb_extra_units.results }}"
+      loop_control: { label: "{{ item.item.name }}" }
+      when: not ansible_check_mode
+
+    - name: Extra mounts — wait until mounted
+      ansible.builtin.command: "mountpoint -q {{ item.mountpoint }}"
+      loop: "{{ storagebox_extra_mounts }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _sb_extra_up
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: _sb_extra_up.rc == 0
+      when: not ansible_check_mode
 
     - name: Ensure the host root path exists on the box
       ansible.builtin.file:

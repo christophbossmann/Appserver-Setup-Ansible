@@ -1,3 +1,5 @@
+{% set _hc_scrape = (healthchecks_enabled | default(false) | bool) and (healthchecks_project_uuid | default('') | length > 0)
+                    and (healthchecks_readonly_key | default('') | length > 0) %}
 services:
   # ============================================================
   # Prometheus — metrics collection
@@ -13,6 +15,10 @@ services:
       - {{ prometheus_data_dir }}:/prometheus
       # file_sd target lists published by other roles (caddy-probes.json from roles/caddy)
       - /etc/prometheus-file-sd:/etc/prometheus/file_sd:ro
+{% if _hc_scrape %}
+      # read-only healthchecks.io API key for the "healthchecks" scrape job
+      - /opt/monitoring/healthchecks-readonly.key:/etc/prometheus/healthchecks.key:ro
+{% endif %}
 {# default(true) = the caddy role's own default. That default is NOT visible here on a run limited
    to this role (--tags monitoring); with default(false) such a run silently dropped the job. #}
 {% if caddy_metrics_enabled | default(true) | bool %}
@@ -126,10 +132,15 @@ services:
       - {{ grafana_data_dir }}:/var/lib/grafana
       - /opt/monitoring/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - /opt/monitoring/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+{% if monitoring_alerting_enabled | default(false) | bool %}
+      # alert rules, contact points, policies (templates/alerting.yml.j2)
+      - /opt/monitoring/provisioning/alerting:/etc/grafana/provisioning/alerting:ro
+{% endif %}
     environment:
-{% if grafana_plugins | default([]) | length > 0 %}
-      # installed on container start (treemap for the "Disk usage" dashboard)
-      GF_PLUGINS_PREINSTALL: "{{ grafana_plugins | join(',') }}"
+{% set _plugins = (grafana_plugins | default([])) + (grafana_alerting_plugins if (monitoring_alerting_enabled | default(false) | bool) else []) %}
+{% if _plugins | length > 0 %}
+      # installed on container start (treemap: "Disk usage"; infinity: "Alerts overview")
+      GF_PLUGINS_PREINSTALL: "{{ _plugins | join(',') }}"
 {% endif %}
 {% if (monitoring_trivy_enabled | default(false)) and (monitoring_scan_button_enabled | default(false)) %}
       # lets dashboard buttons POST to the scan hook behind Grafana's own host name
@@ -168,17 +179,54 @@ services:
 {% endif %}
     depends_on:
       - prometheus
+{% if monitoring_alerting_enabled | default(false) | bool %}
+
+  # ============================================================
+  # ntfy — push notifications of the alerts to the phone app
+  # ============================================================
+  # The one container of this stack reachable from the internet, so it is fenced in: its
+  # own network with NO other container (a hole in ntfy reaches neither Grafana nor
+  # Prometheus) — Grafana posts to it through the public Caddy route like the phone does.
+  # Unprivileged uid, read-only filesystem except its data dir, no capabilities.
+  ntfy:
+    image: {{ ntfy_image }}
+    container_name: ntfy
+    restart: unless-stopped
+    command: serve
+    user: "{{ ntfy_uid }}:{{ ntfy_uid }}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    ports:
+      # loopback only — reached through the `ntfy` Caddy route
+      - "127.0.0.1:{{ ntfy_port }}:{{ ntfy_port }}"
+    volumes:
+      - /opt/monitoring/ntfy/server.yml:/etc/ntfy/server.yml:ro
+      - {{ ntfy_data_dir }}:/var/lib/ntfy
+    networks:
+      - ntfy
+{% endif %}
 {% set _ext_nets = ((_pg_exporters | default([])) | map(attribute='network') | list
                      + (_prom_apps | default({})).values() | list) | unique | list %}
-{% if _ext_nets | length > 0 %}
+{% set _ntfy = monitoring_alerting_enabled | default(false) | bool %}
+{% if _ext_nets | length > 0 or _ntfy %}
 
-# The postgres instances' networks (joined by their exporters). Declared external: they
-# belong to the database stacks, this stack only attaches to them.
 networks:
+{% if _ext_nets | length > 0 %}
+  # The postgres instances' networks (joined by their exporters). Declared external: they
+  # belong to the database stacks, this stack only attaches to them.
   default:
     name: monitoring_default
 {% for net in _ext_nets %}
   {{ net }}:
     external: true
 {% endfor %}
+{% endif %}
+{% if _ntfy %}
+  # ntfy alone (see the ntfy service)
+  ntfy: {}
+{% endif %}
 {% endif %}

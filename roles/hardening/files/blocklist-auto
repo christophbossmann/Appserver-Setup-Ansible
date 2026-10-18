@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+# Managed by Ansible (roles/hardening). Puts SYSTEMATIC attackers on the own blocklist — hourly
+# (blocklist-auto.timer). Settings come from /etc/blocklist/auto.json (Ansible).
+#
+# Attempts per source IP and day = SSH attempts (security-metrics' hourly tallies) + refused
+# logins on the public routes (Caddy access log: Immich share gate, ntfy). An IP is blocked when
+#   attempts in 7 days > threshold_7d  AND  it was active (>= active_min) on >= active_days days
+#   (optional burst rule: > burst_24h in 24 h)
+# How much is blocked depends on who the address belongs to (offline lookup, IPtoASN database
+# + a list of hosting ASNs, refreshed daily — no address leaves the host):
+#   data centre                 -> the whole /24 (IPv6 /48)
+#   big cloud (AWS, Google, ..)  -> only the address (they also run services we need)
+#   residential / unknown        -> only the address (/32, IPv6 /64)
+#   residential in exempt countries (exempt_residential_countries, default none) -> never
+#   automatically: reported for a manual decision
+# Addresses AbuseIPDB does NOT confirm (score < min_score) are not blocked either — only reported
+# (hint "Attacker for a manual decision", blocklist_auto_hint{reason="unconfirmed"}).
+# With an AbuseIPDB key (/etc/blocklist/abuseipdb.key) an address is only blocked when AbuseIPDB
+# confirms it (score >= min_score), and its usage type ("Data Center/Web Hosting/Transit" vs
+# "Fixed Line ISP", ...) and country decide the class above (the AS database is the fallback).
+# Auto entries are released again — without "never again" — once they are harmless:
+#   /32: AbuseIPDB score 0 over release_ip_days AND nothing from it at our firewall for quiet_days
+#        (residential lines: release_residential_days / quiet_residential_days — shorter, because
+#        dynamic addresses soon belong to someone else)
+#   /24: no address of the net reported for release_net_days (the free check-block looks back
+#        30 days, so "clean since" is tracked across the weekly checks) AND quiet for quiet_days
+# Only attacker addresses are sent to AbuseIPDB.
+# Entries get source "auto" and a note with attempts, AS, country and AbuseIPDB score. One removed in the portal
+# is remembered and never added again. At most max_per_day new entries per day. Every entry
+# passes `blocklist`'s lock-out checks (tailnet devices, SSH logins, protected ranges, ...).
+import bisect, gzip, ipaddress, json, os, re, subprocess, sys, time, urllib.request
+
+CONF = "/etc/blocklist/auto.json"
+DIR = "/var/lib/blocklist"
+STATE = os.path.join(DIR, "auto-state.json")
+REMOVED = os.path.join(DIR, "auto-removed.json")        # written by `blocklist remove`
+ASNDB = os.path.join(DIR, "ip2asn-combined.tsv.gz")
+BADASN = os.path.join(DIR, "bad-asn-list.csv")
+SECURITY_STATE = "/var/lib/node_exporter/security-state.json"
+METRICS = "/var/lib/node_exporter/textfile/blocklist-auto.prom"
+BLOCKLIST = "/usr/local/sbin/blocklist"
+DAY = 86400
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def jload(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def jsave(path, obj):
+    with open(path + ".tmp", "w") as f:
+        json.dump(obj, f)
+    os.replace(path + ".tmp", path)
+
+
+def refresh(path, url, min_bytes, max_age=DAY):
+    """Download when missing/older than a day; a failed or tiny download keeps the old file."""
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < max_age:
+        return
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "blocklist-auto (ansible roles/hardening)"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            body = r.read()
+        if len(body) >= min_bytes:
+            with open(path + ".tmp", "wb") as f:
+                f.write(body)
+            os.replace(path + ".tmp", path)
+    except Exception as e:                       # keep the old copy
+        print("download %s failed: %s" % (url, e), file=sys.stderr)
+
+
+class AsnDb:
+    """IPtoASN ranges: start, end, asn, country, description — binary search by address."""
+    def __init__(self, path):
+        self.v = {4: ([], []), 6: ([], [])}
+        with gzip.open(path, "rt", errors="replace") as f:
+            for line in f:
+                p = line.rstrip("\n").split("\t")
+                if len(p) < 5 or p[2] == "0":
+                    continue
+                try:
+                    a, b = ipaddress.ip_address(p[0]), ipaddress.ip_address(p[1])
+                except ValueError:
+                    continue
+                starts, rows = self.v[a.version]
+                starts.append(int(a))
+                rows.append((int(b), int(p[2]), p[3], p[4]))
+
+    def lookup(self, ip):
+        starts, rows = self.v[ip.version]
+        i = bisect.bisect_right(starts, int(ip)) - 1
+        if i >= 0 and int(ip) <= rows[i][0]:
+            return rows[i][1], rows[i][2], rows[i][3]
+        return 0, "??", "unknown"
+
+
+ABUSE_KEY = "/etc/blocklist/abuseipdb.key"
+
+
+def abuse(path, **q):
+    """AbuseIPDB API v2 (None when there is no key or the call fails)."""
+    try:
+        key = open(ABUSE_KEY).read().strip()
+    except OSError:
+        return None
+    if not key:
+        return None
+    from urllib.parse import urlencode
+    req = urllib.request.Request("https://api.abuseipdb.com/api/v2/%s?%s" % (path, urlencode(q)),
+                                 headers={"Key": key, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r).get("data")
+    except Exception as e:
+        print("AbuseIPDB %s failed: %s" % (path, e), file=sys.stderr)
+        return None
+
+
+def knocked(net, since):
+    """Did anything from net hit our blocklist rules since `since`? (security-metrics' tallies
+    of the rate-limited "[BLOCKLIST DROP]" log lines, hourly buckets)"""
+    for start, b in jload(SECURITY_STATE, {}).get("buckets", {}).items():
+        if int(start) + 3600 > since:
+            for ip in b.get("blocklist", {}):
+                try:
+                    if ipaddress.ip_address(ip) in net:
+                        return True
+                except ValueError:
+                    pass
+    return False
+
+
+def release_pass(cfg, st, now):
+    """Weekly re-check of the auto entries; release the harmless ones (a few per run)."""
+    ab = cfg.get("abuseipdb", {})
+    if not ab or not os.path.exists(ABUSE_KEY):
+        return []
+    checks = st.setdefault("checks", {})
+    entries = [e for e in json.loads(run([BLOCKLIST, "list"]).stdout or "[]") if e["source"] == "auto"]
+    nets = {e["net"] for e in entries}
+    for n in list(checks):
+        if n not in nets:
+            del checks[n]
+    released, done = [], 0
+    for e in sorted(entries, key=lambda e: checks.get(e["net"], {}).get("checked", 0)):
+        c = checks.setdefault(e["net"], {"clean_since": None, "checked": 0})
+        resi = "(residential)" in e.get("comment", "")
+        quiet = ab["quiet_residential_days"] if resi else ab["quiet_days"]
+        if done >= ab["checks_per_run"] or now - c["checked"] < ab["recheck_days"] * DAY \
+                or now - e.get("added", now) < quiet * DAY:
+            continue
+        net = ipaddress.ip_network(e["net"])
+        single = net.num_addresses == 1 or (net.version == 6 and net.prefixlen >= 64)
+        if single:
+            d = abuse("check", ipAddress=str(net.network_address),
+                      maxAgeInDays=ab["release_residential_days"] if resi else ab["release_ip_days"])
+            clean = d is not None and d.get("abuseConfidenceScore", 1) == 0
+            enough = clean
+        else:
+            d = abuse("check-block", network=e["net"], maxAgeInDays=30)
+            clean = d is not None and not any(a.get("abuseConfidenceScore", 0) > 0 for a in d.get("reportedAddress", []))
+            if clean and not c["clean_since"]:
+                c["clean_since"] = now - 30 * DAY          # the 30 days the query covered
+            if not clean:
+                c["clean_since"] = None
+            enough = clean and now - c["clean_since"] >= ab["release_net_days"] * DAY
+        if d is None:
+            continue
+        done += 1
+        c["checked"] = now
+        if enough and not knocked(net, now - quiet * DAY):
+            if cfg.get("dry_run"):
+                print("WOULD RELEASE %s (harmless: no reports, quiet)" % e["net"])
+            elif run([BLOCKLIST, "expire", e["net"]]).returncode == 0:
+                released.append(e["net"])
+    return released
+
+
+def web_failures(st, cfg):
+    """Refused logins on the public routes since the last run (Caddy JSON access log)."""
+    rules = [(r["host"], re.compile(r.get("path", "") or ".*"), set(r.get("status", [401, 403]))) for r in cfg.get("web", [])]
+    if not rules:
+        return
+    args = ["journalctl", "-u", "caddy", "-o", "json", "--no-pager", "--output-fields=MESSAGE,__REALTIME_TIMESTAMP"]
+    args += ["--after-cursor", st["cursor"]] if st.get("cursor") else ["--since", "-7d"]
+    out = run(args).stdout.splitlines()
+    for line in out:
+        try:
+            e = json.loads(line)
+            m = json.loads(e.get("MESSAGE", "") if isinstance(e.get("MESSAGE"), str) else "")
+        except ValueError:
+            continue
+        st["cursor"] = e.get("__CURSOR", st.get("cursor"))
+        req = m.get("request", {}) if isinstance(m, dict) else {}
+        for host, path, codes in rules:
+            if req.get("host") == host and m.get("status") in codes and path.search(req.get("uri", "")):
+                day = str(int(int(e.get("__REALTIME_TIMESTAMP", time.time() * 1e6)) / 1e6 // DAY))
+                ip = req.get("client_ip", "")
+                st["web"].setdefault(day, {})
+                st["web"][day][ip] = st["web"][day].get(ip, 0) + 1
+                break
+
+
+def main():
+    cfg = jload(CONF, {})
+    if not cfg.get("enabled"):
+        return 0
+    os.makedirs(DIR, exist_ok=True)
+    now = time.time()
+    today = int(now // DAY)
+    st = jload(STATE, {})
+    st.setdefault("web", {})
+    st.setdefault("added", {})
+    web_failures(st, cfg)
+    st["web"] = {d: v for d, v in st["web"].items() if int(d) > today - 8}
+    st["added"] = {d: v for d, v in st["added"].items() if int(d) > today - 8}
+
+    # attempts per IP and day: SSH (security-metrics' hourly buckets) + web
+    days = {}
+    for start, b in jload(SECURITY_STATE, {}).get("buckets", {}).items():
+        if int(start) > now - 7 * DAY:
+            for ip, n in b.get("ssh", {}).items():
+                days.setdefault(ip, {}).setdefault(int(start) // DAY, [0, 0])[0] += n
+    for d, ips in st["web"].items():
+        if int(d) > today - 7:
+            for ip, n in ips.items():
+                days.setdefault(ip, {}).setdefault(int(d), [0, 0])[1] += n
+
+    hits = []
+    for ip, per in days.items():
+        total = sum(a + w for a, w in per.values())
+        active = sum(1 for a, w in per.values() if a + w >= cfg["active_min"])
+        last24 = sum(a + w for d, (a, w) in per.items() if d >= today - 1)
+        if (total > cfg["threshold_7d"] and active >= cfg["active_days"]) or \
+                (cfg.get("burst_24h") and last24 > cfg["burst_24h"]):
+            hits.append((ip, total, sum(a for a, _ in per.values()), sum(w for _, w in per.values()), active))
+    hits.sort(key=lambda h: -h[1])
+
+    refresh(ASNDB, cfg["asn_url"], 1_000_000)
+    refresh(BADASN, cfg["hosting_asn_url"], 1_000)
+    db = AsnDb(ASNDB) if os.path.exists(ASNDB) else None
+    hosting = set()
+    for line in (open(BADASN).read().splitlines()[1:] if os.path.exists(BADASN) else []):
+        if line.split(",")[0].isdigit():
+            hosting.add(int(line.split(",")[0]))
+    hosting |= set(cfg.get("hosting_asns_extra", []))
+    keyword = re.compile(cfg["hosting_keywords"], re.I)
+    big = set(cfg.get("big_cloud_asns", []))
+
+    entries = json.loads(run([BLOCKLIST, "list"]).stdout or "[]")
+    have = [ipaddress.ip_network(e["net"]) for e in entries]
+    removed = [ipaddress.ip_network(n) for n in jload(REMOVED, [])]
+    added_today = st["added"].get(str(today), 0)
+    exempt, added, skipped, unconfirmed = [], [], [], []
+    for ip_s, total, ssh, web, active in hits:
+        try:
+            ip = ipaddress.ip_address(ip_s)
+        except ValueError:
+            continue
+        if any(ip in n for n in have) or any(ip in n for n in removed):
+            continue
+        asn, cc, desc = db.lookup(ip) if db else (0, "??", "unknown")
+        dc = asn in hosting or bool(keyword.search(desc))
+        score = ""
+        ab = cfg.get("abuseipdb", {})
+        if ab and os.path.exists(ABUSE_KEY):
+            d = abuse("check", ipAddress=ip_s, maxAgeInDays=ab["confirm_days"])
+            if d is None:
+                skipped.append(ip_s)               # API down / quota: try again next run
+                continue
+            if d.get("abuseConfidenceScore", 0) < ab["min_score"]:
+                unconfirmed.append((ip_s, total, asn, desc, d.get("countryCode") or cc, d.get("abuseConfidenceScore", 0)))
+                continue
+            usage = d.get("usageType") or ""
+            if usage:
+                dc = bool(re.search(r"data cent|hosting|transit|content delivery", usage, re.I))
+            cc = d.get("countryCode") or cc
+            score = ", AbuseIPDB %d (%d reports)" % (d.get("abuseConfidenceScore", 0), d.get("totalReports", 0))
+        why = "%d attempts/7d (ssh %d, web %d) on %d days, AS%d %s, %s%s" % (total, ssh, web, active, asn, desc[:40], cc, score)
+        if not dc and cc in cfg.get("exempt_residential_countries", []):
+            exempt.append((ip_s, total, asn, desc, cc, None))
+            continue
+        if added_today >= cfg["max_per_day"]:
+            skipped.append(ip_s)
+            continue
+        if dc and asn not in big:
+            net = ipaddress.ip_network("%s/%d" % (ip, 24 if ip.version == 4 else 48), strict=False)
+            kind = "data centre"
+        else:
+            net = ipaddress.ip_network("%s/%d" % (ip, 32 if ip.version == 4 else 64), strict=False)
+            kind = "big cloud" if dc else "residential"
+        if cfg.get("dry_run"):
+            print("WOULD ADD %s — auto (%s): %s" % (net, kind, why))
+            added.append(str(net))
+            have.append(net)
+            continue
+        r = run([BLOCKLIST, "auto-add", str(net), "auto (%s): %s" % (kind, why)])
+        if r.returncode == 0:
+            added_today += 1
+            added.append(str(net))
+            have.append(net)
+        else:
+            print("not added %s: %s" % (net, (r.stdout + r.stderr).strip()[:200]), file=sys.stderr)
+    st["added"][str(today)] = added_today
+    released = release_pass(cfg, st, now)
+    jsave(STATE, st)
+    for i, t, a, d, c, _ in exempt:
+        print("EXEMPT %s — %d attempts/7d, AS%d %s, %s (residential, never automatic)" % (i, t, a, d[:40], c))
+    for i, t, a, d, c, s in unconfirmed:
+        print("UNCONFIRMED %s — %d attempts/7d, AS%d %s, %s, AbuseIPDB score %d (not blocked, hint only)" % (i, t, a, d[:40], c, s))
+
+    esc = lambda s: str(s).replace("\\", "\\\\").replace('"', '\\"')
+    lines = ["# HELP blocklist_auto_hint Systematic attacker NOT blocked automatically, for a manual decision — "
+             "reason unconfirmed (AbuseIPDB score below min_score) or exempt (residential, exempt country); value: attempts in 7 days",
+             "# TYPE blocklist_auto_hint gauge"]
+    lines += ['blocklist_auto_hint{ip="%s",reason="%s",asn="%d",as_name="%s",country="%s",abuse_score="%s"} %d'
+              % (esc(i), reason, a, esc(d[:60]), esc(c), "" if s is None else s, t)
+              for reason, lst in (("exempt", exempt), ("unconfirmed", unconfirmed)) for i, t, a, d, c, s in lst]
+    lines += ["# TYPE blocklist_auto_added_today gauge", "blocklist_auto_added_today %d" % added_today,
+              "# TYPE blocklist_auto_deferred gauge", "blocklist_auto_deferred %d" % len(skipped),
+              "# TYPE blocklist_auto_unconfirmed gauge", "blocklist_auto_unconfirmed %d" % len(unconfirmed),
+              "# TYPE blocklist_auto_released_last_run gauge", "blocklist_auto_released_last_run %d" % len(released),
+              "# TYPE blocklist_auto_last_run_timestamp_seconds gauge",
+              "blocklist_auto_last_run_timestamp_seconds %d" % int(now)]
+    if os.path.isdir(os.path.dirname(METRICS)):
+        with open(METRICS + ".tmp", "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.chmod(METRICS + ".tmp", 0o644)
+        os.replace(METRICS + ".tmp", METRICS)
+    print("candidates %d, added %d %s, exempt %d, deferred %d, not confirmed by AbuseIPDB %d, released %d %s"
+          % (len(hits), len(added), added, len(exempt), len(skipped), len(unconfirmed), len(released), released))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

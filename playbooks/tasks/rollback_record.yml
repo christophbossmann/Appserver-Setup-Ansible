@@ -1,0 +1,30 @@
+---
+# Late rollback, part 2 (called by the upgrade playbooks after a verified, KEPT upgrade):
+# a record on the host of everything needed to go back for rollback_window_hours (default
+# 72) — playbooks/upgrade-rollback.yml reads it, the portal offers it, `app-upgrade expire`
+# (hourly) removes it and what it kept when the window is over.
+# Expects: rb_service, rb_from (value before), rb_to (value now), rb_var, rb_file,
+#          rb_anchor (PITR target or ""), rb_pitr (instance or ""), rb_snapshots (dict),
+#          rb_state_paths (list), rb_stamp (suffix of the state copies or "").
+- name: Ensure the rollback record dir exists
+  ansible.builtin.file:
+    path: /var/lib/app-upgrade/rollback
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Record how to roll {{ rb_service }} back ({{ rb_to }} -> {{ rb_from }})
+  ansible.builtin.copy:
+    dest: "/var/lib/app-upgrade/rollback/{{ rb_service }}.json"
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      {{ {'service': rb_service, 'from': rb_from, 'to': rb_to, 'var': rb_var, 'file': rb_file,
+          'anchor': rb_anchor | default(''), 'pitr': rb_pitr | default(''),
+          'snapshots': rb_snapshots | default({}), 'state_paths': rb_state_paths | default([]),
+          'stamp': rb_stamp | default(''),
+          'created': lookup('pipe', 'date -u +%s') | int,
+          'expires': (lookup('pipe', 'date -u +%s') | int) + (rollback_window_hours | default(72) | int) * 3600}
+         | to_nice_json }}

@@ -1,0 +1,30 @@
+---
+# Late rollback, part 1 (called by the upgrade playbooks right after the PITR anchor, before
+# anything changes): btrfs snapshots of the data volumes the service's catalog entry lists
+# (`snapshots:`), so a rollback within rollback_window_hours can take the FILES back to the
+# same moment as the database — no files without database rows afterwards, no rows without
+# files. Volumes whose snapper config does not exist on this host are skipped.
+# Expects: rb_service (catalog name). Sets: _rb_snapshots ({config: number}).
+- name: Load the upgrade catalog (late rollback)
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/vars/upgrade_catalog.yml"
+    name: _rb_cat
+
+- name: Snapshot the data volumes for a later rollback
+  ansible.builtin.shell: |
+    set -e
+    for cfg in {{ (_rb_cat.upgrade_catalog[rb_service].snapshots | default([])) | join(' ') }}; do
+      snapper -c "$cfg" get-config >/dev/null 2>&1 || continue
+      n=$(snapper -c "$cfg" create --type single --cleanup-algorithm number --print-number \
+            --description "pre-upgrade {{ rb_service }} $(date -u +%Y-%m-%dT%H:%MZ)")
+      echo "$cfg=$n"
+    done
+  args:
+    executable: /bin/bash
+  register: _rb_snap_out
+  changed_when: _rb_snap_out.stdout | length > 0
+  when: not ansible_check_mode
+
+- name: Remember the snapshots
+  ansible.builtin.set_fact:
+    _rb_snapshots: "{{ dict((_rb_snap_out.stdout_lines | default([])) | map('split', '=') | list) }}"

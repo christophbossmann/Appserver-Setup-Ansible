@@ -83,6 +83,11 @@ monitoring_immich_storage_dirs: [library, upload, encoded-video, thumbs]
 monitoring_pitr_metrics_enabled: "{{ postgres_pitr_enabled | default(false) }}"
 monitoring_pitr_metrics_oncalendar: "*-*-* *:05:00"
 
+#   updates-metrics : upgradable / security packages, held packages, reboot pending (apt-check,
+#   /var/run/reboot-required) — the "Reboot pending" / "Security updates pending" hints. Hourly.
+monitoring_updates_metrics_enabled: true
+monitoring_updates_metrics_oncalendar: "hourly"
+
 #   snapshot-metrics : btrfs/snapper snapshots of every config — when taken, retention, and
 #   how much space deleting them would free: per single snapshot and per SET (all of a
 #   volume, all automatic ones but the newest, those older than 7 days) — "Disk snapshots"
@@ -124,7 +129,7 @@ monitoring_trivy_update_rules:
   - { image: "ghcr.io/immich-app/postgres",                   tags: '^[0-9]+-vectorchord[0-9]+\.[0-9]+\.[0-9]+$' }
   - { image: "ghcr.io/goauthentik/server",                    tags: '^[0-9]{4}\.[0-9]+\.[0-9]+$', major_parts: 2 }
   - { image: "ghcr.io/goauthentik/ldap",                      tags: '^[0-9]{4}\.[0-9]+\.[0-9]+$', major_parts: 2 }
-  - { image: "nextcloud",                                     tags: '^[0-9]+-apache$' }
+  - { image: "nextcloud",                                     tags: '^[0-9]+\.[0-9]+\.[0-9]+-apache$' }
   - { image: "ghcr.io/juanfont/headscale",                    tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
   - { image: "ghcr.io/tale/headplane",                        tags: '^[0-9]+\.[0-9]+\.[0-9]+$' }
   - { image: "grafana/grafana",                               tags: '^[0-9]+\.[0-9]+\.[0-9]+$' }
@@ -137,6 +142,7 @@ monitoring_trivy_update_rules:
   - { image: "valkey/valkey",                                 tags: '^[0-9]+$' }
   - { image: "postgres",                                      tags: '^[0-9]+-alpine$' }
   - { image: "amir20/dozzle",                                 tags: '^v[0-9]+$' }
+  - { image: "binwiederhier/ntfy",                            tags: '^v[0-9]+\.[0-9]+\.[0-9]+$' }
 
 # "Start new scan" button on the Vulnerabilities dashboard. Grafana cannot run host
 # commands, so the button POSTs to /hooks/trivy-scan on Grafana's own (VPN-only) host name;
@@ -149,6 +155,11 @@ monitoring_webhook_port: 9777
 # Grafana plugins installed at container start (treemap for the "Disk usage" dashboard).
 grafana_plugins:
   - marcusolsson-treemap-panel
+# ...and with alerting on: Infinity (JSON APIs as a datasource) for the "Alerts overview"
+# tables — Grafana's own rules API (every rule's last/next evaluation) and the healthchecks.io
+# API (last/next ping of every check). Both read-only, see templates/infinity.yml.j2.
+grafana_alerting_plugins:
+  - yesoreyeram-infinity-datasource
 
 # systemd units the node_exporter systemd collector reports (regex on the unit name) —
 # feeds the "Scheduled jobs" dashboard: the scheduled timers/services this repo and the
@@ -179,3 +190,91 @@ grafana_admin_password: "changeme"
 
 # Caddy route(s) for this role live in defaults/caddy_route.yml (loaded
 # explicitly by the caddy role, not auto-loaded). Selected per host via caddy_services.
+
+# =====================================================================================
+# Alerting — Grafana alert rules -> ntfy (self-hosted, in this stack) on the phone
+# =====================================================================================
+# HOST-GATED: off unless monitoring_alerting_enabled is set in host_vars.
+#
+#   rules     provisioned from templates/alerting.yml.j2 (folder "Alerting" in Grafana,
+#             read-only there — change them here). Three severities:
+#               critical  immediately, also at night                -> ntfy priority high
+#               warning   held during monitoring_alert_quiet_hours, sent when they end
+#               info      daily hints, sent in the morning window   -> ntfy priority low
+#   ntfy      own container (ntfy_*), reachable for the phone through the `ntfy` Caddy route
+#             (caddy_services: ntfy: external). deny-all: only the declared users — ntfy_user
+#             (the phone app, password vault_ntfy_password, read+write on the alert topic)
+#             and `grafana` (token only, write-only on ntfy_topic).
+#   watchdog  an always-firing rule that pings healthchecks.io (check
+#             <healthchecks_prefix>-grafana-watchdog, roles/healthchecks) every few minutes —
+#             only while Grafana evaluates, Prometheus answers and ntfy is reachable through
+#             its public route. Any of those broken -> the pings stop -> healthchecks.io
+#             alarms via ntfy.sh. A dead alerting path is itself alarmed.
+monitoring_alerting_enabled: false
+
+# Services whose outage is CRITICAL (alarm immediately, also at night); every other service
+# that goes down is a WARNING. Matched against
+#   - the first label of a probed Caddy hostname (authentik.<host> -> authentik),
+#   - the docker compose project of a container (postgres-business, immich, ...),
+#   - the container name (prometheus, grafana, ...).
+monitoring_alert_critical_services:
+  - authentik
+  - nextcloud
+  - immich
+  - postgres-business
+  - prometheus
+  - grafana
+  - ntfy
+# A service is down when its probe fails / a container of it is gone for this long.
+monitoring_alert_down_for_critical: 5m
+monitoring_alert_down_for_warning: 10m
+# Containers that may disappear without an alarm (regex on the container name). Compose
+# one-off containers (docker compose run) are never watched. A container removed on purpose
+# is reported for a day (it is "gone" until it drops out of the 24 h lookback).
+monitoring_alert_container_ignore: "^$"
+
+monitoring_alert_disk_warning_pct: 20            # free space per filesystem
+monitoring_alert_disk_critical_pct: 10
+monitoring_alert_memory_critical_pct: 5          # MemAvailable below this for 10 min
+monitoring_alert_cert_warning_days: 14
+monitoring_alert_cert_critical_days: 3
+monitoring_alert_pitr_wal_max_hours: 3           # no WAL archived for this long (archive_timeout 1 h)
+monitoring_alert_pitr_base_max_hours: 30         # newest base backup older than this (daily job)
+monitoring_alert_box_thumbs_max_hours: 50        # Storage Box thumbnail mirror (nightly)
+monitoring_alert_box_dumps_max_days: 5           # Storage Box database dumps (every 4 days)
+monitoring_alert_restarts: 3                     # container starts within 30 min
+monitoring_alert_image_max_age_days: 180         # info: image build older than this
+monitoring_alert_unassigned_gib: 20              # info: disk space no directory accounts for
+monitoring_alert_reboot_pending_days: 7          # info: the system asked for a reboot this long ago
+monitoring_alert_security_pending_days: 3        # info: security updates pending this long
+                                                 #   (unattended-upgrades installs them daily -> stuck)
+
+# Warnings are held during these hours and sent when they end; daily hints are sent only in
+# the info window (and repeated once a day while they hold). Local time of the timezone.
+# These are only the DEFAULTS a fresh host starts with: the two intervals are editable in
+# Grafana (Alerting -> Notification configuration -> Time intervals — e.g. the time zone
+# while abroad) and a deploy keeps what is set there.
+monitoring_alert_quiet_hours: { start: "22:00", end: "08:00" }
+monitoring_alert_info_window: { start: "08:00", end: "09:00" }
+monitoring_alert_timezone: Europe/Berlin
+
+# ntfy (self-hosted push to the phone app; https://docs.ntfy.sh)
+ntfy_version: "v2.31.1"
+ntfy_image: "binwiederhier/ntfy:{{ ntfy_version }}"
+ntfy_port: 2586
+ntfy_uid: 2586                                   # unprivileged uid the container runs as (owns ntfy_data_dir)
+ntfy_data_dir: /opt/monitoring/ntfy-data
+ntfy_topic: "{{ healthchecks_prefix | default(inventory_hostname | lower) }}-alerts"
+# Technical login of the phone app(s) — shared, independent of Authentik on purpose: ntfy
+# has no OIDC/LDAP, and the alarm path must not depend on the SSO it may have to report.
+ntfy_user: ntfy
+ntfy_password: "{{ vault_ntfy_password | default('') }}"
+# The grafana user only uses its token; its password is never typed. Both derived from an
+# existing vault secret (like pg_exporter_password) — no extra vault entry.
+ntfy_grafana_token: "tk_{{ ((grafana_admin_password ~ ':ntfy-token:' ~ inventory_hostname) | hash('sha256'))[:29] }}"
+ntfy_grafana_password: "{{ (grafana_admin_password ~ ':ntfy-grafana:' ~ inventory_hostname) | hash('sha256') }}"
+# iPhone only: ntfy forwards a poll request (message id only, no content) to this server,
+# which wakes the app through Apple's push service — without it iOS delivers late.
+# Leave empty for Android.
+ntfy_upstream_base_url: ""
+

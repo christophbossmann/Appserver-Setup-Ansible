@@ -1,0 +1,87 @@
+---
+# Nextcloud's data directory on the Storage Box (nextcloud_data_external) — runs BEFORE the
+# nextcloud stack. The box folder is mounted by roles/storagebox (storagebox_extra_mounts:
+# owner www-data, 0770) at nextcloud_box_mountpoint; the stack binds that as /var/www/data.
+#
+# One-time migration: when the box has no Nextcloud data yet (.ncdata missing) but the local
+# data dir has, Nextcloud goes into maintenance mode and stops, the data is copied, the copy
+# is compared (file count + bytes), and the local dir is RENAMED (not deleted) to
+# <dir>.local-before-box-<date> — remove it by hand once everything checks out.
+# Afterwards (tasks/after.yml, after the stack is up): maintenance off + files:scan.
+# A reinstall finds the data already on the box: nothing to migrate.
+- name: Nextcloud data on the Storage Box
+  when: nextcloud_data_external | default(false) | bool
+  block:
+    - name: Require the box mount
+      ansible.builtin.command: "mountpoint -q {{ nextcloud_box_mountpoint }}"
+      register: _ncs_mounted
+      changed_when: false
+      failed_when: _ncs_mounted.rc != 0
+      when: not ansible_check_mode
+
+    - name: Where is the data now?
+      ansible.builtin.shell: |
+        box='{{ nextcloud_box_mountpoint }}'; local='{{ nextcloud_local_data_dir }}'
+        echo "box=$([ -e "$box/.ncdata" ] && echo yes || echo no)"
+        echo "local=$([ -e "$local/.ncdata" ] && echo yes || echo no)"
+      register: _ncs_where
+      changed_when: false
+      check_mode: false
+
+    - name: Migrate the local data onto the box (one-time)
+      when:
+        - "'box=no' in _ncs_where.stdout"
+        - "'local=yes' in _ncs_where.stdout"
+        - not ansible_check_mode
+      block:
+        - name: Maintenance mode on, stop Nextcloud
+          ansible.builtin.shell: |
+            set -e
+            if docker ps --format '{{ "{{.Names}}" }}' | grep -qx nextcloud; then
+              docker exec -u www-data nextcloud php occ maintenance:mode --on
+            fi
+            docker stop nextcloud nextcloud-cron 2>/dev/null || true
+          changed_when: true
+
+        - name: Copy the data to the box
+          ansible.builtin.command:
+            # -rt: owner/permissions come from the mount (www-data, 0770); rclone keeps no
+            # owners and no symlinks, so none are copied
+            argv: [rsync, -rt, --delete, "{{ nextcloud_local_data_dir }}/", "{{ nextcloud_box_mountpoint }}/"]
+          changed_when: true
+
+        - name: Compare the copy (files + bytes)
+          ansible.builtin.shell: |
+            set -e
+            count() { find "$1" -type f | wc -l; }
+            bytes() { find "$1" -type f -printf '%s\n' | awk '{s+=$1} END {print s+0}'; }
+            l="$(count '{{ nextcloud_local_data_dir }}') $(bytes '{{ nextcloud_local_data_dir }}')"
+            b="$(count '{{ nextcloud_box_mountpoint }}') $(bytes '{{ nextcloud_box_mountpoint }}')"
+            echo "local: $l / box: $b"
+            [ "$l" = "$b" ]
+          args:
+            executable: /bin/bash
+          register: _ncs_cmp
+          changed_when: false
+
+        - name: Keep the local copy aside (renamed, not deleted)
+          ansible.builtin.command:
+            argv: [mv, "{{ nextcloud_local_data_dir }}", "{{ nextcloud_local_data_dir }}.local-before-box-{{ now(fmt='%Y%m%d-%H%M') }}"]
+          changed_when: true
+
+        - name: Remember to finish the migration after the stack is up
+          ansible.builtin.set_fact:
+            _ncs_migrated: true
+
+        - name: Migration done
+          ansible.builtin.debug:
+            msg: "Nextcloud data copied to the box ({{ _ncs_cmp.stdout }}). The local copy is kept as {{ nextcloud_local_data_dir }}.local-before-box-* — delete it once Nextcloud works."
+
+    - name: Refuse when neither place has the data (fresh box AND fresh server)
+      ansible.builtin.debug:
+        msg: >-
+          Neither the box nor the server has Nextcloud data yet — Nextcloud installs fresh into
+          the box folder (or restore the data/dumps first for a rebuild).
+      when:
+        - "'box=no' in _ncs_where.stdout"
+        - "'local=no' in _ncs_where.stdout"

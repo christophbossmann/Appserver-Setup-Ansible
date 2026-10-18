@@ -1,0 +1,29 @@
+# Managed by Ansible (roles/monitoring) — read-only JSON datasources for the "Alerts overview"
+# tables. Each may only call its own host (allowedHosts).
+apiVersion: 1
+
+datasources:
+  # Grafana's own API as the Viewer service account alerts-overview (rules: last/next evaluation)
+  - name: Grafana API (viewer)
+    type: yesoreyeram-infinity-datasource
+    uid: grafana-api
+    editable: false
+    jsonData:
+      auth_method: bearerToken
+      allowedHosts: ["http://localhost:3000"]
+    secureJsonData:
+      bearerToken: "{{ _viewer_token }}"
+{% if (healthchecks_enabled | default(false) | bool) and (healthchecks_readonly_key | default('') | length > 0) %}
+  # healthchecks.io with the project's READ-ONLY API key (checks: last/next ping)
+  - name: healthchecks.io API
+    type: yesoreyeram-infinity-datasource
+    uid: healthchecks-api
+    editable: false
+    jsonData:
+      auth_method: apiKey
+      apiKeyKey: X-Api-Key
+      apiKeyType: header
+      allowedHosts: ["https://healthchecks.io"]
+    secureJsonData:
+      apiKeyValue: "{{ healthchecks_readonly_key }}"
+{% endif %}

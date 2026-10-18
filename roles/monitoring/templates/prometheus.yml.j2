@@ -76,6 +76,21 @@ scrape_configs:
       - targets: ["headscale:9090"]
 
 {% endif %}
+{% if (healthchecks_enabled | default(false) | bool) and (healthchecks_project_uuid | default('') | length > 0)
+      and (healthchecks_readonly_key | default('') | length > 0) %}
+  # healthchecks.io project status (hc_check_up, ...; roles/healthchecks) — read-only key
+  # from a file, so it is not in this world-readable config.
+  - job_name: "healthchecks"
+    scrape_interval: 60s
+    scheme: https
+    metrics_path: /projects/{{ healthchecks_project_uuid }}/metrics/
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/healthchecks.key
+    static_configs:
+      - targets: ["healthchecks.io"]
+
+{% endif %}
   - job_name: "cadvisor"
     scrape_interval: {{ cadvisor_scrape_interval }}
     static_configs:

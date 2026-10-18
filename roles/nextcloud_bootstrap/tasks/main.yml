@@ -4,6 +4,13 @@
 # provider entry are guarded by lookups; provider settings are re-applied (occ
 # user_oidc:provider updates in place), so a changed secret/issuer converges.
 
+# Right after a migration of the data onto the Storage Box Nextcloud is still in maintenance
+# mode — finish that first (no-op otherwise).
+- name: Finish a data migration onto the Storage Box
+  ansible.builtin.include_role:
+    name: nextcloud_storage
+    tasks_from: after
+
 - name: Wait until Nextcloud is installed (first boot runs the installer)
   ansible.builtin.command:
     argv: [docker, exec, -u, www-data, nextcloud, php, occ, status, --output=json]

@@ -9,7 +9,9 @@
 # clients (desktop/mobile, CalDAV/CardDAV) authenticate against Nextcloud
 # itself and would break behind an SSO redirect.
 
-nextcloud_version: "35-apache"
+# An exact release tag (not the moving "35-apache"): a re-pull can never upgrade behind
+# your back; newer releases are offered on the upgrade page (nextcloud-upgrade.yml).
+nextcloud_version: "35.0.1-apache"
 nextcloud_image: "nextcloud:{{ nextcloud_version }}"
 nextcloud_redis_image: "valkey/valkey:9"
 

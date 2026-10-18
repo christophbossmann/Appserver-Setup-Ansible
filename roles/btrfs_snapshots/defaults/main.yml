@@ -13,7 +13,9 @@ btrfs_snapshots_enable: auto
 # Which mounted path decides "is this a btrfs snapshot host?" — usually the OS root.
 btrfs_check_path: "/"
 
-# Which snapper config the named checkpoint snapshots (ans_before_hardening, ...) use —
+# How many ans_pre_run snapshots (one at the start of every server-all run) are kept.
+btrfs_pre_run_keep: 5
+# Which snapper config the named checkpoint snapshots (ans_pre_run, anchors) use —
 # the OS root by default. This config must already exist (created by btrfs-bootstrap.sh).
 # NOTE: the checkpoints are created via the server's 'snapshot' helper, which is root-
 # scoped — so keep this 'root' (it's only used here for the readiness/exists check).

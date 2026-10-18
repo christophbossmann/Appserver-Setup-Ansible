@@ -103,7 +103,7 @@ Shared options:
 ```bash
 # Real upgrade
 ansible-playbook playbooks/nextcloud-upgrade.yml \
-  --limit myserver -e nextcloud_upgrade_version=32-apache -e upgrade_confirm=YES
+  --limit myserver -e nextcloud_upgrade_version=32.0.5-apache -e upgrade_confirm=YES
 
 # Non-committal drill (upgrades, verifies, then rolls back)
 ansible-playbook playbooks/immich-upgrade.yml \
@@ -114,6 +114,29 @@ ansible-playbook playbooks/immich-upgrade.yml \
 ansible-playbook playbooks/stack-upgrade.yml \
   --limit myserver -e upgrade_service=grafana -e upgrade_version=13.2.3 -e upgrade_confirm=YES
 ```
+
+### Late rollback (up to 72 h after an upgrade)
+
+For when something turns out not to work only later. Every kept upgrade leaves a record on
+the host (`/var/lib/app-upgrade/rollback/<service>.json`) with what it takes to go back;
+`upgrade-rollback.yml` uses it:
+
+```bash
+ansible-playbook playbooks/upgrade-rollback.yml --limit myserver -e rollback_service=nextcloud -e upgrade_confirm=YES
+```
+
+(or the "roll back to …" link on the on-host upgrade page). What goes back:
+
+| Service | How |
+|---|---|
+| immich, nextcloud, postgres_business | They share the `postgres-business` instance, so it goes back **as a whole** (PITR to the upgrade's anchor) — both apps lose their database changes since then. Their data volumes go back to btrfs snapshots taken at the anchor (catalog `snapshots:`), so files and database match. Immich originals on the Storage Box uploaded since are imported again. Any other service on the instance upgraded after the anchor goes back with it. |
+| authentik | PITR of its own instance + the previous images. |
+| everything else | The previous image, plus the state copy taken before the upgrade (catalog `state_paths:`). |
+
+The previous images are pulled first — if that fails, nothing is changed. The window is
+`rollback_window_hours` (default 72); `app-upgrade expire` (hourly timer) then removes the
+record, the snapshots and the state copies. A drill (`force_rollback`) or a failed upgrade
+leaves no record.
 
 ### The upgrade catalog
 
@@ -143,6 +166,7 @@ the repo win on purpose.
 | `pitr_restore.yml` | `postgres-pitr-restore.yml` and the upgrade rollbacks — the actual PITR steps (move data dir aside → extract base + WAL → recover to target → fresh base on the new timeline). |
 | `nextcloud_rollback.yml`, `immich_rollback.yml`, `authentik_rollback.yml`, `postgres_business_rollback.yml` | the respective upgrade's rescue **and** its `force_rollback` path. |
 | `stack_upgrade_deploy.yml`, `stack_upgrade_rollback.yml` | `stack-upgrade.yml`: (re)deploy + verify, used for the upgrade and for the rollback alike. |
+| `rollback_prepare.yml`, `rollback_record.yml`, `volume_snapshot_rollback.yml` | the late rollback: snapshots at the anchor, the record, swapping a data volume back. |
 | `record_version.yml`, `adopt_host_versions.yml` | version records on the host and their reconciliation with the private config (see above). |
 
 ## `tests/` — non-destructive verification (on-demand only)

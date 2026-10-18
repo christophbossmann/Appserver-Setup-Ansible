@@ -2,7 +2,7 @@
 # Nextcloud upgrade with automatic PITR rollback on failure.
 #
 #   ansible-playbook playbooks/nextcloud-upgrade.yml --limit <host> \
-#     -e nextcloud_upgrade_version=32-apache \
+#     -e nextcloud_upgrade_version=32.0.5-apache \
 #     -e upgrade_confirm=YES \
 #     [-e upgrade_keep_old=false]   # drop the pre-rollback data dir if a rollback happens
 #
@@ -85,6 +85,12 @@
       ansible.builtin.command:
         argv: [docker, exec, "{{ _biz }}", psql, -U, "{{ postgres_business_user }}", -c, "select pg_switch_wal()"]
       changed_when: false
+
+    # Late rollback: snapshots of the data volumes at this very moment (tasks/rollback_prepare.yml).
+    - name: Snapshot the data volumes for a later rollback
+      ansible.builtin.include_tasks: tasks/rollback_prepare.yml
+      vars:
+        rb_service: nextcloud
 
     # ---- PRE-UPGRADE CONFIG SNAPSHOT (tiny; restored on rollback) ----------------------
     - name: Ensure snapshot dir
@@ -205,6 +211,19 @@
             rec_file: nextcloud.yml
             rec_value: "{{ nextcloud_upgrade_version }}"
             rec_previous: "{{ _rollback_version }}"
+          when: not (force_rollback | default(false) | bool)
+
+        - name: Record the late rollback ({{ rollback_window_hours | default(72) }} h)
+          ansible.builtin.include_tasks: tasks/rollback_record.yml
+          vars:
+            rb_service: nextcloud
+            rb_from: "{{ _rollback_version }}"
+            rb_to: "{{ nextcloud_upgrade_version }}"
+            rb_var: nextcloud_version
+            rb_file: nextcloud.yml
+            rb_anchor: "{{ _pitr_target }}"
+            rb_pitr: postgres-business
+            rb_snapshots: "{{ _rb_snapshots | default({}) }}"
           when: not (force_rollback | default(false) | bool)
 
         - name: Drop the pre-upgrade copy of the program dir (upgrade kept)

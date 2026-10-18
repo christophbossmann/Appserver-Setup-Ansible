@@ -65,6 +65,8 @@
       environment:
         TEXTFILE_DIR: "{{ _ri_tmp.path }}"
         IMMICH_STORAGE_LIST_DIR: "{{ _ri_tmp.path }}"
+        # files younger than this are skipped (could still be uploading); a rollback passes 0
+        IMMICH_STORAGE_ORPHAN_MIN_AGE_MIN: "{{ immich_reimport_min_age_min | default(60) }}"
       changed_when: false
       check_mode: false
 

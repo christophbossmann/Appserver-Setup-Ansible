@@ -11,7 +11,8 @@
 set -euo pipefail
 
 RCLONE=(rclone --config {{ storagebox_config_file }})
-REMOTE="{{ storagebox_remote_name }}:{{ [storagebox_remote_subdir, storagebox_root_path, storagebox_backup_dir] | select | join('/') }}"
+# storagebox_backup_remote: an encrypted target (rclone crypt, e.g. box-crypt:backup) — else plain
+REMOTE="{{ storagebox_backup_remote if (storagebox_backup_remote | default('') | length > 0) else (storagebox_remote_name ~ ':' ~ ([storagebox_remote_subdir, storagebox_root_path, storagebox_backup_dir] | select | join('/'))) }}"
 THUMBS_SRC="{{ storagebox_backup_thumbs_src }}"
 WORK="{{ storagebox_backup_dump_workdir }}"
 INTERVAL_DAYS={{ storagebox_backup_dump_interval_days }}

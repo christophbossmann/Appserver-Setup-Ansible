@@ -1,0 +1,295 @@
+---
+# LATE rollback of an upgrade — within rollback_window_hours (default 72) after it, for when
+# something turns out not to work only later. The upgrade playbooks left a record on the
+# host (/var/lib/app-upgrade/rollback/<service>.json, tasks/rollback_record.yml); this puts
+# the version from before back, together with the data of that moment:
+#
+#   ansible-playbook playbooks/upgrade-rollback.yml --limit <host> \
+#     -e rollback_service=<service> -e upgrade_confirm=YES
+#   (or the "roll back" link on the on-host upgrade page)
+#
+# Per kind of service:
+#   immich / nextcloud / postgres_business — they share the postgres-business instance, so it
+#     is rolled back AS A WHOLE (point-in-time recovery to the upgrade's anchor): BOTH apps
+#     lose their database changes since then. Their data volumes go back to the snapshots
+#     taken at that moment (tasks/rollback_prepare.yml), so files and database match again.
+#     Immich originals live on the Storage Box (no snapshots there): the ones uploaded since
+#     are imported again afterwards (they get new database rows — albums / favourites /
+#     faces set since then are lost, the photos are not). Every OTHER service on that
+#     instance that was upgraded after the anchor is rolled back together with it (its new
+#     version would otherwise run on the old database).
+#   authentik — its own instance: point-in-time recovery to the anchor + the previous images
+#     (logins and second factors set up since then are lost).
+#   everything else (stack-upgrade.yml) — the previous image, and the state copy taken before
+#     the upgrade where the service has file-based state.
+# The images of the previous versions are pulled FIRST: if one cannot be had (registry
+# down, Docker Hub limit), nothing is changed.
+# Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
+- import_playbook: preflight-ssh-agent.yml
+  when: not (upgrade_local_run | default(false) | bool)
+
+- name: Late rollback of an upgrade
+  hosts: all
+  become: true
+  vars:
+    upgrade_confirm: ""
+    rollback_service: ""
+    upgrade_keep_old: false
+    upgrade_health_retries: 60
+    upgrade_settle_seconds: 20
+    _biz: postgres-business
+    _occ: ["docker", "exec", "-u", "www-data", "nextcloud", "php", "occ"]
+    _rbdir: /var/lib/app-upgrade/rollback
+  tasks:
+    - name: Safety guard
+      ansible.builtin.assert:
+        that:
+          - upgrade_confirm | default('') == 'YES'
+          - (rollback_service | default('')) | length > 0
+        fail_msg: "Need -e rollback_service=<service> -e upgrade_confirm=YES"
+
+    - name: Reconcile versions with the host
+      ansible.builtin.include_tasks: tasks/adopt_host_versions.yml
+
+    - name: Load the upgrade catalog
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/vars/upgrade_catalog.yml"
+        name: _cat
+
+    - name: Read the rollback records
+      ansible.builtin.shell: |
+        for f in {{ _rbdir }}/*.json; do [ -e "$f" ] && { cat "$f"; echo "@@"; }; done; true
+      args:
+        executable: /bin/bash
+      register: _rb_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse
+      ansible.builtin.set_fact:
+        _rb_all: "{{ (_rb_raw.stdout | default('')).split('@@') | map('trim') | select | map('from_json') | list }}"
+        _now: "{{ lookup('pipe', 'date -u +%s') | int }}"
+
+    - name: Pick the record
+      ansible.builtin.set_fact:
+        _rb: "{{ _rb_all | selectattr('service', 'equalto', rollback_service) | first | default({}) }}"
+
+    - name: There must be a valid record
+      ansible.builtin.assert:
+        that:
+          - _rb | length > 0
+          - (_rb.expires | int) > (_now | int)
+        fail_msg: >-
+          No rollback available for {{ rollback_service }}{{ (' (the window ended ' ~ ('%Y-%m-%d %H:%M UTC' | strftime(_rb.expires | int)) ~ ')') if _rb | length > 0 else '' }}.
+
+    # Services on the same postgres instance upgraded AFTER this one go back with it.
+    - name: Everything that goes back
+      ansible.builtin.set_fact:
+        _joint: >-
+          {{ ([_rb] + (_rb_all | rejectattr('service', 'equalto', _rb.service)
+                              | selectattr('pitr', 'equalto', _rb.pitr) | rejectattr('pitr', 'equalto', '')
+                              | selectattr('created', 'ge', _rb.created) | list)) }}
+        _kind: "{{ 'business' if _rb.pitr == 'postgres-business' else ('authentik' if _rb.service == 'authentik' else 'stack') }}"
+
+    - name: Plan
+      ansible.builtin.debug:
+        msg: >-
+          {{ _joint | map(attribute='service') | zip(_joint | map(attribute='to'), _joint | map(attribute='from'))
+             | map('join', ': ') | join('; ') }} (to -> from) —
+          {{ 'database ' ~ _rb.pitr ~ ' back to ' ~ _rb.anchor ~ ', volumes ' ~ (_rb.snapshots | dict2items | map(attribute='key') | join(', ') or 'none')
+             if _rb.anchor else 'previous image' ~ (' + state copy' if _rb.state_paths else '') }}.
+
+    - name: Remember which containers are running
+      ansible.builtin.command: docker ps --format {{ '{{.Names}}' }}
+      register: _rb_running
+      changed_when: false
+
+    # ---- 1. the previous images must be available BEFORE anything changes --------------------
+    - name: Pull the images of the previous versions
+      ansible.builtin.shell: |
+        set -e
+        {% for r in _joint %}
+        {% for img in _cat.upgrade_catalog[r.service].images | default([]) %}
+        docker pull -q "{{ img }}:{{ r.from | regex_replace('^.*:', '') }}"
+        {% endfor %}
+        {% endfor %}
+      args:
+        executable: /bin/bash
+      register: _rb_pull
+      changed_when: false
+
+    # ---- 2a. immich / nextcloud / postgres_business: the shared instance as a whole ----------
+    - name: Shared database instance
+      when: _kind == 'business'
+      vars:
+        _set: "{{ _joint | map(attribute='service') | list }}"
+      block:
+        - name: Freeze nextcloud (maintenance) — best effort
+          ansible.builtin.shell: "{{ _occ | join(' ') }} maintenance:mode --on || true"
+          changed_when: true
+
+        - name: Stop the apps on the instance
+          ansible.builtin.shell: "docker stop immich-server immich-machine-learning nextcloud nextcloud-cron 2>/dev/null || true"
+          changed_when: true
+
+        - name: The previous database image first (it was upgraded after the anchor)
+          ansible.builtin.include_role:
+            name: compose_stack
+          vars:
+            stack: postgres-business
+            postgres_business_image: "{{ (_joint | selectattr('service', 'equalto', 'postgres_business') | first).from }}"
+          when: "'postgres_business' in _set"
+
+        - name: Point-in-time recovery of the instance to the anchor
+          ansible.builtin.include_tasks: tasks/pitr_restore.yml
+          vars:
+            pitr_instance: postgres-business
+            pitr_target_time: "{{ _rb.anchor }}"
+            pitr_keep_old: false
+
+        - name: The data volumes back to the anchor
+          ansible.builtin.include_tasks: tasks/volume_snapshot_rollback.yml
+          loop: "{{ _rb.snapshots | dict2items }}"
+          loop_control:
+            loop_var: _vs
+            label: "{{ _vs.key }} #{{ _vs.value }}"
+          vars:
+            vsr_config: "{{ _vs.key }}"
+            vsr_number: "{{ _vs.value }}"
+
+        - name: Immich in the version from before (if it goes back) — else as it is
+          ansible.builtin.include_role:
+            name: compose_stack
+          vars:
+            stack: immich
+            immich_version: "{{ (_joint | selectattr('service', 'equalto', 'immich') | first).from if 'immich' in _set else immich_version }}"
+
+        - name: Nextcloud in the version from before (if it goes back) — else as it is
+          ansible.builtin.include_role:
+            name: compose_stack
+          vars:
+            stack: nextcloud
+            nextcloud_version: "{{ (_joint | selectattr('service', 'equalto', 'nextcloud') | first).from if 'nextcloud' in _set else nextcloud_version }}"
+
+        - name: Wait until nextcloud answers (installed, not upgrading)
+          ansible.builtin.command:
+            argv: "{{ _occ + ['status', '--output=json'] }}"
+          register: _ncs
+          until: _ncs.rc == 0 and (_ncs.stdout | from_json).installed | default(false) and not ((_ncs.stdout | from_json).needsDbUpgrade | default(true))
+          retries: "{{ upgrade_health_retries }}"
+          delay: 5
+          changed_when: false
+
+        - name: Nextcloud out of maintenance
+          ansible.builtin.command:
+            argv: "{{ _occ + ['maintenance:mode', '--off'] }}"
+          changed_when: true
+
+        - name: Nextcloud file index matches the files (volume and database are from the same moment)
+          ansible.builtin.command:
+            argv: "{{ _occ + ['files:scan', '--all'] }}"
+          changed_when: false
+
+        - name: Wait until immich-server is healthy
+          ansible.builtin.command:
+            argv: [docker, inspect, immich-server, -f, "{{ '{{.State.Health.Status}}' }}"]
+          register: _ih
+          until: (_ih.stdout | trim) == 'healthy'
+          retries: "{{ upgrade_health_retries }}"
+          delay: 5
+          changed_when: false
+
+        - name: Lift immich maintenance mode (the restored database may still have it set)
+          ansible.builtin.command: docker exec immich-server immich-admin disable-maintenance-mode
+          changed_when: true
+          failed_when: false
+
+        # Originals uploaded since the anchor are still on the Storage Box but unknown to the
+        # restored database: import them again (min age 0 — nothing is uploading right now).
+        - name: Import the photos uploaded since the anchor again
+          ansible.builtin.include_tasks: tasks/immich_reimport_orphans.yml
+          vars:
+            immich_reimport_confirm: "YES"
+            immich_reimport_min_age_min: 0
+
+        - name: Immich files and database must match now
+          ansible.builtin.shell: |
+            set -e
+            systemctl start immich-storage-metrics.service
+            p=/var/lib/node_exporter/textfile/immich-storage.prom
+            grep -q '^immich_storage_scan_success 1' $p
+            awk '/^immich_storage_(orphan|missing)_files\{dir="(library|upload)"\}/ { s += $NF } END { print s + 0 }' $p
+          args:
+            executable: /bin/bash
+          register: _ri_check
+          changed_when: false
+          failed_when: _ri_check.rc != 0 or (_ri_check.stdout_lines[-1] | int) > 0
+
+    # ---- 2b. authentik: its own instance --------------------------------------------------------
+    - name: Authentik
+      when: _kind == 'authentik'
+      ansible.builtin.include_tasks: tasks/authentik_rollback.yml
+      vars:
+        _akpg: authentik-postgres
+        _ak_containers: [authentik-server, authentik-worker, authentik-ldap]
+        _ak_api: "http://127.0.0.1:{{ authentik_http_port }}"
+        _pitr_target: "{{ _rb.anchor }}"
+        _rollback_version: "{{ _rb.from }}"
+
+    # ---- 2c. everything else: previous image (+ state copy) ---------------------------------------
+    - name: Previous image (+ state copy)
+      when: _kind == 'stack'
+      ansible.builtin.include_tasks: tasks/stack_upgrade_rollback.yml
+      vars:
+        _svc: "{{ _cat.upgrade_catalog[_rb.service] | combine({'state_paths': _rb.state_paths}) }}"
+        _old_value: "{{ _rb.from }}"
+        _stamp: "{{ _rb.stamp }}"
+
+    - name: Everything that ran before runs again (e.g. containers stopped for a volume swap)
+      ansible.builtin.shell: |
+        for c in {{ _rb_running.stdout_lines | join(' ') }}; do
+          [ "$(docker inspect -f '{{ '{{.State.Running}}' }}' "$c" 2>/dev/null)" = true ] || { docker start "$c" >/dev/null && echo "started $c"; }
+        done; true
+      args:
+        executable: /bin/bash
+      register: _rb_restart
+      changed_when: "'started' in _rb_restart.stdout"
+
+    # ---- 3. the config repo and the version records follow -----------------------------------------
+    - name: Persist the previous versions to the private config
+      ansible.builtin.lineinfile:
+        path: "{{ inventory_dir }}/group_vars/all/{{ item.file }}"
+        regexp: '^{{ item.var }}:'
+        line: '{{ item.var }}: "{{ item.from }}"'
+      loop: "{{ _joint }}"
+      loop_control:
+        label: "{{ item.var }} = {{ item.from }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Record the versions on the host
+      ansible.builtin.include_tasks: tasks/record_version.yml
+      loop: "{{ _joint }}"
+      loop_control:
+        loop_var: _jr
+        label: "{{ _jr.service }}"
+      vars:
+        rec_service: "{{ _jr.service }}"
+        rec_var: "{{ _jr.var }}"
+        rec_file: "{{ _jr.file }}"
+        rec_value: "{{ _jr.from }}"
+        rec_previous: "{{ _jr.to }}"
+
+    - name: The rollbacks are used up
+      ansible.builtin.file:
+        path: "{{ _rbdir }}/{{ item.service }}.json"
+        state: absent
+      loop: "{{ _joint }}"
+      loop_control:
+        label: "{{ item.service }}"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Rolled back: {{ _joint | map(attribute='service') | zip(_joint | map(attribute='from')) | map('join', ' -> ') | join(', ') }}.
+          {{ 'Database back to ' ~ _rb.anchor ~ '.' if _rb.anchor else '' }}

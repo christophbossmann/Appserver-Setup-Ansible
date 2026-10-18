@@ -18,6 +18,9 @@
 storagebox_backup_enabled: false
 
 storagebox_backup_dir: backup
+# Write through an rclone crypt remote instead (roles/storagebox storagebox_crypt_remotes), e.g.
+# "box-crypt:backup" — contents and file names encrypted on the box. Empty = plain.
+storagebox_backup_remote: ""
 
 # --- immich thumbnails ----------------------------------------------------------------
 storagebox_backup_thumbs_enabled: true

@@ -98,6 +98,12 @@
         argv: "{{ _psql + ['-c', 'select pg_switch_wal()'] }}"
       changed_when: false
 
+    # Late rollback: snapshots of the data volumes at this very moment (tasks/rollback_prepare.yml).
+    - name: Snapshot the data volumes for a later rollback
+      ansible.builtin.include_tasks: tasks/rollback_prepare.yml
+      vars:
+        rb_service: postgres_business
+
     # ---- UPGRADE (block) with automatic PITR ROLLBACK (rescue) -------------------------
     - name: Upgrade
       block:
@@ -252,6 +258,19 @@
             rec_file: postgres.yml
             rec_value: "{{ _new_image }}"
             rec_previous: "{{ _old_image }}"
+          when: not (force_rollback | default(false) | bool)
+
+        - name: Record the late rollback ({{ rollback_window_hours | default(72) }} h)
+          ansible.builtin.include_tasks: tasks/rollback_record.yml
+          vars:
+            rb_service: postgres_business
+            rb_from: "{{ _old_image }}"
+            rb_to: "{{ _new_image }}"
+            rb_var: postgres_business_image
+            rb_file: postgres.yml
+            rb_anchor: "{{ _pitr_target }}"
+            rb_pitr: postgres-business
+            rb_snapshots: "{{ _rb_snapshots | default({}) }}"
           when: not (force_rollback | default(false) | bool)
 
         # Base backups taken before the upgrade stay usable (same Postgres major), but a

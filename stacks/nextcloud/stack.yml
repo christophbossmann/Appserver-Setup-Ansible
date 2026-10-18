@@ -11,8 +11,13 @@ networks:
 dirs:
   # www-data (uid 33) inside the official image. ABSOLUTE paths — the data lives in the
   # 'business' data domain (/srv/business/nextcloud/*), NOT under the compose project dir.
+  # The data dir only when it is LOCAL: on the Storage Box (nextcloud_data_external) the mount
+  # sets owner and permissions itself (roles/storagebox, storagebox_extra_mounts).
   - { path: "{{ nextcloud_html_dir }}", owner: "33", group: "33", mode: "0750" }
-  - { path: "{{ nextcloud_data_dir }}", owner: "33", group: "33", mode: "0750" }
+  - path: "{{ nextcloud_data_dir if not (nextcloud_data_external | default(false) | bool) else nextcloud_html_dir }}"
+    owner: "33"
+    group: "33"
+    mode: "0750"
 
 # First start installs Nextcloud + runs DB migrations — give it headroom.
 health_url: "http://127.0.0.1:{{ nextcloud_port }}/status.php"

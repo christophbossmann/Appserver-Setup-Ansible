@@ -1,3 +1,19 @@
+# Caddy route for ntfy (alert push to the phone; monitoring_alerting_enabled). External so the
+# phone app reaches it without the VPN — ntfy itself denies everyone but its declared users.
+caddy_route_ntfy:
+  name: ntfy
+  depends_service: monitoring
+  hostname_label: ntfy
+  caddy_upstream: "127.0.0.1:{{ ntfy_port | default(2586) }}"
+  healthcheck_status_codes: [200, 404]   # web app disabled: "/" is a 404, the API answers
+  # Access log -> journald: "Access logs" dashboard + the caddy-ntfy fail2ban jail
+  # (roles/hardening) banning IPs that keep failing the login.
+  caddy_extra: |
+    log {
+      output stderr
+      format json
+    }
+
 # Caddy route for grafana (lives in the monitoring role) — loaded explicitly by caddy.
 caddy_route_grafana:
   name: grafana
@@ -28,5 +44,9 @@ caddy_route_grafana:
     }
     handle /hooks/snapshots {
         redir https://{{ svc_edge_host['upgrade'] }}/hooks/snapshots?{query} 302
+    }
+    # "Blocked IPs (portal)" link on the Security dashboard
+    handle /hooks/blocklist {
+        redir https://{{ svc_edge_host['upgrade'] }}/hooks/blocklist 302
     }
     {% endif %}

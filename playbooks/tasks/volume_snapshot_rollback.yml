@@ -1,0 +1,31 @@
+---
+# Roll ONE data volume back to a snapper snapshot (the host's `snapshot` helper: the current
+# state is kept as <subvolume>_rollback_backup_<date>, snapshots newer than the target are
+# dropped). The containers that bind the volume are stopped first — the caller starts what
+# it needs again (redeploy). Expects: vsr_config, vsr_number.
+- name: "Mountpoint of {{ vsr_config }}"
+  ansible.builtin.shell: "snapper -c {{ vsr_config }} get-config | awk -F'|' '$1 ~ /^SUBVOLUME/ { gsub(/ /, \"\", $2); print $2 }'"
+  register: _vsr_mp
+  changed_when: false
+
+- name: "Stop the containers that bind {{ _vsr_mp.stdout }}"
+  ansible.builtin.shell: |
+    set -e
+    ids=$(docker ps -q); [ -n "$ids" ] || exit 0
+    users=$(docker inspect -f '{{ '{{.Name}}|{{range .Mounts}}{{.Source}};{{end}}' }}' $ids \
+            | awk -F'|' -v p="{{ _vsr_mp.stdout }}" '{ n = split($2, m, ";"); for (i = 1; i <= n; i++) if (m[i] == p || index(m[i], p "/") == 1) { sub(/^\//, "", $1); print $1; break } }')
+    [ -z "$users" ] || { docker stop $users >/dev/null; echo "stopped: $users"; }
+  args:
+    executable: /bin/bash
+  register: _vsr_stop
+  changed_when: "'stopped' in _vsr_stop.stdout"
+
+- name: "Roll {{ vsr_config }} back to snapshot #{{ vsr_number }}"
+  ansible.builtin.command:
+    argv: [/usr/local/bin/snapshot, -c, "{{ vsr_config }}", rollback, "{{ vsr_number }}", -y]
+  register: _vsr_out
+  changed_when: true
+
+- name: "Result for {{ vsr_config }}"
+  ansible.builtin.debug:
+    msg: "{{ _vsr_out.stdout_lines | select('search', 'rolled|kept|dropped') | list }}"

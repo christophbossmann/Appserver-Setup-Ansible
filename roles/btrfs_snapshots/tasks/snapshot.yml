@@ -91,9 +91,12 @@
         # checkpoints get --cleanup number (auto-pruned); PERMANENT anchors
         # (btrfs_snapshot_permanent=true, e.g. ans_pre_setup / ans_subvols_ready) are
         # created WITHOUT a cleanup algorithm so they are never auto-deleted.
+        # btrfs_snapshot_keep=N (e.g. ans_pre_run): a fresh snapshot EVERY run, no snapper cleanup
+        # (it would share NUMBER_LIMIT with the apt pre/post pairs and push them out on busy
+        # days) — the newest N of this label are kept, older ones deleted below.
         - name: Create {{ 'PERMANENT anchor' if (btrfs_snapshot_permanent | default(false) | bool) else 'checkpoint' }} snapshot '{{ btrfs_snapshot }}' (via the 'snapshot' helper)
           ansible.builtin.command: >-
-            snapshot create {{ '' if (btrfs_snapshot_permanent | default(false) | bool) else '--cleanup number' }}
+            snapshot create {{ '' if (btrfs_snapshot_permanent | default(false) | bool) or btrfs_snapshot_keep is defined else '--cleanup number' }}
             {{ btrfs_snapshot }}
           register: _btrfs_cp_create
           changed_when: (_btrfs_cp_create.rc | default(1)) == 0
@@ -101,12 +104,28 @@
           # mode=auto: stay tolerant (warn below).
           failed_when: (_btrfs_req | bool) and ((_btrfs_cp_create.rc | default(1)) != 0)
           when:
-            - not ((btrfs_checkpoint_skip_if_exists | default(true) | bool) and (btrfs_snapshot in (_btrfs_cp_cfg.stdout | default(''))))
+            - btrfs_snapshot_keep is defined or not ((btrfs_checkpoint_skip_if_exists | default(true) | bool) and (btrfs_snapshot in (_btrfs_cp_cfg.stdout | default(''))))
+
+        - name: Keep only the newest {{ btrfs_snapshot_keep | default('') }} '{{ btrfs_snapshot }}' snapshots
+          ansible.builtin.shell: |
+            set -o pipefail
+            snapper -c {{ btrfs_checkpoint_config }} --csvout list --columns number,description \
+              | awk -F, -v d='{{ btrfs_snapshot }}' 'NR > 1 && $2 == d {print $1}' | sort -n \
+              | head -n -{{ btrfs_snapshot_keep | int }} \
+              | while read -r n; do snapper -c {{ btrfs_checkpoint_config }} delete "$n" && echo "deleted #$n"; done
+          args:
+            executable: /bin/bash
+          register: _btrfs_prune
+          changed_when: "'deleted' in _btrfs_prune.stdout"
+          when:
+            - btrfs_snapshot_keep is defined
+            - not ansible_check_mode
 
         - name: Checkpoint '{{ btrfs_snapshot }}' already exists — not re-created
           ansible.builtin.debug:
             msg: "A '{{ btrfs_snapshot }}_*' snapshot already exists — skipping (btrfs_checkpoint_skip_if_exists=true)."
           when:
+            - btrfs_snapshot_keep is not defined
             - btrfs_checkpoint_skip_if_exists | default(true) | bool
             - btrfs_snapshot in (_btrfs_cp_cfg.stdout | default(''))
 

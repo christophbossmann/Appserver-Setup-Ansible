@@ -71,3 +71,17 @@ storagebox_ensure_dirs: []
 # Containers that bind the Storage Box mount — stopped while the VFS cache is moved (one-time
 # migration) and started again once the mount is back.
 storagebox_dependent_containers: [immich-server, immich-webdav]
+
+# Extra mounts of single box folders for applications that need their own owner/permissions
+# (the main mount belongs to root — fine for immich, which runs as root in its container).
+# Each: name, subdir (on the box, relative to storagebox_remote_subdir), mountpoint, uid, gid,
+# umask, cache_dir, cache_max_size, containers (restarted after a remount); optional remote
+# (a full rclone remote spec, e.g. "immich-crypt:" — then subdir is the box folder behind it). The empty
+# mountpoint is made immutable, so nothing can be written there while the box is not mounted.
+# Example (Nextcloud data, see nextcloud_data_external): set in group_vars/all/storagebox.yml.
+storagebox_extra_mounts: []
+
+# Encrypted folders on the box (rclone crypt): name, path (box folder), password, password2
+# (vault), optional filename_encryption (off | standard | obfuscate; default off) and
+# directory_name_encryption (default false). Mounted through storagebox_extra_mounts (remote).
+storagebox_crypt_remotes: []

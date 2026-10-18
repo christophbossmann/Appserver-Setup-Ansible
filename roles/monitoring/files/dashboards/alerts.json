@@ -1,0 +1,2182 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "timepicker": {},
+  "timezone": "browser",
+  "weekStartsOn": "",
+  "title": "Alerts overview",
+  "uid": "alerts",
+  "tags": [
+    "alerting",
+    "ansible"
+  ],
+  "panels": [
+    {
+      "id": 100,
+      "title": "Now",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "grafana-api"
+      },
+      "description": "Alert instances firing with severity critical (sent immediately, also at night).",
+      "id": 1,
+      "title": "Critical",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "unit": "none",
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "grafana-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "http://localhost:3000/api/prometheus/grafana/api/v1/rules",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "( $c := $count(data.groups.rules.alerts[labels.alertname != \"Watchdog\"][state = \"Alerting\" and labels.severity = \"critical\"]); [{ \"n\": $c }] )",
+          "columns": [
+            {
+              "selector": "n",
+              "text": "n",
+              "type": "number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "grafana-api"
+      },
+      "description": "Firing with severity warning (held 22-08, sent when the quiet hours end).",
+      "id": 2,
+      "title": "Warnings",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "unit": "none",
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "grafana-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "http://localhost:3000/api/prometheus/grafana/api/v1/rules",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "( $c := $count(data.groups.rules.alerts[labels.alertname != \"Watchdog\"][state = \"Alerting\" and labels.severity = \"warning\"]); [{ \"n\": $c }] )",
+          "columns": [
+            {
+              "selector": "n",
+              "text": "n",
+              "type": "number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "grafana-api"
+      },
+      "description": "Firing daily hints (sent in the morning window).",
+      "id": 3,
+      "title": "Hints",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "unit": "none",
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "blue",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "grafana-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "http://localhost:3000/api/prometheus/grafana/api/v1/rules",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "( $c := $count(data.groups.rules.alerts[labels.alertname != \"Watchdog\"][state = \"Alerting\" and labels.severity = \"info\"]); [{ \"n\": $c }] )",
+          "columns": [
+            {
+              "selector": "n",
+              "text": "n",
+              "type": "number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "grafana-api"
+      },
+      "description": "Instances whose condition holds, but not yet for the rule's 'for' duration.",
+      "id": 4,
+      "title": "Pending",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "unit": "none",
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "grafana-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "http://localhost:3000/api/prometheus/grafana/api/v1/rules",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "( $c := $count(data.groups.rules.alerts[labels.alertname != \"Watchdog\"][$contains(state, \"Pending\")]); [{ \"n\": $c }] )",
+          "columns": [
+            {
+              "selector": "n",
+              "text": "n",
+              "type": "number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "healthchecks-api"
+      },
+      "description": "Checks at healthchecks.io that are down (heartbeat, nightly jobs, watchdog), seen from the outside. No data = the read-only key is missing or healthchecks.io is unreachable.",
+      "id": 5,
+      "title": "healthchecks.io down",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "unit": "none",
+          "noValue": "no data",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "healthchecks-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "https://healthchecks.io/api/v3/checks/",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "( $c := $count(checks[status = \"down\"]); [{ \"n\": $c }] )",
+          "columns": [
+            {
+              "selector": "n",
+              "text": "n",
+              "type": "number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "grafana-api"
+      },
+      "description": "The always-firing Watchdog: firing = Grafana evaluates, Prometheus answers and ntfy is reachable; it pings healthchecks.io every 5 min. Anything else = the alerting path is broken.",
+      "id": 6,
+      "title": "Alerting path",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "alive",
+                  "index": 0
+                },
+                "0": {
+                  "text": "BROKEN",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "unit": "none",
+          "noValue": "BROKEN",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "grafana-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "http://localhost:3000/api/prometheus/grafana/api/v1/rules",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "( $c := $count(data.groups.rules.alerts[labels.alertname = \"Watchdog\" and state = \"Alerting\"]); [{ \"n\": $c }] )",
+          "columns": [
+            {
+              "selector": "n",
+              "text": "n",
+              "type": "number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Firing & pending now",
+      "type": "table",
+      "description": "Every alert instance that is not normal, with the message it sends and since when.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "grafana-api"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "state"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "color": "blue",
+                        "index": 2
+                      },
+                      "alerting": {
+                        "text": "firing",
+                        "color": "red",
+                        "index": 3
+                      },
+                      "firing": {
+                        "color": "red",
+                        "index": 4
+                      },
+                      "pending": {
+                        "color": "yellow",
+                        "index": 5
+                      },
+                      "normal": {
+                        "color": "green",
+                        "index": 6
+                      },
+                      "recovering": {
+                        "color": "yellow",
+                        "index": 7
+                      },
+                      "nodata": {
+                        "text": "no data",
+                        "color": "orange",
+                        "index": 8
+                      },
+                      "error": {
+                        "color": "red",
+                        "index": 9
+                      },
+                      "ok": {
+                        "color": "green",
+                        "index": 10
+                      },
+                      "up": {
+                        "color": "green",
+                        "index": 11
+                      },
+                      "new": {
+                        "text": "new (no ping yet)",
+                        "color": "text",
+                        "index": 12
+                      },
+                      "grace": {
+                        "text": "late (grace)",
+                        "color": "orange",
+                        "index": 13
+                      },
+                      "down": {
+                        "text": "DOWN",
+                        "color": "red",
+                        "index": 14
+                      },
+                      "started": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 15
+                      },
+                      "paused": {
+                        "color": "text",
+                        "index": 16
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "severity"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "color": "blue",
+                        "index": 2
+                      },
+                      "alerting": {
+                        "text": "firing",
+                        "color": "red",
+                        "index": 3
+                      },
+                      "firing": {
+                        "color": "red",
+                        "index": 4
+                      },
+                      "pending": {
+                        "color": "yellow",
+                        "index": 5
+                      },
+                      "normal": {
+                        "color": "green",
+                        "index": 6
+                      },
+                      "recovering": {
+                        "color": "yellow",
+                        "index": 7
+                      },
+                      "nodata": {
+                        "text": "no data",
+                        "color": "orange",
+                        "index": 8
+                      },
+                      "error": {
+                        "color": "red",
+                        "index": 9
+                      },
+                      "ok": {
+                        "color": "green",
+                        "index": 10
+                      },
+                      "up": {
+                        "color": "green",
+                        "index": 11
+                      },
+                      "new": {
+                        "text": "new (no ping yet)",
+                        "color": "text",
+                        "index": 12
+                      },
+                      "grace": {
+                        "text": "late (grace)",
+                        "color": "orange",
+                        "index": 13
+                      },
+                      "down": {
+                        "text": "DOWN",
+                        "color": "red",
+                        "index": 14
+                      },
+                      "started": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 15
+                      },
+                      "paused": {
+                        "color": "text",
+                        "index": 16
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "since"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeFromNow"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "severity",
+            "desc": false
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "state": 0,
+              "severity": 1,
+              "rule": 2,
+              "affected": 3,
+              "message": 4,
+              "since": 5
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "grafana-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "http://localhost:3000/api/prometheus/grafana/api/v1/rules",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "( $a := data.groups.rules.alerts[labels.alertname != \"Watchdog\"][$not($contains(state, \"Normal\"))]; $map($a, function($x){ { \"state\": $lowercase($substringBefore($x.state & \" \", \" \")), \"severity\": $x.labels.severity, \"rule\": $x.labels.alertname, \"affected\": [$x.labels.image, $x.labels.service, $x.labels.device, $x.labels.exported_instance, $x.labels.name][0], \"message\": $x.annotations.summary, \"since\": $toMillis($x.activeAt) } }) )",
+          "columns": [
+            {
+              "selector": "state",
+              "text": "state",
+              "type": "string"
+            },
+            {
+              "selector": "severity",
+              "text": "severity",
+              "type": "string"
+            },
+            {
+              "selector": "rule",
+              "text": "rule",
+              "type": "string"
+            },
+            {
+              "selector": "affected",
+              "text": "affected",
+              "type": "string"
+            },
+            {
+              "selector": "message",
+              "text": "message",
+              "type": "string"
+            },
+            {
+              "selector": "since",
+              "text": "since",
+              "type": "timestamp_epoch"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 101,
+      "title": "History (time range above)",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      }
+    },
+    {
+      "id": 8,
+      "title": "Last fired",
+      "type": "table",
+      "description": "When each rule last started firing in the selected time range, and how often.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "grafana-api"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 8,
+        "x": 0,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "severity"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "color": "blue",
+                        "index": 2
+                      },
+                      "alerting": {
+                        "text": "firing",
+                        "color": "red",
+                        "index": 3
+                      },
+                      "firing": {
+                        "color": "red",
+                        "index": 4
+                      },
+                      "pending": {
+                        "color": "yellow",
+                        "index": 5
+                      },
+                      "normal": {
+                        "color": "green",
+                        "index": 6
+                      },
+                      "recovering": {
+                        "color": "yellow",
+                        "index": 7
+                      },
+                      "nodata": {
+                        "text": "no data",
+                        "color": "orange",
+                        "index": 8
+                      },
+                      "error": {
+                        "color": "red",
+                        "index": 9
+                      },
+                      "ok": {
+                        "color": "green",
+                        "index": 10
+                      },
+                      "up": {
+                        "color": "green",
+                        "index": 11
+                      },
+                      "new": {
+                        "text": "new (no ping yet)",
+                        "color": "text",
+                        "index": 12
+                      },
+                      "grace": {
+                        "text": "late (grace)",
+                        "color": "orange",
+                        "index": 13
+                      },
+                      "down": {
+                        "text": "DOWN",
+                        "color": "red",
+                        "index": 14
+                      },
+                      "started": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 15
+                      },
+                      "paused": {
+                        "color": "text",
+                        "index": 16
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "last fired"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeFromNow"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "last fired",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "rule": 0,
+              "severity": 1,
+              "last fired": 2,
+              "times": 3
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "grafana-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "http://localhost:3000/api/annotations?type=alert&limit=2000&from=${__from}&to=${__to}",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "( $f := *[newState = \"Alerting\" and alertName != \"Watchdog\"]; $last := $f{alertName: $max(time)}; $cnt := $f{alertName: $count(time)}; $sev := $f{alertName: tags[$substringBefore($, \":\") = \"severity\"]}; $map($keys($last), function($k){ { \"rule\": $k, \"severity\": $substringAfter([$lookup($sev, $k)][0], \":\"), \"last fired\": $lookup($last, $k), \"times\": $lookup($cnt, $k) } }) )",
+          "columns": [
+            {
+              "selector": "rule",
+              "text": "rule",
+              "type": "string"
+            },
+            {
+              "selector": "severity",
+              "text": "severity",
+              "type": "string"
+            },
+            {
+              "selector": "last fired",
+              "text": "last fired",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "times",
+              "text": "times",
+              "type": "number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "State changes",
+      "type": "table",
+      "description": "Every state change of every alert instance in the selected time range (Grafana's alert state history \u2014 the same as the History tab of a rule).",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "grafana-api"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 16,
+        "x": 8,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "from"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "color": "blue",
+                        "index": 2
+                      },
+                      "alerting": {
+                        "text": "firing",
+                        "color": "red",
+                        "index": 3
+                      },
+                      "firing": {
+                        "color": "red",
+                        "index": 4
+                      },
+                      "pending": {
+                        "color": "yellow",
+                        "index": 5
+                      },
+                      "normal": {
+                        "color": "green",
+                        "index": 6
+                      },
+                      "recovering": {
+                        "color": "yellow",
+                        "index": 7
+                      },
+                      "nodata": {
+                        "text": "no data",
+                        "color": "orange",
+                        "index": 8
+                      },
+                      "error": {
+                        "color": "red",
+                        "index": 9
+                      },
+                      "ok": {
+                        "color": "green",
+                        "index": 10
+                      },
+                      "up": {
+                        "color": "green",
+                        "index": 11
+                      },
+                      "new": {
+                        "text": "new (no ping yet)",
+                        "color": "text",
+                        "index": 12
+                      },
+                      "grace": {
+                        "text": "late (grace)",
+                        "color": "orange",
+                        "index": 13
+                      },
+                      "down": {
+                        "text": "DOWN",
+                        "color": "red",
+                        "index": 14
+                      },
+                      "started": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 15
+                      },
+                      "paused": {
+                        "color": "text",
+                        "index": 16
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "to"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "color": "blue",
+                        "index": 2
+                      },
+                      "alerting": {
+                        "text": "firing",
+                        "color": "red",
+                        "index": 3
+                      },
+                      "firing": {
+                        "color": "red",
+                        "index": 4
+                      },
+                      "pending": {
+                        "color": "yellow",
+                        "index": 5
+                      },
+                      "normal": {
+                        "color": "green",
+                        "index": 6
+                      },
+                      "recovering": {
+                        "color": "yellow",
+                        "index": 7
+                      },
+                      "nodata": {
+                        "text": "no data",
+                        "color": "orange",
+                        "index": 8
+                      },
+                      "error": {
+                        "color": "red",
+                        "index": 9
+                      },
+                      "ok": {
+                        "color": "green",
+                        "index": 10
+                      },
+                      "up": {
+                        "color": "green",
+                        "index": 11
+                      },
+                      "new": {
+                        "text": "new (no ping yet)",
+                        "color": "text",
+                        "index": 12
+                      },
+                      "grace": {
+                        "text": "late (grace)",
+                        "color": "orange",
+                        "index": 13
+                      },
+                      "down": {
+                        "text": "DOWN",
+                        "color": "red",
+                        "index": 14
+                      },
+                      "started": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 15
+                      },
+                      "paused": {
+                        "color": "text",
+                        "index": 16
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "time",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "time": 0,
+              "rule": 1,
+              "affected": 2,
+              "from": 3,
+              "to": 4
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "grafana-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "http://localhost:3000/api/annotations?type=alert&limit=2000&from=${__from}&to=${__to}",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "( $a := *[alertName != \"Watchdog\"]; $map($a, function($e){ { \"time\": $e.time, \"rule\": $e.alertName, \"affected\": $join($map($filter($split($substringBefore($substringAfter($e.text, \"{\"), \"}\"), \", \"), function($l){ $substringBefore($l, \"=\") in [\"image\", \"service\", \"device\", \"exported_instance\", \"name\"] }), function($l){ $substringAfter($l, \"=\") }), \" \"), \"from\": $lowercase($e.prevState), \"to\": $lowercase($e.newState) } }) )",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "rule",
+              "text": "rule",
+              "type": "string"
+            },
+            {
+              "selector": "affected",
+              "text": "affected",
+              "type": "string"
+            },
+            {
+              "selector": "from",
+              "text": "from",
+              "type": "string"
+            },
+            {
+              "selector": "to",
+              "text": "to",
+              "type": "string"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 102,
+      "title": "healthchecks.io (seen from the outside)",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      }
+    },
+    {
+      "id": 10,
+      "title": "Checks",
+      "type": "table",
+      "description": "Every check at healthchecks.io: status, last ping, when the next ping is due, schedule and grace (its API, read-only key).",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "healthchecks-api"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "status"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "color": "blue",
+                        "index": 2
+                      },
+                      "alerting": {
+                        "text": "firing",
+                        "color": "red",
+                        "index": 3
+                      },
+                      "firing": {
+                        "color": "red",
+                        "index": 4
+                      },
+                      "pending": {
+                        "color": "yellow",
+                        "index": 5
+                      },
+                      "normal": {
+                        "color": "green",
+                        "index": 6
+                      },
+                      "recovering": {
+                        "color": "yellow",
+                        "index": 7
+                      },
+                      "nodata": {
+                        "text": "no data",
+                        "color": "orange",
+                        "index": 8
+                      },
+                      "error": {
+                        "color": "red",
+                        "index": 9
+                      },
+                      "ok": {
+                        "color": "green",
+                        "index": 10
+                      },
+                      "up": {
+                        "color": "green",
+                        "index": 11
+                      },
+                      "new": {
+                        "text": "new (no ping yet)",
+                        "color": "text",
+                        "index": 12
+                      },
+                      "grace": {
+                        "text": "late (grace)",
+                        "color": "orange",
+                        "index": 13
+                      },
+                      "down": {
+                        "text": "DOWN",
+                        "color": "red",
+                        "index": 14
+                      },
+                      "started": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 15
+                      },
+                      "paused": {
+                        "color": "text",
+                        "index": 16
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "last ping"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeFromNow"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "next ping due"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeFromNow"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "check",
+            "desc": false
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "check": 0,
+              "status": 1,
+              "last ping": 2,
+              "next ping due": 3,
+              "schedule": 4,
+              "grace": 5
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "healthchecks-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "https://healthchecks.io/api/v3/checks/",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "( $c := checks; $map($c, function($x){ { \"check\": $x.name, \"status\": $x.status, \"last\": $x.last_ping, \"next\": $x.next_ping, \"schedule\": $x.schedule ? $x.schedule : ($string($x.timeout / 60) & \" min\"), \"grace\": $string($x.grace / 60) & \" min\" } }) )",
+          "columns": [
+            {
+              "selector": "check",
+              "text": "check",
+              "type": "string"
+            },
+            {
+              "selector": "status",
+              "text": "status",
+              "type": "string"
+            },
+            {
+              "selector": "last",
+              "text": "last ping",
+              "type": "timestamp"
+            },
+            {
+              "selector": "next",
+              "text": "next ping due",
+              "type": "timestamp"
+            },
+            {
+              "selector": "schedule",
+              "text": "schedule",
+              "type": "string"
+            },
+            {
+              "selector": "grace",
+              "text": "grace",
+              "type": "string"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 11,
+      "title": "Check status over time",
+      "type": "state-timeline",
+      "description": "up / late / down of every healthchecks.io check (Prometheus scrapes its metrics every minute; needs healthchecks_project_uuid).",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "up",
+                  "color": "green",
+                  "index": 1
+                },
+                "2": {
+                  "text": "late",
+                  "color": "orange",
+                  "index": 2
+                },
+                "3": {
+                  "text": "late",
+                  "color": "orange",
+                  "index": 3
+                },
+                "5": {
+                  "text": "running",
+                  "color": "green",
+                  "index": 4
+                },
+                "7": {
+                  "text": "running, late",
+                  "color": "orange",
+                  "index": 5
+                }
+              }
+            },
+            {
+              "type": "range",
+              "options": {
+                "from": 8,
+                "to": 15,
+                "result": {
+                  "text": "paused",
+                  "color": "text",
+                  "index": 6
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left",
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (name) (hc_check_up) + 2 * max by (name) (hc_check_grace) + 4 * max by (name) (hc_check_started) + 8 * max by (name) (hc_check_paused)",
+          "legendFormat": "{{name}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 103,
+      "title": "Alert rules",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      }
+    },
+    {
+      "id": 12,
+      "title": "Alert rules",
+      "type": "table",
+      "description": "Every Grafana alert rule: state, how often it is evaluated, when it was last evaluated and is next, and the error if its query failed.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "grafana-api"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "severity"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "color": "blue",
+                        "index": 2
+                      },
+                      "alerting": {
+                        "text": "firing",
+                        "color": "red",
+                        "index": 3
+                      },
+                      "firing": {
+                        "color": "red",
+                        "index": 4
+                      },
+                      "pending": {
+                        "color": "yellow",
+                        "index": 5
+                      },
+                      "normal": {
+                        "color": "green",
+                        "index": 6
+                      },
+                      "recovering": {
+                        "color": "yellow",
+                        "index": 7
+                      },
+                      "nodata": {
+                        "text": "no data",
+                        "color": "orange",
+                        "index": 8
+                      },
+                      "error": {
+                        "color": "red",
+                        "index": 9
+                      },
+                      "ok": {
+                        "color": "green",
+                        "index": 10
+                      },
+                      "up": {
+                        "color": "green",
+                        "index": 11
+                      },
+                      "new": {
+                        "text": "new (no ping yet)",
+                        "color": "text",
+                        "index": 12
+                      },
+                      "grace": {
+                        "text": "late (grace)",
+                        "color": "orange",
+                        "index": 13
+                      },
+                      "down": {
+                        "text": "DOWN",
+                        "color": "red",
+                        "index": 14
+                      },
+                      "started": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 15
+                      },
+                      "paused": {
+                        "color": "text",
+                        "index": 16
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "state"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "color": "blue",
+                        "index": 2
+                      },
+                      "alerting": {
+                        "text": "firing",
+                        "color": "red",
+                        "index": 3
+                      },
+                      "firing": {
+                        "color": "red",
+                        "index": 4
+                      },
+                      "pending": {
+                        "color": "yellow",
+                        "index": 5
+                      },
+                      "normal": {
+                        "color": "green",
+                        "index": 6
+                      },
+                      "recovering": {
+                        "color": "yellow",
+                        "index": 7
+                      },
+                      "nodata": {
+                        "text": "no data",
+                        "color": "orange",
+                        "index": 8
+                      },
+                      "error": {
+                        "color": "red",
+                        "index": 9
+                      },
+                      "ok": {
+                        "color": "green",
+                        "index": 10
+                      },
+                      "up": {
+                        "color": "green",
+                        "index": 11
+                      },
+                      "new": {
+                        "text": "new (no ping yet)",
+                        "color": "text",
+                        "index": 12
+                      },
+                      "grace": {
+                        "text": "late (grace)",
+                        "color": "orange",
+                        "index": 13
+                      },
+                      "down": {
+                        "text": "DOWN",
+                        "color": "red",
+                        "index": 14
+                      },
+                      "started": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 15
+                      },
+                      "paused": {
+                        "color": "text",
+                        "index": 16
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "health"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "color": "blue",
+                        "index": 2
+                      },
+                      "alerting": {
+                        "text": "firing",
+                        "color": "red",
+                        "index": 3
+                      },
+                      "firing": {
+                        "color": "red",
+                        "index": 4
+                      },
+                      "pending": {
+                        "color": "yellow",
+                        "index": 5
+                      },
+                      "normal": {
+                        "color": "green",
+                        "index": 6
+                      },
+                      "recovering": {
+                        "color": "yellow",
+                        "index": 7
+                      },
+                      "nodata": {
+                        "text": "no data",
+                        "color": "orange",
+                        "index": 8
+                      },
+                      "error": {
+                        "color": "red",
+                        "index": 9
+                      },
+                      "ok": {
+                        "color": "green",
+                        "index": 10
+                      },
+                      "up": {
+                        "color": "green",
+                        "index": 11
+                      },
+                      "new": {
+                        "text": "new (no ping yet)",
+                        "color": "text",
+                        "index": 12
+                      },
+                      "grace": {
+                        "text": "late (grace)",
+                        "color": "orange",
+                        "index": 13
+                      },
+                      "down": {
+                        "text": "DOWN",
+                        "color": "red",
+                        "index": 14
+                      },
+                      "started": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 15
+                      },
+                      "paused": {
+                        "color": "text",
+                        "index": 16
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "last evaluated"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeFromNow"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "next evaluation"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeFromNow"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "state",
+            "desc": false
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "rule": 0,
+              "severity": 1,
+              "state": 2,
+              "health": 3,
+              "evaluated every": 4,
+              "last evaluated": 5,
+              "next evaluation": 6,
+              "error": 7
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "grafana-api"
+          },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "http://localhost:3000/api/prometheus/grafana/api/v1/rules",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "data.groups.( $i := interval; rules.{ \"rule\": name, \"severity\": labels.severity, \"state\": state = \"inactive\" ? \"normal\" : state, \"health\": health, \"every\": $string($i) & \" s\", \"last\": $toMillis(lastEvaluation), \"next\": $toMillis(lastEvaluation) + $i * 1000, \"error\": lastError } )",
+          "columns": [
+            {
+              "selector": "rule",
+              "text": "rule",
+              "type": "string"
+            },
+            {
+              "selector": "severity",
+              "text": "severity",
+              "type": "string"
+            },
+            {
+              "selector": "state",
+              "text": "state",
+              "type": "string"
+            },
+            {
+              "selector": "health",
+              "text": "health",
+              "type": "string"
+            },
+            {
+              "selector": "every",
+              "text": "evaluated every",
+              "type": "string"
+            },
+            {
+              "selector": "last",
+              "text": "last evaluated",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "next",
+              "text": "next evaluation",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "error",
+              "text": "error",
+              "type": "string"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "links": [
+    {
+      "title": "Alert rules",
+      "url": "/alerting/list",
+      "type": "link",
+      "icon": "bolt"
+    },
+    {
+      "title": "healthchecks.io",
+      "url": "https://healthchecks.io/projects/",
+      "type": "link",
+      "icon": "external link",
+      "targetBlank": true
+    }
+  ],
+  "description": "Grafana alerts (now, history, every rule) and the healthchecks.io checks in one place.",
+  "version": 10
+}

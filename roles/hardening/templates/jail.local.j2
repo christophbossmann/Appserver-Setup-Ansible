@@ -30,3 +30,17 @@ maxretry = {{ hardening_fail2ban_caddy_immich_maxretry }}
 findtime = {{ hardening_fail2ban_caddy_immich_findtime }}
 bantime  = {{ hardening_fail2ban_caddy_immich_bantime }}
 {% endif %}
+{% if hardening_fail2ban_caddy_ntfy_enabled | default(false) %}
+
+# Public ntfy route (alert push): ban IPs failing its login / probing topics.
+# ignoreip: the host itself + docker networks — Grafana posts through the public route.
+[caddy-ntfy]
+enabled  = true
+port     = http,https
+filter   = caddy-ntfy
+backend  = systemd
+ignoreip = 127.0.0.1/8 ::1 172.16.0.0/12 {{ ansible_default_ipv4.address | default('') }}
+maxretry = {{ hardening_fail2ban_caddy_ntfy_maxretry }}
+findtime = {{ hardening_fail2ban_caddy_ntfy_findtime }}
+bantime  = {{ hardening_fail2ban_caddy_ntfy_bantime }}
+{% endif %}

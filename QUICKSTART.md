@@ -212,6 +212,8 @@ ansible-playbook playbooks/postgres-business-upgrade.yml --limit <host> \
 # A Docker upgrade restarts every container once.
 ansible-playbook playbooks/host-upgrade.yml --limit <host> -e upgrade_confirm=YES \
   -e host_upgrade_mode=packages-reboot
+# ...and back again within 72 h of an upgrade (previous version + the data of that moment):
+ansible-playbook playbooks/upgrade-rollback.yml --limit <host> -e rollback_service=<name> -e upgrade_confirm=YES
 # Without the controller: hosts with local_upgrade_enabled offer all of the above on
 # https://upgrade.<internal domain>/ (VPN + SSO, admins) — roles/local_upgrade/README.md.
 # The next run from here takes the versions over into the private config: commit them.

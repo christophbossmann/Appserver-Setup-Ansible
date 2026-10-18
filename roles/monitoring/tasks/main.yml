@@ -184,6 +184,94 @@
     mode: "0644"
   notify: Restart monitoring stack
 
+# --- Alerting: Grafana rules + contact points, ntfy (see the Alerting section of defaults) ---
+- name: Alerting
+  when: monitoring_alerting_enabled | default(false) | bool
+  block:
+    - name: Require the ntfy password and the public ntfy route
+      ansible.builtin.assert:
+        that:
+          - ntfy_password | length > 0
+          - "'ntfy' in (caddy_services | default({}))"
+        fail_msg: >-
+          monitoring_alerting_enabled needs vault_ntfy_password (the phone app's login) and
+          caddy_services: ntfy: external (the phone reaches ntfy through it).
+        quiet: true
+
+    - name: Alerting directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /opt/monitoring/provisioning/alerting
+        - /opt/monitoring/ntfy
+
+    # recurse: files created while it still ran as root are handed over
+    - name: ntfy data directory (owned by the container's unprivileged uid)
+      ansible.builtin.file:
+        path: "{{ ntfy_data_dir }}"
+        state: directory
+        owner: "{{ ntfy_uid }}"
+        group: "{{ ntfy_uid }}"
+        mode: "0700"
+        recurse: true
+
+    - name: Deploy the ntfy server config
+      ansible.builtin.template:
+        src: ntfy-server.yml.j2
+        dest: /opt/monitoring/ntfy/server.yml
+        owner: "{{ ntfy_uid }}"
+        group: "{{ ntfy_uid }}"
+        mode: "0400"
+      no_log: true
+      notify: Restart monitoring stack
+
+    # in the "Alerting" folder, next to the provisioned alert rules (foldersFromFilesStructure)
+    - name: Dashboard folder "Alerting"
+      ansible.builtin.file:
+        path: /opt/monitoring/provisioning/dashboards/json/Alerting
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy the "Alerts overview" dashboard
+      ansible.builtin.copy:
+        src: dashboards/alerts.json
+        dest: /opt/monitoring/provisioning/dashboards/json/Alerting/alerts.json
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Remove its old top-level copy
+      ansible.builtin.file:
+        path: /opt/monitoring/provisioning/dashboards/json/alerts.json
+        state: absent
+
+- name: Read-only healthchecks.io key for Prometheus (uid 65534)
+  ansible.builtin.copy:
+    dest: /opt/monitoring/healthchecks-readonly.key
+    content: "{{ healthchecks_readonly_key }}"
+    owner: "65534"
+    group: "65534"
+    mode: "0400"
+  no_log: true
+  notify: Restart monitoring stack
+  when:
+    - healthchecks_enabled | default(false) | bool
+    - healthchecks_project_uuid | default('') | length > 0
+    - healthchecks_readonly_key | default('') | length > 0
+
+- name: Remove the alerting provisioning where alerting is off
+  ansible.builtin.file:
+    path: /opt/monitoring/provisioning/alerting/alerting.yml
+    state: absent
+  when: not (monitoring_alerting_enabled | default(false) | bool)
+  notify: Restart monitoring stack
+
 # No failed_when: false here — a failed download/transform would provision
 # Grafana with missing or wrong-datasource dashboards while the play stays
 # green. Retries cover transient grafana.com hiccups. Skipped in --check:
@@ -297,6 +385,11 @@
           {% for i in postgres_pitr_instances | default([]) | selectattr('container', 'in', _mon_running.stdout_lines) %}{{ i.name }}:{{ i.host_archive }} {% endfor %}
         oncalendar: "{{ monitoring_pitr_metrics_oncalendar }}"
         enabled: "{{ monitoring_pitr_metrics_enabled | bool }}"
+      - name: updates-metrics
+        description: OS update state for node_exporter (upgradable / security packages, held, reboot pending)
+        exec: /usr/local/bin/updates-metrics
+        oncalendar: "{{ monitoring_updates_metrics_oncalendar }}"
+        enabled: "{{ monitoring_updates_metrics_enabled | bool }}"
       - name: snapshot-metrics
         description: btrfs/snapper snapshots for node_exporter (age, retention, space freed by deleting)
         exec: "/usr/local/bin/snapshot-metrics {{ monitoring_snapshot_metrics_samples }}"
@@ -550,3 +643,155 @@
       Login: {{ grafana_admin_user }}
       Prometheus datasource and dashboards are auto-configured.
       Dashboards: Node Exporter Full (host metrics) + Docker Container & Host Metrics.
+
+# --- "Alerts overview" tables: Infinity datasources (alerting hosts) --------------------
+# Grafana's rules API is read with a Viewer service account — NOT the admin login: every
+# Grafana user can run queries through a datasource, so its credentials must not be more
+# than a viewer's. The token cannot be read back from Grafana; it is kept root-only on the
+# host and replaced when it no longer works.
+- name: Alerts overview datasources
+  when:
+    - monitoring_alerting_enabled | default(false) | bool
+    - not ansible_check_mode
+  vars:
+    _gf: "http://127.0.0.1:{{ grafana_port }}"
+    _token_file: /opt/monitoring/grafana-alerts-viewer.token
+  block:
+    - name: Find the alerts-overview service account
+      ansible.builtin.uri:
+        url: "{{ _gf }}/api/serviceaccounts/search?query=alerts-overview"
+        user: "{{ grafana_admin_user }}"
+        password: "{{ grafana_admin_password }}"
+        force_basic_auth: true
+      register: _gf_sa
+      no_log: true
+
+    - name: Create it (role Viewer)
+      ansible.builtin.uri:
+        url: "{{ _gf }}/api/serviceaccounts"
+        method: POST
+        user: "{{ grafana_admin_user }}"
+        password: "{{ grafana_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body: { name: alerts-overview, role: Viewer }
+        status_code: [201]
+      register: _gf_sa_new
+      when: _gf_sa.json.serviceAccounts | selectattr('name', 'equalto', 'alerts-overview') | list | length == 0
+      no_log: true
+
+    - name: Read the kept token
+      ansible.builtin.slurp:
+        src: "{{ _token_file }}"
+      register: _gf_tok
+      failed_when: false
+      no_log: true
+
+    - name: Does the kept token still work?
+      ansible.builtin.uri:
+        url: "{{ _gf }}/api/user"
+        headers: { Authorization: "Bearer {{ (_gf_tok.content | default('') | b64decode | trim) }}" }
+        status_code: [200, 401]
+      register: _gf_tok_ok
+      when: _gf_tok.content is defined
+      no_log: true
+
+    - name: Create a new token
+      ansible.builtin.uri:
+        url: "{{ _gf }}/api/serviceaccounts/{{ (_gf_sa_new.json.id if _gf_sa_new.json is defined else (_gf_sa.json.serviceAccounts | selectattr('name', 'equalto', 'alerts-overview') | first).id) }}/tokens"
+        method: POST
+        user: "{{ grafana_admin_user }}"
+        password: "{{ grafana_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body: { name: "alerts-overview-{{ now(utc=true, fmt='%Y%m%d%H%M%S') }}" }
+      register: _gf_tok_new
+      when: _gf_tok.content is not defined or _gf_tok_ok.status | default(401) != 200
+      no_log: true
+
+    - name: Keep it (root only)
+      ansible.builtin.copy:
+        dest: "{{ _token_file }}"
+        content: "{{ _gf_tok_new.json.key }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: _gf_tok_new.json is defined
+      no_log: true
+
+    # 0640 root:root — Grafana runs with gid 0 and reads it
+    - name: Deploy the Infinity datasources
+      ansible.builtin.template:
+        src: infinity.yml.j2
+        dest: /opt/monitoring/provisioning/datasources/infinity.yml
+        owner: root
+        group: root
+        mode: "0640"
+      vars:
+        _viewer_token: "{{ _gf_tok_new.json.key if _gf_tok_new.json is defined else (_gf_tok.content | b64decode | trim) }}"
+      no_log: true
+      notify: Restart monitoring stack
+
+# --- Alert time intervals (editable in Grafana) + the alerting provisioning -------------
+# quiet-hours / info-window come from the API, not the file, so they can be changed in the
+# Grafana UI (e.g. the time zone while abroad). Created with the repo defaults when missing;
+# one provisioned from the file earlier is converted once (same content); otherwise what is
+# set in Grafana is kept. The provisioning file is written only now: its policy refers to the
+# intervals, which on a fresh host exist only after Grafana is up.
+- name: Alert time intervals and provisioning
+  when:
+    - monitoring_alerting_enabled | default(false) | bool
+    - not ansible_check_mode
+  vars:
+    _mt: "http://127.0.0.1:{{ grafana_port }}/api/v1/provisioning/mute-timings"
+    _intervals:
+      - { name: quiet-hours, w: "{{ monitoring_alert_quiet_hours }}" }
+      - { name: info-window, w: "{{ monitoring_alert_info_window }}" }
+  block:
+    - name: Read the alert time intervals
+      ansible.builtin.uri:
+        url: "{{ _mt }}/{{ item.name }}"
+        user: "{{ grafana_admin_user }}"
+        password: "{{ grafana_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 404]
+      loop: "{{ _intervals }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: _mt_read
+      no_log: true
+
+    - name: Create missing ones (repo defaults) / make file-provisioned ones editable
+      ansible.builtin.uri:
+        url: "{{ _mt ~ ('/' ~ item.item.name if item.status == 200 else '') }}"
+        method: "{{ 'PUT' if item.status == 200 else 'POST' }}"
+        user: "{{ grafana_admin_user }}"
+        password: "{{ grafana_admin_password }}"
+        force_basic_auth: true
+        headers: { X-Disable-Provenance: "true" }
+        body_format: json
+        body: >-
+          {{ (item.json | dict2items | rejectattr('key', 'in', ['provenance']) | items2dict) if item.status == 200 else
+             {'name': item.item.name, 'time_intervals': [{'location': monitoring_alert_timezone, 'times':
+               ([{'start_time': item.item.w.start, 'end_time': item.item.w.end}] if item.item.w.start < item.item.w.end else
+                [{'start_time': item.item.w.start, 'end_time': '24:00'}, {'start_time': '00:00', 'end_time': item.item.w.end}])}]} }}
+        status_code: [200, 201, 202]
+      loop: "{{ _mt_read.results }}"
+      loop_control: { label: "{{ item.item.name }}" }
+      when: item.status == 404 or (item.json.provenance | default('')) == 'file'
+      changed_when: true
+      no_log: true
+
+    # 0640 root:root — carries the ntfy token and the healthchecks ping key. Grafana runs as
+    # uid 472 with gid 0, so it can read it.
+    - name: Deploy the Grafana alerting provisioning
+      ansible.builtin.template:
+        src: alerting.yml.j2
+        dest: /opt/monitoring/provisioning/alerting/alerting.yml
+        owner: root
+        group: root
+        mode: "0640"
+      vars:
+        _alert_intervals_ready: true
+      no_log: true
+      notify: Restart monitoring stack
+

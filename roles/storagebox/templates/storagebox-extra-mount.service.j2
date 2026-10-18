@@ -1,0 +1,36 @@
+[Unit]
+# Managed by Ansible (roles/storagebox) — an extra mount of one box folder for ONE application,
+# with that application's owner and permissions (storagebox_extra_mounts: {{ item.name }}).
+Description=rclone mount Hetzner Storage Box for {{ item.name }} ({{ item.remote | default(storagebox_remote_name ~ ':' ~ item.subdir) }})
+Documentation=man:rclone(1)
+After=network-online.target
+Wants=network-online.target
+# Mounted before Docker starts its containers at boot, so they bind the live mount and not
+# the empty mountpoint underneath (ordering only: a failed mount does not stop Docker).
+Before=docker.service
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/rclone mount {{ item.remote | default(storagebox_remote_name ~ ':' ~ ([storagebox_remote_subdir, item.subdir] | select | join('/'))) }} {{ item.mountpoint }} \
+  --config {{ storagebox_config_file }} \
+  --allow-other \
+  --uid {{ item.uid }} --gid {{ item.gid }} --umask {{ item.umask }} \
+  --cache-dir {{ item.cache_dir }} \
+  --vfs-cache-mode full \
+  --vfs-cache-max-size {{ item.cache_max_size }} \
+  --vfs-cache-max-age {{ item.cache_max_age | default(storagebox_vfs_cache_max_age) }} \
+  --dir-cache-time {{ storagebox_dir_cache_time }} \
+  --log-level INFO
+ExecStartPost=/bin/mount --make-rshared {{ item.mountpoint }}
+{% if item.containers | default([]) | length > 0 %}
+# A container keeps the mount it saw when it started: after a remount, restart the running ones
+# that use it so they see the new mount (no-op at boot, when they are not running yet).
+ExecStartPost=-/bin/sh -c 'ids=$(docker ps -q {% for c in item.containers %}--filter name=^{{ c }}$ {% endfor %}); [ -z "$ids" ] || docker restart $ids'
+{% endif %}
+ExecStop=/bin/fusermount -uz {{ item.mountpoint }}
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

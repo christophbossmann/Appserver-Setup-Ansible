@@ -145,6 +145,23 @@ vault_acme_dns_int_password: "CHANGEME"
 # ZeroSSL API key (optional CA fallback; empty = unused)
 vault_zerossl_api_key: ""
 
+# --- Alerting -------------------------------------------------------------------
+# healthchecks.io (roles/healthchecks): project Settings -> API Access. The API key (read-write,
+# not read-only) stays on the controller; the ping key lands on the host.
+vault_healthchecks_api_key: ""
+vault_healthchecks_ping_key: ""
+vault_healthchecks_readonly_key: ""   # optional: read-only key, Prometheus scrapes the check status (Alerts overview)
+# Storage Box encryption (rclone crypt, one pair for the whole box). openssl rand -base64 32 each.
+# Keep BOTH also in a second safe place (password manager / printout): without them the
+# encrypted data on the box cannot be read by anyone, you included. Plaintext here; any
+# rclone.conf needs `rclone obscure <value>` instead (see README "Secrets").
+vault_storagebox_crypt_password: ""
+vault_storagebox_crypt_salt: ""
+# AbuseIPDB (roles/hardening blocklist-auto: confirm attackers / release harmless entries; free account)
+vault_abuseipdb_api_key: ""
+# ntfy phone-app login (roles/monitoring, monitoring_alerting_enabled). openssl rand -base64 24
+vault_ntfy_password: "CHANGEME"
+
 # --- Storage Box SSH private key (public key goes in the Hetzner panel) --------
 # Multi-line PEM:  vault_storagebox_ssh_private_key: |
 #                    -----BEGIN OPENSSH PRIVATE KEY-----

@@ -120,6 +120,26 @@
       loop_control:
         label: "{{ item.var }}"
 
+    # Records the repo already matches, and records the operator overrode on purpose
+    # (version_conflict_ok): the repo is the source again — otherwise every later change of that
+    # variable in the repo (even a more exact tag for the same image) would count as a conflict.
+    - name: Mark matching / overridden records as synced
+      ansible.builtin.copy:
+        dest: "/var/lib/app-upgrade/versions/{{ item.var }}.json"
+        mode: "0644"
+        content: "{{ item | combine({'source': 'controller', 'value': _cur}) | to_nice_json }}\n"
+      vars:
+        _role: "{{ (_ver_cat.upgrade_catalog[item.service] | default({})).role | default('') }}"
+        _role_default: "{{ ((lookup('ansible.builtin.file', playbook_dir ~ '/../roles/' ~ _role ~ '/defaults/main.yml') | from_yaml)[item.var] | default('__undefined__')) if _role else '__undefined__' }}"
+        _cur: "{{ lookup('ansible.builtin.vars', item.var, default=_role_default) | string }}"
+      loop: "{{ _ver_recs }}"
+      loop_control:
+        label: "{{ item.var }}"
+      when:
+        - item.source == 'host'
+        - _cur == (item.value | string) or ((version_conflict_ok | default(false) | bool) and item.var in (_ver_conflict | map(attribute='var') | list))
+        - not ansible_check_mode
+
     - name: NOTICE — versions were taken over from the host
       ansible.builtin.debug:
         msg: >-

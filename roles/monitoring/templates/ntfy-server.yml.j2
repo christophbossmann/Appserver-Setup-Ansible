@@ -1,0 +1,25 @@
+# Managed by Ansible (roles/monitoring) — ntfy server, push notifications for the alerts.
+# Users, rights and tokens are declared here; users missing from this list are deleted
+# from the database on restart.
+base-url: "https://{{ (svc_edge_host | default({})).get('ntfy', 'ntfy.invalid') }}"
+listen-http: ":{{ ntfy_port }}"
+# the phone app talks to the API only; no web app = less code reachable from outside
+web-root: disable
+behind-proxy: true
+cache-file: /var/lib/ntfy/cache.db
+cache-duration: 72h
+auth-file: /var/lib/ntfy/auth.db
+auth-default-access: deny-all
+enable-login: true
+enable-signup: false
+{% if ntfy_upstream_base_url | length > 0 %}
+upstream-base-url: "{{ ntfy_upstream_base_url }}"
+{% endif %}
+auth-users:
+  - "{{ ntfy_user }}:{{ ntfy_password | password_hash('bcrypt', (inventory_hostname ~ ':ntfy-user') | hash('sha256') | b64encode | regex_replace('[^A-Za-z0-9./]', '') | truncate(22, true, ''), rounds=10, ident='2a') }}:user"
+  - "grafana:{{ ntfy_grafana_password | password_hash('bcrypt', (inventory_hostname ~ ':ntfy-grafana') | hash('sha256') | b64encode | regex_replace('[^A-Za-z0-9./]', '') | truncate(22, true, ''), rounds=10, ident='2a') }}:user"
+auth-access:
+  - "{{ ntfy_user }}:{{ ntfy_topic }}:rw"
+  - "grafana:{{ ntfy_topic }}:wo"
+auth-tokens:
+  - "grafana:{{ ntfy_grafana_token }}:grafana alerts"

@@ -78,6 +78,12 @@
         argv: [docker, exec, "{{ _akpg }}", psql, -U, authentik, -c, "select pg_switch_wal()"]
       changed_when: false
 
+    # Late rollback: snapshots of the data volumes at this very moment (tasks/rollback_prepare.yml).
+    - name: Snapshot the data volumes for a later rollback
+      ansible.builtin.include_tasks: tasks/rollback_prepare.yml
+      vars:
+        rb_service: authentik
+
     # ---- UPGRADE (block) with automatic PITR ROLLBACK (rescue) -------------------------
     - name: Upgrade
       block:
@@ -148,6 +154,19 @@
             rec_file: authentik.yml
             rec_value: "{{ authentik_upgrade_version }}"
             rec_previous: "{{ _rollback_version }}"
+          when: not (force_rollback | default(false) | bool)
+
+        - name: Record the late rollback ({{ rollback_window_hours | default(72) }} h)
+          ansible.builtin.include_tasks: tasks/rollback_record.yml
+          vars:
+            rb_service: authentik
+            rb_from: "{{ _rollback_version }}"
+            rb_to: "{{ authentik_upgrade_version }}"
+            rb_var: authentik_version
+            rb_file: authentik.yml
+            rb_anchor: "{{ _pitr_target }}"
+            rb_pitr: authentik
+            rb_snapshots: "{{ _rb_snapshots | default({}) }}"
           when: not (force_rollback | default(false) | bool)
 
         # ---- force_rollback DRILL: undo the (successful) upgrade on purpose -----------

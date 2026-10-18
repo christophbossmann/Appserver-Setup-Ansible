@@ -1,0 +1,234 @@
+{#- Grafana alerting provisioning: rules, contact points (ntfy + healthchecks.io watchdog),
+    notification policy and time intervals. See the "Alerting" section of defaults/main.yml.
+
+    Written as data first, rendered at the bottom. << >> stand for Grafana's {{ }} template
+    braces (Jinja would eat them). Alerting files get NO $VAR expansion (unlike datasources):
+    a $ is written as is.  -#}
+{#- names are [a-z0-9_-] only: no regex escaping (a \- would be an invalid PromQL string escape) -#}
+{%- set crit = monitoring_alert_critical_services | join('|') -%}
+{%- set ign = monitoring_alert_container_ignore -%}
+{%- set probe_svc = 'label_replace(probe_success{job="blackbox", instance=~"https://(%s)\\\\..*"}, "service", "$1", "instance", "https://([^.]+)\\\\..*")' -%}
+{%- set probe_svc_not = 'label_replace(probe_success{job="blackbox", instance!~"https://(%s)\\\\..*"}, "service", "$1", "instance", "https://([^.]+)\\\\..*")' -%}
+{%- set gone = '(time() - max by (service, name) (label_replace(max_over_time(container_last_seen{name!="", name!~"' ~ ign ~ '", container_label_com_docker_compose_oneoff="False", %s}[1d]), "service", "$1", "container_label_com_docker_compose_project", "(.*)")))' -%}
+{%- set cadvisor_ok = ' and on() (up{job="cadvisor"} == 1)' -%}
+{%- set fs = 'fstype=~"btrfs|ext4|xfs"' -%}
+{%- set free = 'min by (device) (100 * node_filesystem_avail_bytes{' ~ fs ~ '} / node_filesystem_size_bytes{' ~ fs ~ '})' -%}
+{%- set cert = 'min by (instance) ((probe_ssl_earliest_cert_expiry - time()) / 86400)' -%}
+
+{%- set rules = [
+  {'uid': 'service-down-critical', 'title': 'Critical service down', 'severity': 'critical', 'for': monitoring_alert_down_for_critical,
+   'expr': 'min by (service) (' ~ (probe_svc | format(crit)) ~ ') == 0',
+   'summary': '<< $labels.service >> does not answer (probe failed)'},
+  {'uid': 'container-gone-critical', 'title': 'Critical container gone', 'severity': 'critical', 'for': monitoring_alert_down_for_critical,
+   'expr': '((' ~ (gone | format('container_label_com_docker_compose_project=~"' ~ crit ~ '"')) ~ ' > 300) or (' ~ (gone | format('name=~"' ~ crit ~ '"')) ~ ' > 300))' ~ cadvisor_ok,
+   'summary': 'container << $labels.name >> (<< $labels.service >>) is not running'},
+  {'uid': 'service-down', 'title': 'Service down', 'severity': 'warning', 'for': monitoring_alert_down_for_warning,
+   'expr': 'min by (service) (' ~ (probe_svc_not | format(crit)) ~ ') == 0',
+   'summary': '<< $labels.service >> does not answer (probe failed)'},
+  {'uid': 'container-gone', 'title': 'Container gone', 'severity': 'warning', 'for': monitoring_alert_down_for_warning,
+   'expr': '(' ~ (gone | format('container_label_com_docker_compose_project!~"' ~ crit ~ '", name!~"' ~ crit ~ '"')) ~ ' > 300)' ~ cadvisor_ok,
+   'summary': 'container << $labels.name >> (<< $labels.service >>) is not running'},
+  {'uid': 'disk-critical', 'title': 'Disk almost full', 'severity': 'critical', 'for': '5m',
+   'expr': free ~ ' < ' ~ monitoring_alert_disk_critical_pct,
+   'summary': '<< $labels.device >>: only << printf "%.1f" $values.A.Value >> % free'},
+  {'uid': 'disk-warning', 'group': 'slow', 'title': 'Disk filling up', 'severity': 'warning', 'for': '15m',
+   'expr': free ~ ' < ' ~ monitoring_alert_disk_warning_pct ~ ' >= ' ~ monitoring_alert_disk_critical_pct,
+   'summary': '<< $labels.device >>: << printf "%.1f" $values.A.Value >> % free'},
+  {'uid': 'memory-critical', 'title': 'Memory almost exhausted', 'severity': 'critical', 'for': '10m',
+   'expr': '100 * node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < ' ~ monitoring_alert_memory_critical_pct,
+   'summary': 'only << printf "%.1f" $values.A.Value >> % of the memory available'},
+  {'uid': 'cert-critical', 'group': 'slow', 'title': 'Certificate about to expire', 'severity': 'critical', 'for': '30m',
+   'expr': cert ~ ' < ' ~ monitoring_alert_cert_critical_days,
+   'summary': '<< $labels.instance >>: certificate expires in << printf "%.1f" $values.A.Value >> days'},
+  {'uid': 'cert-warning', 'group': 'slow', 'title': 'Certificate expires soon', 'severity': 'warning', 'for': '1h',
+   'expr': cert ~ ' < ' ~ monitoring_alert_cert_warning_days ~ ' >= ' ~ monitoring_alert_cert_critical_days,
+   'summary': '<< $labels.instance >>: certificate expires in << printf "%.0f" $values.A.Value >> days'},
+  {'uid': 'pitr-wal-stalled', 'group': 'slow', 'title': 'PITR: WAL archiving stalled', 'severity': 'critical', 'for': '10m',
+   'expr': '(time() - pitr_wal_last_archived_timestamp_seconds) / 3600 > ' ~ monitoring_alert_pitr_wal_max_hours,
+   'summary': '<< $labels.exported_instance >>: no WAL archived for << printf "%.1f" $values.A.Value >> h'},
+  {'uid': 'pitr-base-old', 'group': 'slow', 'title': 'PITR: base backup too old', 'severity': 'warning', 'for': '10m',
+   'expr': '(time() - pitr_base_newest_timestamp_seconds) / 3600 > ' ~ monitoring_alert_pitr_base_max_hours,
+   'summary': '<< $labels.exported_instance >>: newest base backup is << printf "%.0f" $values.A.Value >> h old'},
+  {'uid': 'box-dumps-old', 'group': 'slow', 'title': 'Storage Box: database dumps too old', 'severity': 'critical', 'for': '10m',
+   'expr': '(time() - storagebox_backup_last_success_timestamp_seconds{exported_job="dumps"}) / 86400 > ' ~ monitoring_alert_box_dumps_max_days,
+   'summary': 'newest database dump on the Storage Box is << printf "%.1f" $values.A.Value >> days old'},
+  {'uid': 'box-thumbs-old', 'group': 'slow', 'title': 'Storage Box: thumbnail mirror too old', 'severity': 'warning', 'for': '10m',
+   'expr': '(time() - storagebox_backup_last_success_timestamp_seconds{exported_job="thumbs"}) / 3600 > ' ~ monitoring_alert_box_thumbs_max_hours,
+   'summary': 'last thumbnail mirror to the Storage Box was << printf "%.0f" $values.A.Value >> h ago'},
+  {'uid': 'unit-failed', 'title': 'Scheduled job failed', 'severity': 'warning', 'for': '5m',
+   'expr': 'node_systemd_unit_state{state="failed"} == 1',
+   'summary': '<< $labels.name >> is in state failed'},
+  {'uid': 'container-restarts', 'title': 'Container restarting', 'severity': 'warning', 'for': '0s',
+   'expr': 'max by (name) (changes(container_start_time_seconds{name!=""}[30m])) >= ' ~ monitoring_alert_restarts,
+   'summary': '<< $labels.name >> started << printf "%.0f" $values.A.Value >> times in 30 min'},
+  {'uid': 'upgrade-failed', 'group': 'slow', 'title': 'Upgrade failed', 'severity': 'warning', 'for': '0s',
+   'expr': 'app_upgrade_last_result == 0 and on(service) (time() - app_upgrade_last_timestamp_seconds) < 86400',
+   'summary': 'upgrade of << $labels.service >> to << $labels.version >> failed (see the upgrade page)'},
+  {'uid': 'metrics-target-down', 'title': 'Metrics source down', 'severity': 'warning', 'for': '10m',
+   'expr': 'up{job!="blackbox"} == 0',
+   'summary': 'Prometheus cannot scrape << $labels.job >> (<< $labels.instance >>)'},
+] -%}
+{%- set hints = [
+  {'uid': 'vulns-fixable', 'title': 'Fixable critical vulnerabilities', 'severity': 'info', 'for': '0s',
+   'expr': 'trivy_image_vulnerabilities{fixable="true", severity="CRITICAL"} > 0 and (trivy_image_vulnerabilities{fixable="true", severity="CRITICAL"} offset 7d) > 0',
+   'summary': '<< $labels.image >>: << printf "%.0f" $values.A.Value >> fixable CRITICAL vulnerabilities for 7+ days'},
+  {'uid': 'image-old', 'title': 'Old container image', 'severity': 'info', 'for': '0s',
+   'expr': '(time() - trivy_image_created_timestamp_seconds) / 86400 > ' ~ monitoring_alert_image_max_age_days,
+   'summary': '<< $labels.image >> was built << printf "%.0f" $values.A.Value >> days ago'},
+  {'uid': 'reboot-pending', 'title': 'Reboot pending', 'severity': 'info', 'for': '0s',
+   'expr': '(time() - updates_reboot_required_since_timestamp_seconds) / 86400 > ' ~ monitoring_alert_reboot_pending_days ~ ' and updates_reboot_required == 1',
+   'summary': 'the server asked for a reboot << printf "%.0f" $values.A.Value >> days ago (host upgrade page: reboot)'},
+  {'uid': 'security-updates-pending', 'title': 'Security updates pending', 'severity': 'info', 'for': '0s',
+   'expr': 'min_over_time(updates_apt_security_upgradable[' ~ monitoring_alert_security_pending_days ~ 'd]) > 0',
+   'summary': '<< printf "%.0f" $values.A.Value >> security updates pending for ' ~ monitoring_alert_security_pending_days ~ '+ days — is unattended-upgrades stuck?'},
+  {'uid': 'attacker-manual', 'title': 'Attacker for a manual decision', 'severity': 'info', 'for': '0s',
+   'expr': 'blocklist_auto_hint',
+   'summary': '<< $labels.ip >> (AS<< $labels.asn >> << $labels.as_name >>, << $labels.country >>): << printf "%.0f" $values.A.Value >> attempts in 7 days, not blocked (<< $labels.reason >>, AbuseIPDB score << $labels.abuse_score >>) — block it in the portal if you want'},
+  {'uid': 'disk-unassigned', 'title': 'Unattributed disk space', 'severity': 'info', 'for': '0s',
+   'expr': 'disk_discover_unassigned_bytes / 1073741824 > ' ~ monitoring_alert_unassigned_gib,
+   'summary': '<< printf "%.0f" $values.A.Value >> GiB used that no directory accounts for (Disk usage dashboard)'},
+] -%}
+{%- set watchdog = {'uid': 'watchdog', 'title': 'Watchdog', 'severity': 'none', 'for': '0s',
+   'expr': 'min(up{job="prometheus"}) * min(probe_success{job="blackbox", instance=~"https://ntfy\\\\..*"}) > 0',
+   'summary': 'alerting path alive (Grafana -> Prometheus -> ntfy)'} -%}
+
+{%- macro rule(r) %}
+      - uid: {{ r.uid }}
+        title: {{ r.title | to_json }}
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: {{ r.expr | to_json }}
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          # A returns only the offending series (all values >= 0) -> each one alerts
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [-1] }
+        noDataState: OK
+        execErrState: KeepLast
+        for: {{ r.for }}
+        labels:
+          severity: {{ r.severity }}
+        annotations:
+          summary: {{ r.summary | replace('<<', '{' ~ '{') | replace('>>', '}' ~ '}') | to_json }}
+{%- endmacro %}
+
+{%- macro ntfy(name, priority) %}
+  - orgId: 1
+    name: {{ name }}
+    receivers:
+      - uid: {{ name }}
+        type: webhook
+        disableResolveMessage: false
+        settings:
+          # through the public route: ntfy shares no network with Grafana (docker-compose.yml.j2)
+          url: "https://{{ svc_edge_host['ntfy'] }}/{{ ntfy_topic }}?template=grafana&priority={{ priority }}"
+          httpMethod: POST
+          authorization_scheme: Bearer
+          authorization_credentials: "{{ ntfy_grafana_token }}"
+          title: {{ '<< if eq .Status "firing" >><< .CommonLabels.severity | toUpper >><< else >>RESOLVED<< end >>: << .CommonLabels.alertname >>' | replace('<<', '{' ~ '{') | replace('>>', '}' ~ '}') | to_json }}
+          message: {{ '<< range .Alerts >><< .Annotations.summary >>\n<< end >>' | replace('<<', '{' ~ '{') | replace('>>', '}' ~ '}') | to_json }}
+{%- endmacro %}
+
+# Managed by Ansible (roles/monitoring, templates/alerting.yml.j2) — do not edit in Grafana.
+apiVersion: 1
+
+contactPoints:
+{{ ntfy('ntfy-critical', 'high') }}
+{{ ntfy('ntfy-warning', 'default') }}
+{{ ntfy('ntfy-info', 'low') }}
+{% if healthchecks_enabled | default(false) | bool %}
+  - orgId: 1
+    name: healthchecks-watchdog
+    receivers:
+      - uid: healthchecks-watchdog
+        type: webhook
+        disableResolveMessage: true
+        settings:
+          url: "{{ healthchecks_ping_url | default('https://hc-ping.com') }}/{{ healthchecks_ping_key }}/{{ healthchecks_prefix }}-grafana-watchdog"
+          httpMethod: POST
+          # nothing but "alive" in the ping body
+          message: "alive"
+          title: "alive"
+{% endif %}
+
+# The time intervals quiet-hours / info-window are NOT in this file: Ansible creates them
+# through the API (tasks/main.yml) with the defaults from monitoring_alert_quiet_hours /
+# monitoring_alert_info_window, editable in Grafana (Alerting -> Notification configuration ->
+# Time intervals: hours, time zone e.g. when abroad). A file-provisioned interval would be
+# read-only there.
+
+policies:
+  - orgId: 1
+    receiver: ntfy-warning
+    group_by: [grafana_folder, alertname]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 12h
+    routes:
+{% if healthchecks_enabled | default(false) | bool %}
+      - receiver: healthchecks-watchdog
+        object_matchers: [[alertname, "=", Watchdog]]
+        group_wait: 0s
+        group_interval: 1m
+        repeat_interval: 5m
+{% endif %}
+      - receiver: ntfy-critical
+        object_matchers: [[severity, "=", critical]]
+        repeat_interval: 4h
+      - receiver: ntfy-warning
+        object_matchers: [[severity, "=", warning]]
+{% if _alert_intervals_ready | default(false) %}
+        mute_time_intervals: [quiet-hours]
+{% endif %}
+        repeat_interval: 12h
+      - receiver: ntfy-info
+        object_matchers: [[severity, "=", info]]
+{% if _alert_intervals_ready | default(false) %}
+        active_time_intervals: [info-window]
+{% endif %}
+        group_interval: 30m
+        repeat_interval: 20h
+
+# Evaluation groups: what must page within minutes is evaluated every minute; rules on data
+# that changes only hourly or nightly (backups, certificates, scans) every 10 min / hour.
+groups:
+  - orgId: 1
+    name: immediate
+    folder: Alerting
+    interval: 1m
+    rules:
+{% for r in rules if r.group | default('immediate') == 'immediate' %}
+{{ rule(r) }}
+{% endfor %}
+{% if healthchecks_enabled | default(false) | bool %}
+{{ rule(watchdog) }}
+{% endif %}
+  - orgId: 1
+    name: slow
+    folder: Alerting
+    interval: 10m
+    rules:
+{% for r in rules if r.group | default('immediate') == 'slow' %}
+{{ rule(r) }}
+{% endfor %}
+  - orgId: 1
+    name: daily hints
+    folder: Alerting
+    interval: 1h
+    rules:
+{% for r in hints %}
+{{ rule(r) }}
+{% endfor %}

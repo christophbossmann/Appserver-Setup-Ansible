@@ -69,11 +69,12 @@
     # A business host ≈  --tags base,btrfs,caddy,platform,business  (btrfs only if you want snapshots).
     # ───────────────────────────────────────────────────────────────────────────────
     - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_pre_setup, btrfs_snapshot_permanent: true }, tags: [btrfs] }
+    # ONE snapshot at the start of EVERY run (also --tags runs): what this run changes can be
+    # undone (`snapshot rollback`). The newest btrfs_pre_run_keep are kept, older ones deleted.
+    - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_pre_run, btrfs_snapshot_keep: "{{ btrfs_pre_run_keep | default(5) }}" }, tags: [always] }
     - { role: data_storage, tags: [base, btrfs, storage] }
     - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_subvols_ready, btrfs_snapshot_permanent: true }, tags: [btrfs] }
-    - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_before_hardening }, tags: [btrfs, hardening] }
     - { role: hardening, tags: [base, hardening] }
-    - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_after_hardening }, tags: [btrfs, hardening] }
     - { role: tailscale, tags: [base, tailscale] }
     - { role: users, tags: [base, users] }
     - { role: docker, tags: [base, docker] }
@@ -118,6 +119,7 @@
     - { role: compose_stack, vars: { stack: immich }, tags: [business, immich] }
     - { role: immich_bootstrap, tags: [business, immich] }   # create the local admin (email = Authentik user) so SSO = admin
     - { role: compose_stack, vars: { stack: immich_uploader }, tags: [business, immich_uploader] }
+    - { role: nextcloud_storage, tags: [business, nextcloud] }   # data dir on the Storage Box (nextcloud_data_external): one-time migration BEFORE the stack
     - { role: compose_stack, vars: { stack: nextcloud }, tags: [business, nextcloud] }
     - { role: nextcloud_bootstrap, tags: [business, nextcloud] }   # occ: wire user_oidc to Authentik
     - { role: backup_restic, tags: [platform, backup] }            # nightly cloud backup (restic over rclone; gated by backup_cloud_enabled)
@@ -145,6 +147,9 @@
     # role's webhook drop-in loads the hooks file this one writes.
     - { role: local_upgrade, tags: [platform, local_upgrade] }
     - { role: monitoring, tags: [platform, monitoring] }
+    # Dead man's switch at healthchecks.io (host-gated by healthchecks_enabled): heartbeat + a
+    # report from every scheduled job. After the roles whose job units it watches.
+    - { role: healthchecks, tags: [platform, healthchecks] }
     # Self-hosted acme-dns (DNS-01 relay) — MUST be up before caddy issues certs in
     # acme_dns mode. DNS public on :53, API loopback-only. Tagged 'caddy' so it
     # deploys with the cert pipeline.
@@ -154,8 +159,9 @@
     - { role: cloudflare_dns, tags: [caddy, cloudflare_dns] }
     - { role: cloudflared, tags: [caddy, cloudflared] }
     - { role: caddy_post_check, tags: [caddy, caddy_post_check] }
-    # Final checkpoint after the whole run completed.
-    - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_after_ansible }, tags: [btrfs] }
+    # PERMANENT anchor after the FIRST complete run (the finished base install of the OS root):
+    # created once (skip_if_exists), never pruned. Per-run undo is ans_pre_run (top).
+    - { role: btrfs_snapshots, vars: { btrfs_snapshot: ans_after_ansible, btrfs_snapshot_permanent: true }, tags: [btrfs] }
 
   # After the whole deploy finishes: a PERMANENT "fresh install" anchor snapshot per
   # DATA subvolume (ans_post_install). Extracted to keep the play lean — see the task
