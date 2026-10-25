@@ -1,0 +1,172 @@
+---
+- name: Safety guard
+  ansible.builtin.assert:
+    that:
+      - restore_confirm | default('') == 'YES'
+      - _br_modes | length > 0
+      - _br_modes.keys() | list | difference(['immich', 'nextcloud', 'authentik']) | length == 0
+      - _br_modes.values() | list | difference(['FRESH', 'RESTORE']) | length == 0
+      - storagebox_enabled | default(false) | bool
+      - _br_crypt | length > 0
+    fail_msg: >-
+      restore_apps needs <app>:<MODE> pairs without spaces — apps immich, nextcloud, authentik;
+      modes FRESH, RESTORE (got {{ _br_modes }}) — plus -e restore_confirm=YES and the Storage Box
+      with its rclone crypt remote on this host.
+
+- name: The app's box layout must be the encrypted one
+  ansible.builtin.assert:
+    that:
+      - ('immich' not in _br_modes) or (immich_storage_encrypted | default(false) | bool)
+      - ('nextcloud' not in _br_modes) or ((nextcloud_data_external | default(false) | bool)
+          and (nextcloud_storage_encrypted | default(false) | bool))
+    fail_msg: >-
+      immich needs immich_storage_encrypted, nextcloud needs nextcloud_data_external +
+      nextcloud_storage_encrypted on this host (host_vars).
+
+- name: State dir (one marker per restored app)
+  ansible.builtin.file:
+    path: "{{ box_restore_state_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Each app is restored once per host
+  ansible.builtin.stat:
+    path: "{{ box_restore_state_dir }}/{{ item }}.done"
+  loop: "{{ _br_restore }}"
+  register: _br_done
+
+- name: Refuse a second restore of an app (it would overwrite what happened since)
+  ansible.builtin.assert:
+    that: (restore_force | bool) or (_br_done.results | default([]) | selectattr('stat.exists') | list | length == 0)
+    fail_msg: >-
+      Already restored on this host: {{ _br_done.results | selectattr('stat.exists') | map(attribute='item') | list }}
+      ({{ box_restore_state_dir }}/<app>.done). Again on purpose: -e restore_force=true.
+
+- name: One stamp for every folder set aside in this run
+  ansible.builtin.set_fact:
+    _br_stamp: "{{ now(utc=true, fmt='%Y%m%d-%H%M%S') }}"
+
+# ---- FRESH ---------------------------------------------------------------------------------
+- name: Fresh apps
+  ansible.builtin.include_tasks: fresh.yml
+  when: _br_fresh | length > 0
+
+# ---- RESTORE: the dump set -----------------------------------------------------------------
+- name: Restore — the dump set
+  when: _br_restore | length > 0
+  block:
+    - name: Dump sets on the box
+      ansible.builtin.command:
+        argv: "{{ _br_rclone + ['lsf', '--dirs-only', _br_backup ~ '/db-dumps'] }}"
+      register: _br_sets
+      changed_when: false
+
+    - name: Pick the dump set
+      ansible.builtin.set_fact:
+        _br_set: >-
+          {{ restore_dump_set if (restore_dump_set | length > 0)
+             else (_br_sets.stdout_lines | map('regex_replace', '/$', '') | select('match', '^[0-9]{8}-[0-9]{6}$') | sort | last | default('')) }}
+
+    - name: Files in the dump set
+      ansible.builtin.command:
+        argv: "{{ _br_rclone + ['lsf', _br_backup ~ '/db-dumps/' ~ _br_set] }}"
+      register: _br_files
+      changed_when: false
+      failed_when: _br_files.rc != 0 or (_br_set | length == 0)
+
+    - name: Every restored app needs its dump in the set
+      ansible.builtin.assert:
+        that: (_br_restore | map('regex_replace', '$', '.dump') | difference(_br_files.stdout_lines)) | length == 0
+        fail_msg: "Dump set {{ _br_set }} lacks {{ _br_restore | map('regex_replace', '$', '.dump') | difference(_br_files.stdout_lines) }}"
+
+    - name: Plan
+      ansible.builtin.debug:
+        msg: >-
+          {{ _br_modes.items() | map('join', ':') | join(', ') }} — box folder
+          '{{ storagebox_root_path }}', dump set {{ _br_set }}{{ ' (+ Nextcloud config values)' if 'nextcloud-config.json' in _br_files.stdout_lines else '' }}.
+          Old backup state set aside at the end (*.before-rebuild-{{ _br_stamp }}).
+
+    - name: Download the dumps of the restored apps
+      ansible.builtin.command:
+        argv: >-
+          {{ _br_rclone + ['copy', _br_backup ~ '/db-dumps/' ~ _br_set, box_restore_work_dir ~ '/' ~ _br_set]
+             + (_br_restore | map('regex_replace', '$', '.dump') | map('regex_replace', '^', '--include=') | list)
+             + (['--include=nextcloud-config.json'] if 'nextcloud' in _br_restore else []) }}
+      changed_when: true
+
+    - name: Dump dir readable by root only
+      ansible.builtin.file:
+        path: "{{ box_restore_work_dir }}"
+        state: directory
+        mode: "0700"
+        recurse: true
+
+# Nextcloud's installer refuses a data folder that already holds files for its admin user —
+# set the data aside so this run installs into an empty folder; the business phase puts it
+# back. Only when Nextcloud is NOT installed here yet (a rebuilt server).
+- name: Nextcloud RESTORE — empty data folder for the installer
+  when: "'nextcloud' in _br_restore"
+  block:
+    - name: Nextcloud — is it installed on this host already?
+      ansible.builtin.stat:
+        path: "{{ nextcloud_html_dir }}/config/config.php"
+      register: _br_nc_cfg
+
+    - name: Nextcloud — does the box folder hold data?
+      ansible.builtin.command:
+        argv: "{{ _br_rclone + ['lsf', '--max-depth', '1', _br_plain_own ~ '/nextcloud/data'] }}"
+      register: _br_nc_own
+      changed_when: false
+      failed_when: false
+
+    # A run that stopped between setting the data aside and putting it back left it in
+    # data.restore-src — pick it up instead of losing track of it.
+    - name: Nextcloud — data still waiting from an earlier, interrupted run?
+      ansible.builtin.command:
+        argv: "{{ _br_rclone + ['lsf', '--max-depth', '1', _br_plain_own ~ '/nextcloud/data.restore-src'] }}"
+      register: _br_nc_waiting
+      changed_when: false
+      failed_when: false
+
+    - name: Nextcloud — refuse when both folders hold data (which one is the right one?)
+      ansible.builtin.assert:
+        that: (_br_nc_waiting.stdout | default('') | trim | length == 0) or (_br_nc_own.stdout | default('') | trim | length == 0)
+        fail_msg: >-
+          Both {{ _br_plain_own }}/nextcloud/data and data.restore-src hold data — sort it out on
+          the box by hand (rename the one that is not the data to restore), then run again.
+
+    - name: Nextcloud — take over the waiting data
+      ansible.builtin.set_fact:
+        _br_nc_aside: "{{ _br_plain_own }}/nextcloud/data.restore-src"
+      when: _br_nc_waiting.stdout | default('') | trim | length > 0
+
+    - name: Nextcloud — set the data aside for the install
+      when:
+        - not _br_nc_cfg.stat.exists
+        - (_br_nc_own.stdout | default('') | trim | length) > 0
+      block:
+        - name: Nextcloud — where it waits
+          ansible.builtin.set_fact:
+            _br_nc_aside: "{{ _br_plain_own }}/nextcloud/data.restore-src"
+
+        - name: Nextcloud — stop its box mount while the folder moves
+          ansible.builtin.systemd:
+            name: "{{ storagebox_service_name }}-nextcloud.service"
+            state: stopped
+
+        - name: Nextcloud — move the data to data.restore-src
+          ansible.builtin.shell: |
+            set -euo pipefail
+            R=(rclone --config '{{ storagebox_config_file }}')
+            "${R[@]}" moveto '{{ _br_plain_own }}/nextcloud/data' '{{ _br_nc_aside }}'
+            "${R[@]}" mkdir '{{ _br_plain_own }}/nextcloud/data'
+          args: { executable: /bin/bash }
+          changed_when: true
+      always:
+        - name: Nextcloud — its box mount back
+          ansible.builtin.systemd:
+            name: "{{ storagebox_service_name }}-nextcloud.service"
+            state: started
+          when:
+            - not _br_nc_cfg.stat.exists
+            - (_br_nc_own.stdout | default('') | trim | length) > 0

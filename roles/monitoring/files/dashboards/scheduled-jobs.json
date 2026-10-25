@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Scheduled systemd timers (backups, PITR base backups, docker prune, snapper, apt, cert renewal) and the long-running helper services \u2014 last run, age, last result. Source: node_exporter systemd collector (unit list: node_exporter_systemd_units in roles/monitoring).",
+  "description": "Scheduled systemd timers (backups, PITR base backups, docker prune, snapper, apt, cert renewal) and the long-running helper services — last run, age, last result. Source: node_exporter systemd collector (unit list: node_exporter_systemd_units in roles/monitoring).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -177,7 +177,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "One row per timer: when it last fired, how long ago, and whether the service it triggers failed on its last run.",
+      "description": "One row per timer: when it last fired, how long ago, and whether the service it triggers failed on its last run. \"Last run did\": a short summary of the journal of the job's last run (job-summary-metrics) — details: journalctl -u <job> on the host.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -289,6 +289,18 @@
                 "value": 140
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "summary"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Last run did"
+              }
+            ]
           }
         ]
       },
@@ -347,6 +359,16 @@
           "format": "table",
           "instant": true,
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (unit, summary) (job_last_summary)",
+          "format": "table",
+          "instant": true,
+          "refId": "D"
         }
       ],
       "title": "Scheduled jobs",
@@ -365,13 +387,16 @@
               "Time": true,
               "Time 1": true,
               "Time 2": true,
-              "Time 3": true
+              "Time 3": true,
+              "Value #D": true,
+              "Time 4": true
             },
             "indexByName": {
               "unit": 0,
               "Value #C": 1,
               "Value #A": 2,
-              "Value #B": 3
+              "Value #B": 3,
+              "summary": 4
             },
             "renameByName": {}
           }
@@ -487,6 +512,6 @@
   "timezone": "browser",
   "title": "Scheduled jobs",
   "uid": "scheduled-jobs",
-  "version": 4,
+  "version": 5,
   "weekStartsOn": ""
 }

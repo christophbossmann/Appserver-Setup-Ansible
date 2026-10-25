@@ -163,7 +163,8 @@
                                     | zip(postgres_pitr_instances | default([]) | map(attribute='name') | list))
                               if (postgres_pitr_enabled | default(false) | bool) else {},
                       'stop': local_upgrade_snapshot_stop,
-                      'post': local_upgrade_snapshot_post} | to_nice_json }}\n"
+                      'post': local_upgrade_snapshot_post,
+                      'pre_run_keep': btrfs_pre_run_keep | default(5) | int} | to_nice_json }}\n"
 
     - name: Install the entry point
       ansible.builtin.copy:

@@ -25,7 +25,7 @@ missing/broken setup is caught loudly); leave it at `auto` for non-btrfs hosts, 
 checkpoint is a safe no-op.
 
 It also keeps the **retention of the root snapshots** at `btrfs_root_retention` (default:
-daily snapshots for 30 days, the last 20 package-run/upgrade snapshots; permanent ones stay).
+daily snapshots for 14 days, the last 10 package-run/upgrade snapshots (5 pre/post pairs); permanent ones stay).
 
 ## Key variables (see `defaults/main.yml`)
 - `btrfs_check_path` (default `/`) — the mount whose FS type decides btrfs-or-not.

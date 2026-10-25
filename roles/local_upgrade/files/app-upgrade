@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 BASE = "/opt/ansible-local"
@@ -497,6 +498,35 @@ SNAP_ACTIONS = {"rollback": "roll the volume back to this snapshot", "delete": "
                 "release": "hand this snapshot back to the automatic cleanup",
                 "create": "take a snapshot now"}
 SNAP_CFG = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+# The subvolumes a volume rollback keeps (<subvolume>_rollback_backup_<date>) — no snapper
+# config, so they get a pseudo config with the btrfs subvolume id as "number" (delete only).
+KEPT_CFG = "keptrb"
+KEPT_METRIC = re.compile(r'^disk_discover_rollback_kept_bytes\{.*subvolume="([^"]+)".*\} (\d+)')
+
+
+def kept_list():
+    """[(subvolume id, name)] of the subvolumes kept from earlier volume rollbacks."""
+    out = subprocess.run(["btrfs", "subvolume", "list", "/"], capture_output=True, text=True).stdout
+    res = []
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) >= 9 and p[1].isdigit() and "_rollback_backup_" in p[-1]:
+            res.append((int(p[1]), p[-1]))
+    return res
+
+
+def kept_sizes():
+    """{name: bytes it holds exclusively} from the nightly disk search (roles/monitoring)."""
+    res = {}
+    try:
+        with open("/var/lib/node_exporter/textfile/disk-discover.prom") as f:
+            for line in f:
+                m = KEPT_METRIC.match(line)
+                if m:
+                    res[m.group(1)] = int(m.group(2))
+    except OSError:
+        pass
+    return res
 
 
 def snap_conf():
@@ -547,6 +577,58 @@ def snap_release_algorithm(snap):
     return "timeline" if snap["description"] == "timeline" else "number"
 
 
+# Several snapshots of one volume at once (delete / keep only): <config>.<list>.<action>, the
+# list compact so it fits the 64 characters of a version string — numbers joined by "_",
+# a run of consecutive ones as "first-last" (e.g. root.78-84_101_107.delete).
+SNAP_MULTI_ACTIONS = ("delete", "keep")
+SNAP_LIST = re.compile(r"^\d+(?:-\d+)?(?:_\d+(?:-\d+)?)*$")
+
+
+def snap_parse_multi(version):
+    """(config, [numbers], action) for a multi-snapshot action, None for a single one."""
+    parts = (version or "").rsplit(".", 2)
+    if len(parts) != 3 or parts[1].isdigit() or not SNAP_LIST.match(parts[1]):
+        return None
+    if parts[2] not in SNAP_MULTI_ACTIONS or not SNAP_CFG.match(parts[0]) or parts[0] == KEPT_CFG:
+        raise Refused("several snapshots at once: only %s, on a snapshot config" % " / ".join(SNAP_MULTI_ACTIONS))
+    nums = set()
+    for piece in parts[1].split("_"):
+        a, _, b = piece.partition("-")
+        a, b = int(a), int(b or a)
+        if b < a or b - a > 500:
+            raise Refused("invalid snapshot range %s" % piece)
+        nums.update(range(a, b + 1))
+    return parts[0], sorted(nums), parts[2]
+
+
+def snap_parse_multi_safe(version):
+    """True when the version is meant as a multi-snapshot action (even an invalid one)."""
+    parts = (version or "").rsplit(".", 2)
+    return len(parts) == 3 and not parts[1].isdigit() and bool(SNAP_LIST.match(parts[1]))
+
+
+def snap_multi_validate(cfg, nums, action):
+    if cfg not in snap_configs():
+        raise Refused("unknown snapshot config %s" % cfg)
+    if not os.path.exists(SNAP_HELPER):
+        raise Refused("the snapshot helper is not installed on this host")
+    have = {s["number"]: s for s in snap_list(cfg)}
+    gone = [n for n in nums if n not in have]
+    if gone:
+        raise Refused("not (any more) in %s: %s" % (cfg, ", ".join("#%d" % n for n in gone)))
+    # one-time anchors (ans_pre_setup, ans_subvols_ready, ans_after_ansible, ans_post_install …)
+    # cannot be taken again — never in a bulk action, only one by one on purpose
+    anchors = [n for n in nums if have[n]["description"].startswith("ans_") and have[n]["description"] != "ans_pre_run"]
+    if anchors:
+        raise Refused("one-time anchor snapshot(s) %s — not in a bulk action; delete them one by one if you really mean it"
+                      % ", ".join("#%d (%s)" % (n, have[n]["description"]) for n in anchors))
+    if action == "keep":
+        already = [n for n in nums if not have[n]["cleanup"]]
+        if already:
+            raise Refused("already permanent: %s" % ", ".join("#%d" % n for n in already))
+    return [have[n] for n in nums]
+
+
 def snap_parse(version):
     parts = (version or "").rsplit(".", 2)
     if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in SNAP_ACTIONS or not SNAP_CFG.match(parts[0]):
@@ -555,7 +637,18 @@ def snap_parse(version):
 
 
 def snap_validate(version):
+    multi = snap_parse_multi(version)
+    if multi:
+        cfg, nums, action = multi
+        snap_multi_validate(cfg, nums, action)
+        return cfg, nums, action
     cfg, n, action = snap_parse(version)
+    if cfg == KEPT_CFG:
+        if action != "delete":
+            raise Refused("a subvolume kept from a rollback can only be deleted")
+        if n not in dict(kept_list()):
+            raise Refused("no kept rollback subvolume with id %d (any more)" % n)
+        return cfg, n, action
     if cfg not in snap_configs():
         raise Refused("unknown snapshot config %s" % cfg)
     if not os.path.exists(SNAP_HELPER):
@@ -608,6 +701,30 @@ def sh(cmd, **kw):
 
 def snap_run(version, by):
     cfg, n, action = snap_validate(version)
+    if isinstance(n, list):      # several snapshots: one after the other, report what failed
+        failed = []
+        for num in n:
+            print("--- %s #%d" % (action, num), flush=True)
+            if sh([SNAP_HELPER, "-c", cfg, action, str(num)]) != 0:
+                failed.append(num)
+        print("%s: %d of %d done%s" % (action, len(n) - len(failed), len(n),
+                                     (" — FAILED: " + ", ".join("#%d" % f for f in failed)) if failed else ""), flush=True)
+        return 1 if failed else 0
+    if cfg == KEPT_CFG:
+        # kept subvolumes are mounted nowhere: reach them through the top level for a moment
+        name = dict(kept_list())[n]
+        dev = subprocess.run(["findmnt", "-no", "SOURCE", "/"], capture_output=True, text=True).stdout.split("[")[0].strip()
+        top = tempfile.mkdtemp(prefix="app-upgrade-top.", dir="/run")
+        try:
+            if sh(["mount", "-o", "subvolid=5", dev, top]) != 0:
+                return 1
+            try:
+                print("deleting %s (kept from an earlier rollback, requested by %s)" % (name, by), flush=True)
+                return sh(["btrfs", "subvolume", "delete", os.path.join(top, name)])
+            finally:
+                sh(["umount", top])
+        finally:
+            os.rmdir(top)
     sv = snap_configs()[cfg]
     helper = [SNAP_HELPER, "-c", cfg]
     if action == "create":
@@ -678,6 +795,13 @@ def page_snapshots(state):
                 else "sizes not measured yet" if age is None
                 else "sizes measured %s ago (estimates, in steps of about %s; measured once a night — after deleting, use the button)" % (
                     "%d min" % (age // 60) if age < 7200 else "%d h" % (age // 3600), human(sizes.get("sample_bytes", 0))))]
+    # sizes measured BEFORE the last deletion are stale — say so, but do not re-measure on our own
+    last = state.get("snapshots") or {}
+    if (str(last.get("version", "")).endswith(".delete") and last.get("finished", 0) > sizes.get("measured", 0)
+            and not measuring):
+        body.append('<p class=warn><i>Snapshots were deleted after the last measurement (%s) — the sizes below may '
+                    'no longer be right. "Measure now" measures them again.</i></p>'
+                    % esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(last["finished"]))))
     if run and run.get("service") == "snapshots":
         body.append('<div class=card><b class="warn">running: %s</b> · <a href="/hooks/upgrade-log?service=snapshots">follow the log</a></div>'
                     % esc(run["version"]))
@@ -689,16 +813,24 @@ def page_snapshots(state):
         users = snap_users(sv)
         sets = sizes.get("sets", {}).get(cfg, {})
         rows = []
+        keep_pre_run = int(snap_conf().get("pre_run_keep", 5))
         for s in reversed(snaps):
             m = sz.get(str(s["number"]))
+            # ans_pre_run: no snapper cleanup, but not permanent either — Ansible keeps the newest N
+            cleanup = s["cleanup"] or ("Ansible: newest %d" % keep_pre_run if s["description"] == "ans_pre_run" else "permanent")
             acts = " · ".join('<a href="/hooks/snapshots?version=%s.%d.%s">%s</a>' % (esc(cfg), s["number"], a, a)
                               for a in (("rollback", "delete", "keep") if s["cleanup"] else
                                         ("rollback", "delete") if s["description"].startswith("ans_") else
                                         ("rollback", "delete", "release")))
-            rows.append("<tr><td>#%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                s["number"], esc(s["date"]), esc(s["type"]), esc(s["cleanup"] or "permanent"), esc(s["description"]),
-                ("<b>%s</b>" % human(m["exclusive"]) if m["exclusive"] >= 1 << 30 else human(m["exclusive"])) if m else
-                '<span class="muted">not measured yet</span>', acts))
+            big = lambda b: ("<b>%s</b>" % human(b)) if b >= 1 << 30 else human(b)
+            anchor = s["description"].startswith("ans_") and s["description"] != "ans_pre_run"
+            box = ('<span class=muted title="one-time anchor — delete it on its own">—</span>' if anchor else
+                   '<input type=checkbox class=sel data-cfg="%s" data-keep="%s" value=%d>' % (esc(cfg), "1" if s["cleanup"] else "", s["number"]))
+            rows.append("<tr><td>%s</td>"
+                        "<td>#%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                box, s["number"], esc(s["date"]), esc(s["type"]), esc(cleanup), esc(s["description"]),
+                big(m["exclusive"]) if m else '<span class="muted">not measured yet</span>',
+                big(m["with_older"]) if m and "with_older" in m else '<span class="muted">—</span>', acts))
         summary = "%d snapshot(s)" % len(snaps)
         if "all" in sets:
             summary += ", together they hold %s" % human(sets["all"])
@@ -710,28 +842,111 @@ def page_snapshots(state):
         body.append(
             '<div class=card><details%s><summary><b>%s</b> <code>%s</code> — %s</summary>'
             '%s<p class=muted>Used by: %s · <a href="/hooks/snapshots?version=%s.0.create">take a snapshot now</a></p>'
-            "<table><tr><th>#</th><th>Taken</th><th>Type</th><th>Cleanup</th><th>Description</th>"
-            "<th>Freed if deleted</th><th></th></tr>%s</table></details></div>" % (
-                "" if sv == "/" else " open", esc(cfg), esc(sv), esc(summary), freed,
+            '<p class=selbar data-cfg="%s"><button class=seldel data-cfg="%s" disabled>Delete selected</button> '
+            '<button class=selkeep data-cfg="%s" disabled>Keep selected</button> <span class=muted></span></p>'
+            "<table><tr><th></th><th>#</th><th>Taken</th><th>Type</th><th>Cleanup</th><th>Description</th>"
+            "<th>Freed if deleted</th><th>… with all older</th><th></th></tr>%s</table></details></div>" % (
+                "", esc(cfg), esc(sv), esc(summary), freed,   # every volume collapsed: count + size are in the summary line
                 esc(", ".join(users)) if users else ("the whole system" if sv == "/" else "no running container"),
-                esc(cfg), "".join(rows) or "<tr><td colspan=7 class=muted>no snapshots</td></tr>"))
-    left = subprocess.run("btrfs subvolume list / | awk '{print $NF}' | grep '_rollback_backup_' || true", shell=True,
-                          capture_output=True, text=True).stdout.split()
+                esc(cfg), esc(cfg), esc(cfg), esc(cfg),
+                "".join(rows) or "<tr><td colspan=9 class=muted>no snapshots</td></tr>"))
+    left, sizes = kept_list(), kept_sizes()
     if left:
-        body.append('<div class=card><b>Kept from earlier rollbacks</b> (the volume as it was before; takes space until deleted — '
-                    "on the host: <code>mount -o subvolid=5 $(findmnt -no SOURCE / | sed 's/\\[.*//') /mnt &amp;&amp; btrfs subvolume delete /mnt/&lt;name&gt; ; umount /mnt</code>)"
-                    "<br>%s</div>" % "<br>".join("<code>%s</code>" % esc(x) for x in left))
+        body.append('<div class=card><b>Kept from earlier rollbacks</b> — the volume as it was before each rollback, '
+                    "a safety net in case the rollback was wrong. Delete them once you are sure; what one holds "
+                    "exclusively is freed (measured nightly).<table><tr><th>Subvolume</th><th>Freed if deleted</th><th></th></tr>%s"
+                    "</table></div>" % "".join(
+                        '<tr><td><code>%s</code></td><td>%s</td><td><a href="/hooks/snapshots?version=%s.%d.delete">delete</a></td></tr>'
+                        % (esc(name), human(sizes[name]) if name in sizes else "not measured yet", KEPT_CFG, sid)
+                        for sid, name in left))
     body.append('<p class=muted>"Freed if deleted" is what only this one snapshot still references. Data it shares with '
                 "neighbouring snapshots is freed only when all of them are gone — that is why the sets above can be far "
-                "bigger than the single values added up. Sizes are estimates, measured nightly and with the button "
-                "(Grafana → Disk snapshots).</p>")
+                "bigger than the single values added up. \"… with all older\" is what deleting this snapshot together with "
+                "every OLDER one of the volume would free — read it top-down to see where the shared data is freed at last. "
+                "Sizes are estimates, measured nightly and with the button (Grafana → Disk snapshots).</p>")
     return "".join(body)
 
 
+def page_kept_confirm(version, n):
+    reason = ""
+    try:
+        svc, _ = validate("snapshots", version)
+        prechecks(svc)
+    except Refused as e:
+        reason = str(e)
+    name = dict(kept_list()).get(n, "?")
+    size = kept_sizes().get(name)
+    rows = [("Action", "<b>delete</b> — the subvolume kept from an earlier rollback"),
+            ("Subvolume", "<code>%s</code> (id %d)" % (esc(name), n)),
+            ("Frees", ("about <b>%s</b> (what only it holds)" % human(size)) if size is not None else "not measured yet"),
+            ("Effect", "the state of the volume before that rollback is gone for good — there is no undo")]
+    expect = "%s %d" % (KEPT_CFG, n)
+    body = "<h1>Delete the kept rollback state?</h1><div class=card><table>%s</table></div>" % (
+        "".join("<tr><th>%s</th><td>%s</td></tr>" % r for r in rows))
+    if reason:
+        body += '<div class=card><b class="bad">Not possible right now:</b> %s</div>' % esc(reason)
+    else:
+        body += ('<p>Type <code>%s</code> to confirm: <input id=confirm data-expect="%s" autocomplete=off '
+                 'style="font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)"></p>'
+                 % (esc(expect), esc(expect)))
+    body += ('<button id=go data-service="snapshots" data-version="%s"%s>Delete now</button><div id=out></div><div id=log></div>'
+             % (esc(version), " disabled data-blocked=1" if reason else ""))
+    return body
+
+
+def page_multi_confirm(version):
+    reason, snaps = "", []
+    try:
+        cfg, nums, action = snap_parse_multi(version)
+    except Refused as e:
+        return '<h1>Snapshots</h1><div class=card><b class="bad">Not possible:</b> %s</div>' % esc(str(e))
+    try:
+        svc, _ = validate("snapshots", version)
+        prechecks(svc)
+        snaps = snap_multi_validate(cfg, nums, action)
+    except Refused as e:
+        reason = str(e)
+        snaps = [s for s in snap_list(cfg) if s["number"] in nums] if cfg in snap_configs() else []
+    try:
+        with open(SNAP_SIZES) as f:
+            sizes = json.load(f).get("sizes", {}).get(cfg, {})
+    except (OSError, ValueError):
+        sizes = {}
+    single = sum((sizes.get(str(s["number"])) or {}).get("exclusive", 0) for s in snaps)
+    listing = "".join("<tr><td>#%d</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+        s["number"], esc(s["date"]), esc(s["cleanup"] or "permanent"), esc(s["description"])) for s in snaps)
+    rows = [("Action", "<b>%s</b> — %s" % (esc(action), esc(SNAP_ACTIONS[action]))),
+            ("Volume", "<b>%s</b> <code>%s</code>" % (esc(cfg), esc(snap_configs().get(cfg, "?")))),
+            ("Snapshots", "%d: <table>%s</table>" % (len(nums), listing))]
+    if action == "delete":
+        rows.append(("Frees", "at least about <b>%s</b> (what each of them holds alone, added up) — plus what they "
+                              "share only among themselves, which the single values do not show" % human(single)))
+        rows.append(("Effect", "the snapshots are gone for good — there is no undo"))
+    else:
+        rows.append(("Effect", "snapper's automatic cleanup will no longer remove them; delete them by hand later, "
+                               "or hand them back with release"))
+    expect = "%s %d" % (cfg, len(nums))
+    body = "<h1>Snapshots: %s %d?</h1><div class=card><table>%s</table></div>" % (
+        esc(action), len(nums), "".join("<tr><th>%s</th><td>%s</td></tr>" % r for r in rows))
+    if reason:
+        body += '<div class=card><b class="bad">Not possible right now:</b> %s</div>' % esc(reason)
+    else:
+        body += ('<p>Type <code>%s</code> to confirm: <input id=confirm data-expect="%s" autocomplete=off '
+                 'style="font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)"></p>'
+                 % (esc(expect), esc(expect)))
+    body += ('<button id=go data-service="snapshots" data-version="%s"%s>%s %d now</button><div id=out></div><div id=log></div>'
+             % (esc(version), " disabled data-blocked=1" if reason else "", esc(action.capitalize()), len(nums)))
+    return body
+
+
 def page_snap_confirm(version, state):
+    if snap_parse_multi_safe(version):
+        return page_multi_confirm(version)
     reason = ""
     try:
         cfg, n, action = snap_parse(version)
+        if cfg == KEPT_CFG:
+            return page_kept_confirm(version, n)
         svc, _ = validate("snapshots", version)
         prechecks(svc)
     except Refused as e:
@@ -822,6 +1037,31 @@ mb.addEventListener('click', async () => {
     if (!r.ok) mb.disabled = false;
   } catch (e) { ms.textContent = 'could not start: ' + e; mb.disabled = false; }
 });
+// several snapshots of one volume: tick them, then delete / keep them in one go
+function selList(nums) {             // [78,79,80,84] -> "78-80_84" (fits the 64 characters of a version)
+  nums.sort((a, b) => a - b); const out = [];
+  for (let i = 0; i < nums.length; i++) {
+    let j = i; while (j + 1 < nums.length && nums[j + 1] === nums[j] + 1) j++;
+    out.push(j > i ? nums[i] + '-' + nums[j] : String(nums[i])); i = j;
+  }
+  return out.join('_');
+}
+function selUpdate(cfg) {
+  const boxes = [...document.querySelectorAll('input.sel[data-cfg="' + cfg + '"]:checked')];
+  const bar = document.querySelector('p.selbar[data-cfg="' + cfg + '"]');
+  const del = bar.querySelector('.seldel'), keep = bar.querySelector('.selkeep'), info = bar.querySelector('span');
+  del.disabled = boxes.length === 0;
+  keep.disabled = boxes.length === 0 || boxes.some(b => !b.dataset.keep);   // keep: only automatic ones
+  info.textContent = boxes.length ? boxes.length + ' selected' : '';
+}
+document.querySelectorAll('input.sel').forEach(b => b.addEventListener('change', () => selUpdate(b.dataset.cfg)));
+document.querySelectorAll('.seldel, .selkeep').forEach(btn => btn.addEventListener('click', () => {
+  const cfg = btn.dataset.cfg, action = btn.classList.contains('seldel') ? 'delete' : 'keep';
+  const nums = [...document.querySelectorAll('input.sel[data-cfg="' + cfg + '"]:checked')].map(b => parseInt(b.value, 10));
+  const version = cfg + '.' + selList(nums) + '.' + action;
+  if (version.length > 64) { alert('Too many separate snapshots for one action — select fewer (or neighbouring ones).'); return; }
+  location.href = '/hooks/snapshots?version=' + encodeURIComponent(version);
+}));
 </script>"""
 SCANSCRIPT = """<script>
 const sb = document.getElementById('scan'), ss = document.getElementById('sstate');

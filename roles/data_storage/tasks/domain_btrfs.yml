@@ -14,9 +14,23 @@
     SNAP='{{ (_dom.snapshot | default(true) | bool) | ternary("yes", "no") }}'   # no = subvolume only
     DEV="$(findmnt -no SOURCE / | sed 's/\[.*//')"
     RUUID="$(findmnt -no UUID /)"
+    STOP='{{ _dom.migrate_stop | default([]) | join(" ") }}'   # units to stop while existing data moves in
     changed=0
 
     # 1) subvolume @NAME, mounted at MP (via fstab)
+    # A filled directory that is not its own volume yet moves in only where the host allows
+    # it (data_storage_migrate, host_vars — it stops services). Otherwise leave it COMPLETELY
+    # alone, before anything is created: an empty subvolume mounted over it would hide the
+    # live data. This task runs in check mode too (later checks need the mountpoints) — but
+    # moving data in stops services: never in a check run, only reported.
+    if ! mountpoint -q "$MP" && [ -d "$MP" ] && [ -n "$(ls -A "$MP" 2>/dev/null)" ] && [ '{{ ansible_check_mode | ternary("yes", "no") }}' = yes ]; then
+      echo "SKIPPED (check mode) $MP holds data and is not its own volume yet — WOULD MIGRATE in a real run{{ '' if (data_storage_migrate | default(false) | bool) else ' with data_storage_migrate: true' }}"
+      exit 0
+    fi
+    if ! mountpoint -q "$MP" && [ -d "$MP" ] && [ -n "$(ls -A "$MP" 2>/dev/null)" ]        && [ '{{ data_storage_migrate | default(false) | bool | ternary("yes", "no") }}' != yes ]; then
+      echo "SKIPPED $MP holds data and is not its own volume yet — moving it in needs data_storage_migrate: true (host_vars)"
+      exit 0
+    fi
     if ! mountpoint -q "$MP"; then
       TLM="$(mktemp -d)"
       mount -o subvolid=5 "$DEV" "$TLM"
@@ -24,11 +38,32 @@
       if [ "$SNAP" = yes ]; then
         [ -d "$TLM/@${NAME}_snapshots" ] || { btrfs subvolume create "$TLM/@${NAME}_snapshots" >/dev/null; changed=1; }
       fi
+      # MP already holds data (an existing host, e.g. /var/lib/docker before it got its own
+      # volume): stop its users, move the data in (reflink copy — instant, no extra space),
+      # keep the old directory as MP.before-subvolume until the new mount is verified.
+      if [ -d "$MP" ] && [ -n "$(ls -A "$MP" 2>/dev/null)" ] && [ -z "$(ls -A "$TLM/@$NAME" 2>/dev/null)" ]; then
+        [ -n "$STOP" ] && systemctl stop $STOP
+        # nothing may still be mounted below (container overlays, shm) — it would be copied in
+        if findmnt -rn -o TARGET | grep -q "^$MP/"; then
+          umount "$TLM"; rmdir "$TLM"
+          for u in $(printf '%s\n' $STOP | tac); do systemctl start "$u" || true; done
+          echo "FAILED: still mounted below $MP:"; findmnt -rn -o TARGET | grep "^$MP/" | head; exit 1
+        fi
+        cp -a -x --reflink=always "$MP/." "$TLM/@$NAME/"
+        chmod "$(stat -c %a "$MP")" "$TLM/@$NAME"; chown "$(stat -c %u:%g "$MP")" "$TLM/@$NAME"
+        mv "$MP" "$MP.before-subvolume"
+        echo "MIGRATED $MP -> @$NAME (old copy: $MP.before-subvolume)"
+        migrated=1; changed=1
+      fi
       umount "$TLM"; rmdir "$TLM"
       grep -qE "[[:space:]]${MP}[[:space:]]" /etc/fstab \
         || { echo "UUID=$RUUID $MP btrfs defaults,subvol=@$NAME 0 0" >> /etc/fstab; changed=1; }
       mkdir -p "$MP"
       mountpoint -q "$MP" || { mount "$MP"; changed=1; }
+      # the stopped units again, in reverse order (containerd before docker)
+      if [ "${migrated:-0}" = 1 ] && [ -n "$STOP" ]; then
+        for u in $(printf '%s\n' $STOP | tac); do systemctl start "$u" || true; done
+      fi
     fi
 
     # 2) snapper config NAME with a FLAT .snapshots (@NAME_snapshots), daily/DAILY-day timeline
@@ -68,3 +103,8 @@
   register: _stor_dom
   changed_when: "'CHANGED' in (_stor_dom.stdout | default(''))"
   check_mode: false
+
+- name: "storage[{{ _dom.name }}]: moved in / left alone"
+  ansible.builtin.debug:
+    msg: "{{ _stor_dom.stdout_lines | select('match', '^(MIGRATED|SKIPPED|FAILED)') | list }}"
+  when: (_stor_dom.stdout_lines | default([]) | select('match', '^(MIGRATED|SKIPPED|FAILED)') | list | length) > 0

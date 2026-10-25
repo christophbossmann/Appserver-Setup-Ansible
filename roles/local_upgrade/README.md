@@ -88,7 +88,9 @@ the volume needs:
   after the last upgrade, or take the data volumes back to the same time.
 
 In both cases snapshots newer than the target are dropped, and the volume as it was is kept
-as `<subvolume>_rollback_backup_<date>` until you delete it (listed on the page).
+as `<subvolume>_rollback_backup_<date>` until you delete it — listed on the snapshot page
+with what it holds exclusively (measured nightly) and a **delete** link (typed confirmation).
+The disk dashboard shows them as "kept from rollbacks" instead of unexplained space.
 For "back to a few hours ago" of a database, PITR (`postgres-pitr-restore.yml`) is the
 better tool: it is exact to the second and keeps the archive intact.
 

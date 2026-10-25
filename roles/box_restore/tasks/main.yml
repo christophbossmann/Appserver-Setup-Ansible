@@ -1,0 +1,30 @@
+---
+# Called three times from server-all.yml (box_restore_phase), each at the point where that
+# step fits into a fresh install:
+#   prepare    after the storagebox role: checks; FRESH apps' old folders aside; for RESTORE
+#              the dump set, Nextcloud's data aside for its installer
+#   authentik  after the authentik stack, before authentik_bootstrap: the database
+#   business   after the nextcloud stack, before nextcloud_bootstrap: immich + nextcloud,
+#              then the old backup state aside
+- name: Rebuild from the Storage Box — {{ box_restore_phase }}
+  ansible.builtin.include_tasks: "{{ box_restore_phase }}.yml"
+  vars:
+    # {app: MODE} from "immich:RESTORE,nextcloud:FRESH"
+    _br_modes: >-
+      {{ dict((restore_apps | string).replace(' ', '').split(',') | select
+              | map('split', ':') | list) }}
+    _br_restore: "{{ _br_modes | dict2items | selectattr('value', 'equalto', 'RESTORE') | map(attribute='key') | list }}"
+    _br_fresh: "{{ _br_modes | dict2items | selectattr('value', 'equalto', 'FRESH') | map(attribute='key') | list }}"
+    _br_crypt: "{{ (storagebox_crypt_remotes | default([]) | first | default({})).name | default('') }}"
+    _br_rclone: [rclone, --config, "{{ storagebox_config_file }}"]
+    # decrypted view of this host's backups / plain (= encrypted bytes) path of its folder,
+    # for renames on the box
+    _br_backup: "{{ (storagebox_crypt_remotes | default([]) | first | default({})).name | default('') }}:{{ storagebox_backup_dir | default('backup') }}"
+    _br_plain_own: "{{ storagebox_remote_name }}:{{ [storagebox_remote_subdir | default(''), storagebox_root_path | default('')] | select | join('/') }}"
+  when: not ansible_check_mode
+
+# Renames folders and replaces databases — nothing a dry run could show meaningfully.
+- name: Rebuild from the Storage Box — not in check mode
+  ansible.builtin.debug:
+    msg: "Check mode: the rebuild step '{{ box_restore_phase }}' ({{ restore_apps }}) is skipped — it runs only in a real run."
+  when: ansible_check_mode

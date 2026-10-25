@@ -536,7 +536,7 @@
         "uid": "prometheus"
       },
       "title": "Largest directories anywhere (nightly search)",
-      "description": "Found by walking every local filesystem completely once a night (disk-discover-metrics) \u2014 not limited to the fixed list the panels above use, so data in an unexpected place shows up here. Every directory of at least the threshold, split as deep as it stays that big; nothing is counted twice. '(rest)' = what a directory holds besides its big children, '(everything smaller)' = the remainder of a volume. Snapshot directories and the Storage Box are left out.",
+      "description": "Found by walking every local filesystem completely once a night (disk-discover-metrics) — not limited to the fixed list the panels above use, so data in an unexpected place shows up here. Every directory of at least the threshold, split as deep as it stays that big; nothing is counted twice. '(rest)' = what a directory holds besides its big children, '(everything smaller)' = the remainder of a volume. Snapshot directories and the Storage Box are left out.",
       "gridPos": {
         "h": 18,
         "w": 16,
@@ -598,86 +598,19 @@
       ]
     },
     {
-      "id": 21,
+      "id": 24,
       "type": "stat",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "title": "Not attributed",
-      "description": "Used space the nightly search could not explain: used - all directories it measured - what only snapshots still hold. A few GiB are normal (filesystem metadata, estimates). A large value means data somewhere that is not visible as files \u2014 or a place the search does not reach.",
+      "title": "Used",
+      "description": "Used space of the local disk (statvfs). \"Used consists of\" below shows what it is made of — including what the nightly search could not attribute.",
       "gridPos": {
-        "h": 6,
+        "h": 5,
         "w": 8,
         "x": 16,
         "y": 36
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes",
-          "decimals": 1,
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 8000000000.0
-              },
-              {
-                "color": "red",
-                "value": 20000000000.0
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "textMode": "value",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "refId": "A",
-          "instant": true,
-          "expr": "sum(disk_discover_unassigned_bytes)"
-        }
-      ]
-    },
-    {
-      "id": 22,
-      "type": "stat",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "title": "Used = files + snapshots + not attributed",
-      "description": "How the used space of the local disk adds up: what the search found as files, what only snapshots still hold (Disk snapshots dashboard), and the unexplained remainder.",
-      "gridPos": {
-        "h": 6,
-        "w": 8,
-        "x": 16,
-        "y": 42
       },
       "fieldConfig": {
         "defaults": {
@@ -694,7 +627,7 @@
         "colorMode": "value",
         "graphMode": "none",
         "justifyMode": "center",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "orientation": "horizontal",
         "reduceOptions": {
           "calcs": [
@@ -714,13 +647,76 @@
           "instant": true,
           "legendFormat": "used",
           "expr": "sum(disk_discover_used_bytes)"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "title": "Used consists of",
+      "description": "The parts add up to Used: what the nightly search found as files, what only snapshots still hold (Disk snapshots dashboard), btrfs metadata (stored twice, never visible as files), what subvolumes kept by earlier volume rollbacks hold exclusively (*_rollback_backup_*, delete them on the upgrade page -> snapshots), and the remainder the search could not explain (data shared by several of these, filesystem overhead, estimates).",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 41
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 1,
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
         },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "not attributed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color",
+        "namePlacement": "left",
+        "sizing": "auto",
+        "minVizHeight": 16,
+        "maxVizHeight": 300,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "refId": "B",
+          "refId": "A",
           "instant": true,
           "legendFormat": "files",
           "expr": "sum(disk_discover_measured_bytes)"
@@ -730,10 +726,40 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "refId": "C",
+          "refId": "B",
           "instant": true,
           "legendFormat": "snapshots",
           "expr": "sum(disk_discover_snapshots_bytes)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "C",
+          "instant": true,
+          "legendFormat": "btrfs metadata",
+          "expr": "sum(disk_discover_metadata_bytes)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "D",
+          "instant": true,
+          "legendFormat": "kept from rollbacks",
+          "expr": "sum(disk_discover_rollback_kept_total_bytes)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "E",
+          "instant": true,
+          "legendFormat": "not attributed",
+          "expr": "sum(disk_discover_unassigned_bytes)"
         }
       ]
     },
@@ -750,7 +776,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 48
+        "y": 49
       },
       "fieldConfig": {
         "defaults": {
@@ -817,6 +843,6 @@
   "timezone": "browser",
   "title": "Disk usage",
   "uid": "disk-usage",
-  "version": 1,
+  "version": 4,
   "weekStartsOn": ""
 }

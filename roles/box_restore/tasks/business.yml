@@ -1,0 +1,274 @@
+---
+# immich + nextcloud RESTORE, then the old backup state aside. Runs after the nextcloud stack
+# and BEFORE nextcloud_bootstrap (which then wires user_oidc + apps of the host onto the restored
+# data).
+- name: Restore immich + nextcloud
+  block:
+    # ---- immich: the originals stay where they are ---------------------------------------
+    - name: Immich from the box
+      when: "'immich' in _br_restore"
+      block:
+        - name: Immich — was authentik restored on this host (this run or earlier)?
+          ansible.builtin.stat:
+            path: "{{ box_restore_state_dir }}/authentik.done"
+          register: _br_ak_before
+
+        - name: Immich — stop server + ML
+          ansible.builtin.shell: "docker stop immich-server immich-machine-learning 2>/dev/null || true"
+          changed_when: true
+
+        - name: Immich — thumbnails back (minutes instead of hours of regeneration)
+          ansible.builtin.command:
+            argv: "{{ _br_rclone + ['sync', _br_backup ~ '/immich-thumbs', immich_upload_dir ~ '/thumbs',
+                                    '--transfers', '8', '--checkers', '16', '--stats-one-line', '--stats', '0', '-v'] }}"
+          changed_when: true
+
+        - name: Immich — restore the database
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/pg_restore_dump.yml"
+          vars:
+            prd_container: "{{ postgres_business_container | default('postgres-business') }}"
+            prd_user: "{{ postgres_business_user }}"
+            prd_db: "{{ immich_db_name }}"
+            prd_dump: "{{ box_restore_work_dir }}/{{ _br_set }}/immich.dump"
+
+        # The users' OIDC subjects came with the authentik database when it was restored too;
+        # against a fresh authentik they are stale -> cleared, immich re-links by email on
+        # the next login (see immich-restore-local.yml for the details).
+        - name: Immich — clear the OIDC links (authentik was NOT restored with it)
+          ansible.builtin.shell: |
+            docker exec -i {{ postgres_business_container | default('postgres-business') }} psql -U {{ postgres_business_user }} -d {{ immich_db_name }} <<'SQL'
+            UPDATE "user" SET "oauthId"='' WHERE "oauthId" IS NOT NULL AND "oauthId" <> '';
+            SQL
+          args: { executable: /bin/bash }
+          changed_when: true
+          when: not _br_ak_before.stat.exists
+
+      always:
+        # the job queue in redis still holds the fresh install's jobs (asset ids that are gone)
+        - name: Immich — empty redis, start server + ML
+          ansible.builtin.shell: |
+            docker exec immich-redis sh -c 'valkey-cli FLUSHALL || redis-cli FLUSHALL' >/dev/null 2>&1 || true
+            docker start immich-server immich-machine-learning
+          changed_when: true
+          when: "'immich' in _br_restore"
+
+    - name: Immich — answering on its published port
+      when: "'immich' in _br_restore"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ immich_port }}/api/server/ping"
+        status_code: 200
+      register: _br_im_ping
+      until: _br_im_ping.status == 200
+      retries: 60
+      delay: 5
+
+    - name: Immich — not in maintenance mode (a dump taken during an upgrade carries it)
+      ansible.builtin.command: docker exec immich-server immich-admin disable-maintenance-mode
+      changed_when: false
+      failed_when: false
+      when: "'immich' in _br_restore"
+
+    # Photos uploaded after the dump are on the box but not in the restored database.
+    - name: Immich — import the photos newer than the dump again
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/immich_reimport_orphans.yml"
+      vars:
+        immich_reimport_confirm: "YES"
+        immich_reimport_min_age_min: 0
+      when:
+        - "'immich' in _br_restore"
+        - restore_immich_reimport_orphans | bool
+
+    - name: Immich — restored once on this host
+      ansible.builtin.copy:
+        dest: "{{ box_restore_state_dir }}/immich.done"
+        content: "{{ {'set': _br_set, 'time': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')} | to_nice_json }}\n"
+        mode: "0644"
+      when: "'immich' in _br_restore"
+
+    # ---- nextcloud ------------------------------------------------------------------------
+    - name: Nextcloud from the box
+      when: "'nextcloud' in _br_restore"
+      vars:
+        _occ: [docker, exec, -u, www-data, nextcloud, php, occ]
+        _nc_cfg_file: "{{ box_restore_work_dir }}/{{ _br_set }}/nextcloud-config.json"
+      block:
+        - name: Nextcloud — maintenance mode on (best effort)
+          ansible.builtin.shell: "{{ _occ | join(' ') }} maintenance:mode --on || true"
+          changed_when: true
+
+        - name: Nextcloud — stop it
+          ansible.builtin.shell: "docker stop nextcloud-cron nextcloud 2>/dev/null || true"
+          changed_when: true
+
+        # The data set aside before the install comes back; the folder holds only the fresh
+        # install's files by now. Nothing to do when Nextcloud was installed already (its data
+        # never left the folder).
+        - name: Nextcloud — the data back in place
+          when: _br_nc_aside is defined
+          block:
+            - name: Nextcloud — stop its box mount meanwhile
+              ansible.builtin.systemd:
+                name: "{{ storagebox_service_name }}-nextcloud.service"
+                state: stopped
+
+            - name: Nextcloud — swap the fresh install's folder for the data
+              ansible.builtin.shell: |
+                set -euo pipefail
+                R=(rclone --config '{{ storagebox_config_file }}')
+                dst='{{ _br_plain_own }}/nextcloud/data'
+                "${R[@]}" purge "$dst" 2>/dev/null || true          # the fresh install only
+                "${R[@]}" moveto '{{ _br_nc_aside }}' "$dst"
+              args: { executable: /bin/bash }
+              changed_when: true
+          always:
+            - name: Nextcloud — its box mount back
+              ansible.builtin.systemd:
+                name: "{{ storagebox_service_name }}-nextcloud.service"
+                state: started
+
+        - name: Nextcloud — restore the database
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/pg_restore_dump.yml"
+          vars:
+            prd_container: "{{ nextcloud_db_host | default('postgres') }}"
+            prd_user: "{{ nextcloud_db_admin_user | default(postgres_user) }}"
+            prd_db: "{{ nextcloud_db_name }}"
+            prd_dump: "{{ box_restore_work_dir }}/{{ _br_set }}/nextcloud.dump"
+
+        # file locks + caches in redis belong to the fresh install's database
+        - name: Nextcloud — empty redis, start it
+          ansible.builtin.shell: |
+            docker exec nextcloud-redis sh -c 'valkey-cli FLUSHALL || redis-cli FLUSHALL' >/dev/null 2>&1 || true
+            docker start nextcloud
+          changed_when: true
+
+        - name: Nextcloud — occ answers
+          ansible.builtin.command:
+            argv: "{{ _occ + ['status', '--output=json'] }}"
+          register: _br_nc_status
+          until: _br_nc_status.rc == 0
+          retries: 36
+          delay: 5
+          changed_when: false
+
+        # instanceid names the appdata folder (previews, theming) in the restored data,
+        # secret encrypts stored credentials, passwordsalt the old-style local passwords.
+        - name: Nextcloud — the source's config values (dump set)
+          ansible.builtin.slurp:
+            src: "{{ _nc_cfg_file }}"
+          register: _br_nc_cfg_json
+          failed_when: false
+          no_log: true
+
+        - name: Nextcloud — set instanceid / secret / passwordsalt
+          ansible.builtin.command:
+            argv: "{{ _occ + ['config:system:set', item.key, '--value=' ~ item.value] }}"
+          loop: "{{ (_br_nc_cfg_json.content | b64decode | from_json) | dict2items }}"
+          loop_control: { label: "{{ item.key }}" }
+          changed_when: true
+          no_log: true
+          when: _br_nc_cfg_json.content is defined
+
+        - name: Nextcloud — no config values in this dump set (older backup)
+          ansible.builtin.debug:
+            msg: >-
+              The dump set has no nextcloud-config.json — the instanceid of this install stays,
+              previews get regenerated; credentials stored encrypted (e.g. external storages)
+              have to be entered again.
+          when: _br_nc_cfg_json.content is not defined
+
+        # occ upgrade refuses to run in maintenance mode — off first, then upgrade only when the
+        # restored database is older than the running version
+        - name: Nextcloud — maintenance off
+          ansible.builtin.command:
+            argv: "{{ _occ + ['maintenance:mode', '--off'] }}"
+          changed_when: true
+
+        - name: Nextcloud — does the restored database need a schema upgrade?
+          ansible.builtin.command:
+            argv: "{{ _occ + ['status', '--output=json'] }}"
+          register: _br_nc_st
+          changed_when: false
+
+        - name: Nextcloud — schema upgrade to the running version
+          ansible.builtin.command:
+            argv: "{{ _occ + ['upgrade'] }}"
+          changed_when: true
+          when: (_br_nc_st.stdout | from_json).needsDbUpgrade | default(false) | bool
+
+        - name: Nextcloud — tell clients the data changed
+          ansible.builtin.command:
+            argv: "{{ _occ + ['maintenance:data-fingerprint'] }}"
+          changed_when: true
+
+        - name: Nextcloud — file index matches the files
+          ansible.builtin.command:
+            argv: "{{ _occ + ['files:scan', '--all'] }}"
+          changed_when: true
+
+      always:
+        - name: Nextcloud — running again (+ cron)
+          ansible.builtin.shell: "docker start nextcloud nextcloud-cron"
+          changed_when: true
+          when: "'nextcloud' in _br_restore"
+
+    - name: Nextcloud — restored once on this host
+      ansible.builtin.copy:
+        dest: "{{ box_restore_state_dir }}/nextcloud.done"
+        content: "{{ {'set': _br_set, 'time': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')} | to_nice_json }}\n"
+        mode: "0644"
+      when: "'nextcloud' in _br_restore"
+
+    # A big restore is a new starting point: take a PITR anchor right away (when PITR is set
+    # up already — on a fresh server roles/postgres_pitr takes the first one later this run).
+    - name: Fresh PITR base backup of the business instance
+      ansible.builtin.shell: "[ -x /usr/local/bin/pg-pitr-backup ] && /usr/local/bin/pg-pitr-backup postgres-business || echo 'PITR not set up yet'"
+      changed_when: true
+      when: ('immich' in _br_restore) or ('nextcloud' in _br_restore)
+
+    # ---- backups: a new start, the old ones kept -----------------------------------------
+    # The new server's backup jobs start right away; their dump rotation would push the old
+    # sets out, so db-dumps/ is set aside. The thumbnail mirror is one folder, not sets: it
+    # stays in use after immich:RESTORE (it matches the restored database — the nightly mirror
+    # only adds what is new); otherwise it belongs to the old database and goes aside too.
+    - name: Backups — was immich restored on this host (this run or an earlier one)?
+      ansible.builtin.stat:
+        path: "{{ box_restore_state_dir }}/immich.done"
+      register: _br_im_done
+
+    - name: Backups — set the old state aside
+      ansible.builtin.shell: |
+        set -uo pipefail
+        R=(rclone --config '{{ storagebox_config_file }}')
+        b='{{ _br_plain_own }}/{{ storagebox_backup_dir | default("backup") }}'
+        for d in db-dumps {{ '' if _br_im_done.stat.exists else 'immich-thumbs' }}; do
+          if [ -n "$("${R[@]}" lsf --max-depth 1 "$b/$d" 2>/dev/null)" ]; then
+            "${R[@]}" moveto "$b/$d" "$b/$d.before-rebuild-{{ _br_stamp }}" && echo "MOVED $d -> $d.before-rebuild-{{ _br_stamp }}"
+          else
+            echo "EMPTY $d"
+          fi
+        done
+      args: { executable: /bin/bash }
+      register: _br_bk
+      changed_when: "'MOVED' in _br_bk.stdout"
+
+  always:
+    - name: Remove the downloaded dumps
+      ansible.builtin.file:
+        path: "{{ box_restore_work_dir }}"
+        state: absent
+
+- name: Rebuild from the box — was authentik restored on this host (this run or earlier)?
+  ansible.builtin.stat:
+    path: "{{ box_restore_state_dir }}/authentik.done"
+  register: _br_ak_done
+
+- name: Rebuild from the box — done
+  ansible.builtin.debug:
+    msg: >-
+      {{ _br_modes.items() | map('join', ':') | join(', ') }}{{ (' — dump set ' ~ _br_set) if (_br_restore | length > 0) else '' }}.
+      Backups: {{ _br_bk.stdout_lines | default([]) | join('; ') }}.
+      {% if 'immich' in _br_restore %}Immich: encoded videos are not on the box — Administration ->
+      Job Queues -> Transcode Videos -> "Missing" rebuilds them. {% endif %}
+      {% if _br_restore | length > 0 and not _br_ak_done.stat.exists %}SSO: authentik was not
+      restored — logins re-link by email/username on first use. {% endif %}
+      Remove the *.before-* folders on the box by hand once everything checks out.

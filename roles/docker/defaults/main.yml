@@ -1,6 +1,10 @@
 ---
 docker_users: []
 
+# Paths of the docker / containerd storage subvolumes (data_domains entries named docker /
+# containerd, roles/data_storage) — the daemons get RequiresMountsFor on them.
+docker_storage_mounts: "{{ data_domains | default([]) | selectattr('name', 'in', ['docker', 'containerd']) | map(attribute='path') | list }}"
+
 # Weekly cleanup of UNUSED images + build cache older than docker_prune_keep_hours.
 # Images of running AND stopped containers stay; volumes are NEVER pruned. Without this
 # every version bump leaves the previous image behind forever.

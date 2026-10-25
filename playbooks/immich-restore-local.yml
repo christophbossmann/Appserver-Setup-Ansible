@@ -132,39 +132,13 @@
           become: false
           when: immich_restore_db | bool
 
-        - name: Restore the database (pg_restore --clean, DESTRUCTIVE)
-          # NO --no-owner: the dump (made by the `business` superuser) records
-          # owner=immich; restoring as the superuser re-applies it so the
-          # least-privilege `immich` app role keeps access. The vchord extension in
-          # the dump is recreated as superuser (the business image ships it).
-          ansible.builtin.shell: >-
-            cat {{ _remote_dump }} |
-            docker exec -i {{ _biz }} pg_restore -U {{ _bu }}
-            -d {{ immich_db_name }} --clean --if-exists
-          args: { executable: /bin/bash }
-          register: _pg_restore
-          failed_when: false   # --clean emits benign "does not exist" notices; inspect output
-          when: immich_restore_db | bool
-
-        - name: Ensure every restored object is owned by the immich DB role
-          # Belt-and-suspenders: reassign anything in public not owned by the DB owner
-          # (datdba = immich) back to it, so the least-privilege app role keeps access.
-          ansible.builtin.shell: |
-            docker exec -i {{ _biz }} psql -U {{ _bu }} -d {{ immich_db_name }} <<'SQL'
-            DO $$
-            DECLARE r record; dbowner text;
-            BEGIN
-              SELECT datdba::regrole::text INTO dbowner FROM pg_database WHERE datname = current_database();
-              FOR r IN SELECT tablename AS n FROM pg_tables WHERE schemaname='public' AND tableowner <> dbowner LOOP
-                EXECUTE format('ALTER TABLE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
-              FOR r IN SELECT sequencename AS n FROM pg_sequences WHERE schemaname='public' AND sequenceowner <> dbowner LOOP
-                EXECUTE format('ALTER SEQUENCE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
-              FOR r IN SELECT viewname AS n FROM pg_views WHERE schemaname='public' AND viewowner <> dbowner LOOP
-                EXECUTE format('ALTER VIEW public.%I OWNER TO %I', r.n, dbowner); END LOOP;
-            END $$;
-            SQL
-          args: { executable: /bin/bash }
-          changed_when: true
+        - name: Restore the database + owner fix (shared with the restore from the Storage Box)
+          ansible.builtin.include_tasks: tasks/pg_restore_dump.yml
+          vars:
+            prd_container: "{{ _biz }}"
+            prd_user: "{{ _bu }}"
+            prd_db: "{{ immich_db_name }}"
+            prd_dump: "{{ _remote_dump }}"
           when: immich_restore_db | bool
 
         - name: Clear stale OIDC links so SSO re-attaches by email (Authentik-state-independent)

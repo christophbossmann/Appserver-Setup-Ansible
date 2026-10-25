@@ -1,0 +1,45 @@
+---
+# Rebuild a server WITH a decision per app about its old state in its own Storage Box folder
+# (storagebox_root_path) — for a rebuilt server after a total loss, or a wanted fresh start.
+# Off unless the run asks for it:
+#
+#   ansible-playbook playbooks/server-all.yml --limit <host> \
+#     -e restore_apps=immich:RESTORE,nextcloud:RESTORE,authentik:RESTORE \
+#     -e restore_confirm=YES --ask-vault-pass
+#
+# restore_apps      <app>:<MODE>, comma-separated, no spaces; an app not listed is left alone.
+#   immich:FRESH        the old folder on the box is renamed aside, immich starts empty
+#   immich:RESTORE      the originals are used where they are; database + thumbnails from the
+#                       dump set; photos newer than the dump are imported again
+#   nextcloud:FRESH     the old data folder is renamed aside, nextcloud installs empty
+#   nextcloud:RESTORE   database + data (set aside for the installer, which needs an empty
+#                       folder, and put back), instanceid / secret / passwordsalt from the dump
+#                       set (nextcloud-config.json), file scan
+#   authentik:FRESH     nothing to do — the blueprints set authentik up new
+#   authentik:RESTORE   database (the blueprints + authentik_bootstrap then re-apply the
+#                       host's providers, URLs and passwords)
+# restore_dump_set  YYYYmmdd-HHMMSS of a dump set on the box; empty = the newest
+#
+# Nothing on the box is deleted or overwritten: old folders are renamed aside
+# (<folder>.before-fresh-<stamp>) or used in place. In every rebuild backup/db-dumps is renamed
+# too (db-dumps.before-rebuild-<stamp>, after the restore read from it), so the new server's
+# dump rotation cannot push out the last good sets; the thumbnail mirror stays in use after
+# immich:RESTORE (it matches the restored database), else it goes aside as well. Remove the
+# *.before-* folders by hand once everything checks out.
+#
+# A test of another host's state (e.g. PROD's on DEV): copy that host's folder on the box into
+# this host's folder first (rclone copy storagebox:prod storagebox:dev — encrypted bytes, one
+# key pair for the box), then restore as usual — the same path as a real disaster recovery.
+#
+# Each app is restored ONCE per host (/var/lib/box-restore/<app>.done); again only with
+# -e restore_force=true. Requires the Storage Box with its rclone crypt remote and, per app,
+# the encrypted layout (immich_storage_encrypted; nextcloud_data_external +
+# nextcloud_storage_encrypted).
+restore_apps: ""
+restore_confirm: ""
+restore_force: false
+restore_dump_set: ""
+restore_immich_reimport_orphans: true
+
+box_restore_state_dir: /var/lib/box-restore
+box_restore_work_dir: "{{ backup_dump_dir | default('/opt/backups') }}/box-restore"

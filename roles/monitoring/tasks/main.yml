@@ -399,6 +399,14 @@
         kickoff: false     # boot or on every deploy
         service_extra:
           - "TimeoutStartSec=2h"
+          # the disk search takes over the snapshot number of THIS measurement (else the disk
+          # dashboard shows the one of the night before until the next nightly search)
+          - "{{ 'ExecStartPost=-/usr/bin/systemctl start --no-block disk-discover-metrics.service' if (monitoring_disk_discover_enabled | bool) else '' }}"
+      - name: job-summary-metrics
+        description: What the last run of each scheduled job did ("Scheduled jobs" dashboard)
+        exec: /usr/local/bin/job-summary-metrics /etc/job-summary-units.regex
+        oncalendar: "{{ monitoring_job_summary_oncalendar }}"
+        enabled: "{{ monitoring_job_summary_enabled | bool }}"
       - name: trivy-metrics
         description: Vulnerabilities of the running container images for node_exporter (trivy)
         exec: "/usr/local/bin/trivy-metrics {{ monitoring_trivy_cache_dir }} /etc/trivy-update-rules.tsv"
@@ -538,6 +546,13 @@
         owner: root
         group: root
         mode: "0755"
+
+    - name: The scheduled jobs job-summary-metrics summarises (same list as node_exporter's)
+      ansible.builtin.copy:
+        dest: /etc/job-summary-units.regex
+        content: "{{ node_exporter_systemd_units }}\n"
+        mode: "0644"
+      when: monitoring_job_summary_enabled | bool
 
     - name: Install collector scripts
       ansible.builtin.copy:

@@ -82,21 +82,30 @@
     # apps that externalize data onto it (e.g. immich originals), so the mount is up when
     # their symlinks/binds resolve. No-op where disabled.
     - { role: storagebox, tags: [base, storagebox, business, immich, nextcloud] }
+    # Rebuild with a decision per app about its old state on the Storage Box (opt-in per run:
+    # -e restore_apps=immich:RESTORE,nextcloud:FRESH,… -e restore_confirm=YES;
+    # roles/box_restore/defaults). Three phases, each where it fits into
+    # a fresh install; skipped entirely without restore_apps.
+    - { role: box_restore, vars: { box_restore_phase: prepare }, tags: [always], when: (restore_apps | default('') | string | length) > 0 }
     # rclone+LDAP image = WebDAV --auth-proxy sidecar for immich/nextcloud (and n8n/playground).
     # Tagged with every CONSUMER so it is built whenever one of them is selected (built once,
     # cached; the stacks reference it with pull_policy: never). NOT in base — only built if a
     # consumer is actually deployed.
     - { role: rclone_ldap_image, tags: [rclone_ldap_image, business, immich, nextcloud, n8n, playground] }
-    - { role: compose_stack, vars: { stack: postgres }, tags: [postgres] }   # dev/shared instance (n8n + supabase); NOT needed by immich/nextcloud (they use postgres-business)
+    - { role: compose_stack, vars: { stack: postgres }, tags: [postgres], when: "('n8n' in (caddy_services | default({}))) or ('supabase' in (caddy_services | default({}))) or ((caddy_services | default({})).keys() | select('match', '^(pg[0-9]+|webdav_playground)$') | list | length > 0)" }   # dev/shared instance (n8n + supabase); NOT needed by immich/nextcloud (they use postgres-business)
     - { role: compose_stack, vars: { stack: postgres-business }, tags: [business, postgres, postgres_business, immich, nextcloud] }   # shared DB for immich+nextcloud — tagged with both so either app pulls it standalone
     # Authentik EARLY (right after postgres creates the backend net): it is the
     # auth foundation — every later service is immediately usable (OIDC/forward-
     # auth/LDAP logins) the moment it comes up, and anything with a deploy-time
     # dependency on authentik (networks, API) is ordered safely by construction.
     - { role: compose_stack, vars: { stack: authentik }, tags: [platform, authentik] }
+    - { role: box_restore, vars: { box_restore_phase: authentik }, tags: [always], when: (restore_apps | default('') | string | length) > 0 }
     - { role: authentik_bootstrap, tags: [platform, authentik] }          # post-blueprint API setup: passwords + LDAP outpost token + human profile sync (groups/attrs/avatar)
     # Generic compose stacks (definitions in stacks/<name>/).
-    - { role: n8n, tags: [n8n] }
+    # OPTIONAL apps run only where the host plans them: a key in its caddy_services
+    # (host_vars) — so a full, untagged run installs exactly the host's set (also with --tags).
+    # The core (authentik, immich, nextcloud, headscale, monitoring, …) is not gated.
+    - { role: n8n, tags: [n8n], when: "'n8n' in (caddy_services | default({}))" }
     - { role: compose_stack, vars: { stack: dozzle }, tags: [platform, dozzle] }   # container dashboard (live logs/actions)
     - { role: headscale_int_dns, tags: [platform, headscale] }   # derive .int extra_records from caddy_services (BEFORE the stack renders config.yaml)
     - { role: compose_stack, vars: { stack: headscale }, tags: [platform, headscale] }   # self-hosted Tailscale control server (per-host isolated tailnet)
@@ -112,21 +121,22 @@
     - { role: headscale_int_dns, vars: { headscale_int_dns_require_ip: true }, tags: [platform, headscale] }
     - { role: compose_stack, vars: { stack: headscale }, tags: [platform, headscale] }
     - { role: compose_stack, vars: { stack: headplane }, tags: [platform, headplane] }   # headscale web UI (internal + SSO)
-    - { role: compose_stack, vars: { stack: komodo }, tags: [komodo] }
-    - { role: cockpit, tags: [cockpit] }
-    - { role: compose_stack, vars: { stack: playwright_mcp }, tags: [playwright_mcp] }
+    - { role: compose_stack, vars: { stack: komodo }, tags: [komodo], when: "'komodo' in (caddy_services | default({}))" }
+    - { role: cockpit, tags: [cockpit], when: "'cockpit' in (caddy_services | default({}))" }
+    - { role: compose_stack, vars: { stack: playwright_mcp }, tags: [playwright_mcp], when: "'playwright_mcp' in (caddy_services | default({}))" }
     - { role: immich_prep, tags: [business, immich] }   # externalize originals onto the Storage Box (symlink) BEFORE the stack starts (gated by immich_originals_external)
     - { role: compose_stack, vars: { stack: immich }, tags: [business, immich] }
     - { role: immich_bootstrap, tags: [business, immich] }   # create the local admin (email = Authentik user) so SSO = admin
     - { role: compose_stack, vars: { stack: immich_uploader }, tags: [business, immich_uploader] }
     - { role: nextcloud_storage, tags: [business, nextcloud] }   # data dir on the Storage Box (nextcloud_data_external): one-time migration BEFORE the stack
     - { role: compose_stack, vars: { stack: nextcloud }, tags: [business, nextcloud] }
+    - { role: box_restore, vars: { box_restore_phase: business }, tags: [always], when: (restore_apps | default('') | string | length) > 0 }
     - { role: nextcloud_bootstrap, tags: [business, nextcloud] }   # occ: wire user_oidc to Authentik
     - { role: backup_restic, tags: [platform, backup] }            # nightly cloud backup (restic over rclone; gated by backup_cloud_enabled)
     - { role: storagebox_backup, tags: [platform, backup, storagebox_backup] }   # immich thumbs + database dumps onto the Storage Box (gated by storagebox_backup_enabled, host_vars)
     - { role: postgres_pitr, tags: [platform, postgres_pitr, backup] }   # WAL archiving + base backups for PITR (gated by postgres_pitr_enabled, host_vars)
-    - { role: compose_stack, vars: { stack: supabase }, tags: [supabase] }
-    - { role: supabase_bootstrap, tags: [supabase] }   # idempotent instance SQL (pg_cron) — also on rebuilds
+    - { role: compose_stack, vars: { stack: supabase }, tags: [supabase], when: "'supabase' in (caddy_services | default({}))" }
+    - { role: supabase_bootstrap, tags: [supabase], when: "'supabase' in (caddy_services | default({}))" }   # idempotent instance SQL (pg_cron) — also on rebuilds
     # pgadmin is its OWN opt-in tag (NOT part of business) — deploy with `--tags pgadmin`.
     # Placed AFTER authentik + supabase: it joins their external networks (authentik_default,
     # supabase_default via pgadmin_extra_networks), which only exist once those stacks have
@@ -135,10 +145,10 @@
     # actual stacks (drop supabase_default on a host without supabase, else the container fails
     # on the missing net). Alternative without pgadmin: local pgAdmin via SSH tunnel to the
     # loopback DB ports (postgres_business_port 5434, authentik_postgres_port 5435, …).
-    - { role: pgadmin_prep, tags: [pgadmin] }   # fail-soft: drop bridge nets (authentik/supabase_default) that aren't deployed on this host -> no per-host override
-    - { role: compose_stack, vars: { stack: pgadmin }, tags: [pgadmin] }
-    - { role: pgadmin_servers, tags: [pgadmin] }   # import shared server defs (SSO users see them)
-    - { role: claude_playground, tags: [playground] }
+    - { role: pgadmin_prep, tags: [pgadmin], when: "'pgadmin' in (caddy_services | default({}))" }   # fail-soft: drop bridge nets (authentik/supabase_default) that aren't deployed on this host -> no per-host override
+    - { role: compose_stack, vars: { stack: pgadmin }, tags: [pgadmin], when: "'pgadmin' in (caddy_services | default({}))" }
+    - { role: pgadmin_servers, tags: [pgadmin], when: "'pgadmin' in (caddy_services | default({}))" }   # import shared server defs (SSO users see them)
+    - { role: claude_playground, tags: [playground], when: "((caddy_services | default({})).keys() | select('match', '^(pg[0-9]+|webdav_playground)$') | list | length > 0)" }
     # Monitoring AFTER every app stack: it derives scrape jobs + postgres exporters from the
     # containers RUNNING at deploy time (immich, authentik, headscale, PITR instances) and
     # joins their networks. Placed earlier, a fresh host came up without the immich/headscale

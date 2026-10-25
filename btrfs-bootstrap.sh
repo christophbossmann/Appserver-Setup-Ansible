@@ -163,11 +163,11 @@ if ! snapper list-configs 2>/dev/null | awk 'NR>2{print $1}' | grep -qx root; th
   fi
   snapper -c root create-config /
 fi
-# Timeline = ONE snapshot per day (no hourly tier), kept 30 days; the last 20 package-run
+# Timeline = ONE snapshot per day (no hourly tier), kept 14 days; the last 10 package-run
 # snapshots. Ansible keeps these values afterwards (roles/btrfs_snapshots: btrfs_root_retention).
 snapper -c root set-config \
-  TIMELINE_CREATE=yes TIMELINE_LIMIT_HOURLY=0 TIMELINE_LIMIT_DAILY=30 \
-  TIMELINE_LIMIT_WEEKLY=0 TIMELINE_LIMIT_MONTHLY=0 TIMELINE_LIMIT_YEARLY=0 NUMBER_LIMIT=20
+  TIMELINE_CREATE=yes TIMELINE_LIMIT_HOURLY=0 TIMELINE_LIMIT_DAILY=14 \
+  TIMELINE_LIMIT_WEEKLY=0 TIMELINE_LIMIT_MONTHLY=0 TIMELINE_LIMIT_YEARLY=0 NUMBER_LIMIT=10
 # snapper-timeline.timer fires HOURLY by default — make it daily (drop-in, idempotent).
 mkdir -p /etc/systemd/system/snapper-timeline.timer.d
 printf '[Timer]\nOnCalendar=\nOnCalendar=daily\n' > /etc/systemd/system/snapper-timeline.timer.d/daily.conf

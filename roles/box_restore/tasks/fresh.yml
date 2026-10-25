@@ -1,0 +1,37 @@
+---
+# FRESH: the app starts empty on a box folder that may still hold its old data — the old
+# folder is RENAMED aside (instant, server-side), never deleted. Without it nextcloud's install
+# stops (roles/nextcloud_storage) and immich would start next to thousands of old originals.
+- name: Fresh — only on a server where the app is not installed yet
+  ansible.builtin.shell: "docker ps -a --format '{{ '{{.Names}}' }}' | grep -xE '{{ _br_fresh | map('regex_replace', '^immich$', 'immich-server') | join('|') }}' || true"
+  register: _bf_existing
+  changed_when: false
+
+- name: Fresh — refuse on an installed app (its database would not match an empty folder)
+  ansible.builtin.assert:
+    that: _bf_existing.stdout_lines | length == 0
+    fail_msg: "Already installed here: {{ _bf_existing.stdout_lines }} — FRESH is for a rebuilt server."
+
+- name: "Fresh — set {{ item.app }}'s old data aside"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    R=(rclone --config '{{ storagebox_config_file }}')
+    src='{{ item.path }}'
+    if [ -z "$("${R[@]}" lsf --max-depth 1 "$src" 2>/dev/null)" ]; then echo "EMPTY $src"; exit 0; fi
+    systemctl stop '{{ storagebox_service_name }}-{{ item.app }}.service'
+    trap "systemctl start '{{ storagebox_service_name }}-{{ item.app }}.service'" EXIT
+    "${R[@]}" moveto "$src" "$src.before-fresh-{{ _br_stamp }}"
+    "${R[@]}" mkdir "$src"
+    echo "MOVED $src -> $src.before-fresh-{{ _br_stamp }}"
+  args: { executable: /bin/bash }
+  loop: >-
+    {{ ([{'app': 'immich', 'path': _br_plain_own ~ '/immich'}] if 'immich' in _br_fresh else [])
+       + ([{'app': 'nextcloud', 'path': _br_plain_own ~ '/nextcloud/data'}] if 'nextcloud' in _br_fresh else []) }}
+  loop_control: { label: "{{ item.app }}" }
+  register: _bf_moved
+  changed_when: "'MOVED' in _bf_moved.stdout"
+
+- name: Fresh — result
+  ansible.builtin.debug:
+    msg: "{{ _bf_moved.results | map(attribute='stdout') | list }}"
+  when: _bf_moved.results is defined

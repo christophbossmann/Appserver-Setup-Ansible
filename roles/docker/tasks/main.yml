@@ -32,6 +32,34 @@
     state: present
     update_cache: yes
 
+# /var/lib/docker + /var/lib/containerd on their own subvolumes (data_domains docker/containerd,
+# no snapshots): the daemons must never start on the empty directory under a failed mount —
+# they would pull everything again into the root volume.
+- name: Drop-in dirs for docker + containerd
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.service.d"
+    state: directory
+    mode: "0755"
+  loop: [docker, containerd]
+  when: docker_storage_mounts | length > 0
+
+- name: Docker + containerd wait for their storage mounts
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item }}.service.d/10-storage-mounts.conf"
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/docker)
+      [Unit]
+      RequiresMountsFor={{ docker_storage_mounts | join(' ') }}
+  loop: [docker, containerd]
+  register: _docker_mount_dropins
+  when: docker_storage_mounts | length > 0
+
+- name: Reload systemd for the mount drop-ins
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _docker_mount_dropins is changed
+
 - name: Enable and start Docker
   ansible.builtin.systemd:
     name: docker

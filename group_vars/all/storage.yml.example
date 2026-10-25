@@ -54,6 +54,13 @@ data_domains:
   # Caches that churn constantly (rclone VFS cache of the Storage Box). Inside @ every root
   # snapshot pinned evicted cache files; a cache needs no snapshots at all.
   - { name: cache, path: "{{ cache_root }}", subdirs: [rclone-storagebox], snapshot: false }
+  # Container images + container state (docker on the containerd image store). Inside @ every
+  # root snapshot pinned the images of all earlier versions (GBs after a day of upgrades) and
+  # the many files inflated the btrfs metadata; images come back from the registry anyway.
+  # An existing directory moves in once (reflink copy, docker + containerd stopped for it —
+  # all containers are down for a few minutes); the old one stays as <path>.before-subvolume.
+  - { name: docker,     path: /var/lib/docker,     subdirs: [], snapshot: false, migrate_stop: [docker.socket, docker.service, containerd.service] }
+  - { name: containerd, path: /var/lib/containerd, subdirs: [], snapshot: false, migrate_stop: [docker.socket, docker.service, containerd.service] }
 
 # Daily snapshots per data domain, kept 14 days (manual + anchor snapshots are exempt).
 data_snapshot_timeline_daily: 14

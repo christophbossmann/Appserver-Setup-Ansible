@@ -64,6 +64,22 @@ dumps() {
     docker exec -i "$ctr" pg_restore -l < "$dir/$name.dump" > /dev/null
     echo "dumped $name ($(du -h "$dir/$name.dump" | cut -f1))"
   done
+{% if storagebox_backup_nextcloud_config | bool %}
+  # Nextcloud's instanceid (names the appdata folder in the data), secret (encrypts stored
+  # credentials) and passwordsalt live in config.php, not in the database — a restore needs
+  # them too (roles/box_restore). Only when Nextcloud runs here.
+  if [ -n "$(docker ps -q --filter name=^nextcloud$)" ]; then
+    python3 - "$dir/nextcloud-config.json" <<'PY'
+import json, os, subprocess, sys
+get = lambda k: subprocess.check_output(['docker', 'exec', '-u', 'www-data', 'nextcloud', 'php', 'occ',
+                                         'config:system:get', k], text=True).strip()
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, 'w') as f:
+    json.dump({k: get(k) for k in ('instanceid', 'secret', 'passwordsalt')}, f)
+PY
+    echo "saved nextcloud config values"
+  fi
+{% endif %}
   "${RCLONE[@]}" copy "$dir" "$REMOTE/db-dumps/$stamp" --transfers 4
   "${RCLONE[@]}" check "$dir" "$REMOTE/db-dumps/$stamp" --one-way 2>&1 | tail -1
   # only now, with the new set safely on the box, drop the oldest ones

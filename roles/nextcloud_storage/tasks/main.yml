@@ -77,6 +77,28 @@
           ansible.builtin.debug:
             msg: "Nextcloud data copied to the box ({{ _ncs_cmp.stdout }}). The local copy is kept as {{ nextcloud_local_data_dir }}.local-before-box-* — delete it once Nextcloud works."
 
+    # A fresh server (no config.php yet) on a box that already holds Nextcloud data: the
+    # installer would stop on "files already exist for this user", and an empty Nextcloud on
+    # top of the old data would be wrong anyway. The restore (roles/box_restore) moves the data
+    # aside before this point and puts it back with its database.
+    - name: Is Nextcloud installed on this server?
+      ansible.builtin.stat:
+        path: "{{ nextcloud_html_dir }}/config/config.php"
+      register: _ncs_cfg
+
+    - name: Refuse a fresh install on top of existing data on the box
+      ansible.builtin.fail:
+        msg: >-
+          The box already holds Nextcloud data ({{ nextcloud_box_mountpoint }}) but Nextcloud is
+          not installed on this server — a rebuild. Decide what happens to it:
+          -e restore_apps=nextcloud:RESTORE (data + database back) or
+          -e restore_apps=nextcloud:FRESH (old data renamed aside), each
+          with -e restore_confirm=YES (README: Rebuild from the Storage Box).
+      when:
+        - "'box=yes' in _ncs_where.stdout"
+        - not _ncs_cfg.stat.exists
+        - not ansible_check_mode
+
     - name: Refuse when neither place has the data (fresh box AND fresh server)
       ansible.builtin.debug:
         msg: >-

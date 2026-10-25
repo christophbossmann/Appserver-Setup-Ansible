@@ -219,6 +219,12 @@ def main():
             str(n): {"exclusive": only_in(frozenset([r])),
                      "referenced": int(sum(c for ids, c in combos.items() if r in ids) * per)}
             for n, r in rid.items()}
+        # "this one and every older one of the volume": how one cleans up in practice (oldest
+        # first), and the way to see where data shared by many snapshots is freed at last
+        older = set()
+        for n in sorted(rid):
+            older.add(rid[n])
+            state["sizes"][cfg][str(n)]["with_older"] = only_in(frozenset(older))
         auto = [s for s in snaps if s["cleanup"] and s["number"] in rid]
         state["sets"][cfg] = {
             "all": only_in(frozenset(rid.values())),

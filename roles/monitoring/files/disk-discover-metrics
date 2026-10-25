@@ -16,11 +16,15 @@
 # started on; the Storage Box and the snapshot volumes are separate mounts).
 # It also says how much of the used space it could NOT attribute:
 #   used - everything measured - what only snapshots still hold
+#        - what the subvolumes kept from earlier volume rollbacks hold (*_rollback_backup_*,
+#          not mounted anywhere — measured through a short read-only mount of the top level)
+#        - btrfs metadata (stored twice with the DUP profile, never visible as files)
 # A large value there means data in a place that is not visible as files (or a bug here).
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 TEXTFILE = os.environ.get("TEXTFILE_DIR", "/var/lib/node_exporter/textfile")
@@ -73,6 +77,44 @@ def big_dirs(mount):
     return total, pieces, top
 
 
+def btrfs_metadata(mount):
+    """Bytes btrfs metadata (+ system chunks) take on the disk: used x copies of the profile."""
+    out = subprocess.run(["btrfs", "filesystem", "usage", "-b", mount], capture_output=True, text=True).stdout
+    total = 0
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith(("Metadata,", "System,")) and "Used:" in line:
+            profile = line.split(",", 1)[1].split(":", 1)[0].strip().upper()
+            copies = 2 if profile in ("DUP", "RAID1") else 3 if profile == "RAID1C3" else 4 if profile == "RAID1C4" else 1
+            total += int(line.split("Used:")[1].split()[0]) * copies
+    return total
+
+
+def rollback_kept(dev):
+    """{name: exclusive bytes} of the subvolumes a volume rollback kept (*_rollback_backup_*).
+    They are mounted nowhere: mount the top level read-only for a moment and ask btrfs."""
+    names = [l.split()[-1] for l in subprocess.run(["btrfs", "subvolume", "list", "/"], capture_output=True,
+                                                   text=True).stdout.splitlines() if "_rollback_backup_" in l]
+    if not names:
+        return {}
+    res, top = {}, tempfile.mkdtemp(prefix="disk-discover-top.", dir="/run")
+    try:
+        if subprocess.run(["mount", "-o", "subvolid=5,ro", dev, top], capture_output=True).returncode != 0:
+            return {}
+        try:
+            out = subprocess.run(["btrfs", "filesystem", "du", "-s", "--raw"] + [os.path.join(top, n) for n in names],
+                                 capture_output=True, text=True).stdout
+            for line in out.splitlines()[1:]:
+                p = line.split()
+                if len(p) >= 4 and p[1].isdigit():
+                    res[os.path.basename(p[-1])] = int(p[1])
+        finally:
+            subprocess.run(["umount", top], capture_output=True)
+    finally:
+        os.rmdir(top)
+    return res
+
+
 def esc(s):
     return str(s).replace("\\", "\\\\").replace('"', '\\"')
 
@@ -96,13 +138,23 @@ def main():
         st = os.statvfs(info["mount"])
         used = (st.f_blocks - st.f_bfree) * st.f_frsize
         snap = held if dev == root_dev else 0       # snapshot-metrics samples the root filesystem
+        is_btrfs = subprocess.run(["findmnt", "-no", "FSTYPE", info["mount"]], capture_output=True,
+                                  text=True).stdout.strip() == "btrfs"
+        kept = rollback_kept(dev) if is_btrfs else {}
+        meta = btrfs_metadata(info["mount"]) if is_btrfs else 0
+        for name, b in sorted(kept.items()):
+            extra.append('disk_discover_rollback_kept_bytes{device="%s",subvolume="%s"} %d' % (esc(dev), esc(name), b))
         extra += ['disk_discover_used_bytes{device="%s"} %d' % (esc(dev), used),
                   'disk_discover_measured_bytes{device="%s"} %d' % (esc(dev), info["measured"]),
                   'disk_discover_snapshots_bytes{device="%s"} %d' % (esc(dev), snap),
-                  'disk_discover_unassigned_bytes{device="%s"} %d' % (esc(dev), used - info["measured"] - snap)]
+                  'disk_discover_rollback_kept_total_bytes{device="%s"} %d' % (esc(dev), sum(kept.values())),
+                  'disk_discover_metadata_bytes{device="%s"} %d' % (esc(dev), meta),
+                  'disk_discover_unassigned_bytes{device="%s"} %d' % (esc(dev), used - info["measured"] - snap - sum(kept.values()) - meta)]
     out = (["# HELP disk_big_dir_bytes Directories at or above the threshold found by the nightly search (a partition: nothing counted twice)",
             "# TYPE disk_big_dir_bytes gauge"] + lines +
-           ["# HELP disk_discover_unassigned_bytes Used space the search could not attribute: used - measured - held only by snapshots",
+           ["# HELP disk_discover_unassigned_bytes Used space the search could not attribute: used - measured - held only by snapshots - kept rollback subvolumes - btrfs metadata",
+            "# HELP disk_discover_rollback_kept_bytes What a subvolume kept by a volume rollback holds exclusively (freed when it is deleted)",
+            "# HELP disk_discover_metadata_bytes btrfs metadata + system chunks on the disk (all copies of the profile)",
             "# TYPE disk_discover_unassigned_bytes gauge"] + extra +
            ["# TYPE disk_discover_threshold_bytes gauge", "disk_discover_threshold_bytes %d" % THRESHOLD,
             "# TYPE disk_discover_duration_seconds gauge", "disk_discover_duration_seconds %d" % (time.time() - start),

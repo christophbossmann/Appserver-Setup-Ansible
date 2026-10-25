@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+# Managed by Ansible (roles/monitoring). "What did the last run of each scheduled job do?" for
+# node_exporter's textfile collector -> "Last run did" column of the "Scheduled jobs" dashboard.
+#
+#   job-summary-metrics <file with the unit regex>   (the regex the node_exporter systemd
+#                                                      collector uses — a file, as it is no
+#                                                      fun to quote for an ExecStart line)
+#
+# Every job prints something different, so there is one short TEXT per job, not columns: the
+# journal of the job's LAST run (its systemd invocation) goes through a rule for that job
+# (RULES below) — e.g. docker-prune -> "3 images deleted · 6.7 GB freed". A job without a rule
+# shows its last line of output. Only jobs with a timer (the scheduled ones). The details stay
+# in the journal: journalctl -u <job>.
+import os
+import re
+import subprocess
+import sys
+
+TEXTFILE = os.environ.get("TEXTFILE_DIR", "/var/lib/node_exporter/textfile")
+MAXLEN = 120
+SYSTEMD_NOISE = re.compile(r"^(Started|Starting|Finished|Stopped|Deactivated|Consumed|.*: Succeeded\.|.*Main process exited)")
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
+def last_run_lines(unit):
+    inv = run(["systemctl", "show", "-p", "InvocationID", "--value", unit + ".service"]).strip()
+    if not inv:
+        return None
+    out = run(["journalctl", "_SYSTEMD_INVOCATION_ID=" + inv, "-o", "cat", "--no-pager"])
+    return [l.rstrip() for l in out.splitlines() if l.strip() and "host key validation" not in l]
+
+
+def count(lines, pattern):
+    return sum(1 for l in lines if re.search(pattern, l))
+
+
+def first(lines, pattern, group=1):
+    for l in lines:
+        m = re.search(pattern, l)
+        if m:
+            return m.group(group)
+    return None
+
+
+def docker_prune(lines):
+    n = count(lines, r"^untagged: ")
+    freed = first(lines, r"^Total reclaimed space: (\S+)")
+    return "nothing to delete" if not n else "%d image(s) deleted · %s freed" % (n, freed or "?")
+
+
+def pitr(lines):
+    ok = re.findall(r"base backup (\S+)/\S+ OK", "\n".join(lines))
+    wal = re.findall(r"WAL: (\d+) segs", "\n".join(lines))
+    return ("base backup OK: %s" % ", ".join(ok) + (" · WAL %s segs" % "/".join(wal) if wal else "")) if ok else None
+
+
+def box_dumps(lines):
+    new = first(lines, r"dump set (\S+) on the box")
+    if new:
+        dumped = re.findall(r"dumped (\S+) \((\S+)\)", "\n".join(lines))
+        return "new set %s (%s)" % (new, ", ".join("%s %s" % d for d in dumped))
+    m = first(lines, r"(newest dump set \S+ is \S+ old)", 1)
+    return ("skipped — " + m) if m else None
+
+
+def box_thumbs(lines):
+    if count(lines, r"There was nothing to transfer"):
+        return "nothing new"
+    files = first(lines, r"Transferred:\s+(\d+) / \d+")
+    deleted = first(lines, r"Deleted:\s+(\d+)")
+    return "%s file(s) copied · %s deleted" % (files or "?", deleted or "0")
+
+
+def fstrim(lines):
+    t = re.findall(r"^(\S+): (\S+ \S+) \(\d+ bytes\) trimmed", "\n".join(lines), re.M)
+    return " · ".join("%s %s trimmed" % (m, s) for m, s in t) if t else None
+
+
+def snapper_timeline(lines):
+    n = count(lines, r"^running timeline for ")
+    return "daily snapshot of %d volume(s)" % n if n else None
+
+
+def snapper_cleanup(lines):
+    n = len(set(re.findall(r"cleanup for '([^']+)'", "\n".join(lines))))
+    return "retention applied to %d volume(s)" % n if n else None
+
+
+def apt_upgrade(_lines):
+    """unattended-upgrades logs to its own file, not the journal: its last run there."""
+    try:
+        with open("/var/log/unattended-upgrades/unattended-upgrades.log") as f:
+            tail = f.readlines()[-200:]
+    except OSError:
+        return None
+    starts = [i for i, l in enumerate(tail) if "Starting unattended upgrades script" in l]
+    # newest run first; a run cut short (e.g. stopped by an Ansible play) has no result line
+    for a, b in reversed(list(zip(starts, starts[1:] + [len(tail)]))):
+        run_ = "".join(tail[a:b])
+        when = tail[a][:16]
+        m = re.search(r"Packages that will be upgraded: (.+)", run_)
+        if m:
+            pk = m.group(1).split()
+            return "%s: %d package(s) upgraded: %s" % (when, len(pk), " ".join(pk[:6]) + (" …" if len(pk) > 6 else ""))
+        if "No packages found that can be upgraded" in run_:
+            return "%s: no updates" % when
+    return None
+
+
+def trivy(_lines):
+    """trivy-metrics prints nothing — its result is in its metrics file."""
+    try:
+        with open(os.path.join(TEXTFILE, "trivy.prom")) as f:
+            text = f.read()
+    except OSError:
+        return None
+    scanned = len(re.findall(r"^trivy_image_scan_success\{[^}]*\} 1$", text, re.M))
+    sev = {}
+    for s, v in re.findall(r'^trivy_image_vulnerabilities\{[^}]*severity="(\w+)"[^}]*\} (\d+)', text, re.M):
+        sev[s] = sev.get(s, 0) + int(v)
+    updates = len(re.findall(r"^trivy_image_update_available\{[^}]*\} 1$", text, re.M))
+    return "%d image(s) scanned · %d critical · %d high · %d update(s) available" % (
+        scanned, sev.get("CRITICAL", 0), sev.get("HIGH", 0), updates)
+
+
+RULES = {
+    "docker-prune": docker_prune,
+    "pg-pitr-backup": pitr,
+    "storagebox-backup-dumps": box_dumps,
+    "storagebox-backup-thumbs": box_thumbs,
+    "fstrim": fstrim,
+    "snapper-timeline": snapper_timeline,
+    "snapper-cleanup": snapper_cleanup,
+    "apt-daily-upgrade": apt_upgrade,
+    "trivy-metrics": trivy,
+}
+
+
+def summary(unit, lines):
+    text = None
+    if unit in RULES:
+        try:
+            text = RULES[unit](lines)
+        except Exception as e:          # a rule must never break the whole collector
+            text = "rule error: %s" % e
+    if not text:
+        useful = [l for l in lines if not SYSTEMD_NOISE.match(l)]
+        text = useful[-1] if useful else "ran (no output)"
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= MAXLEN else text[:MAXLEN - 1] + "…"
+
+
+def esc(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ".*"
+    if os.path.isfile(arg):
+        with open(arg) as f:
+            arg = f.read().strip()
+    want = re.compile(arg)
+    timers = [l.split()[0] for l in run(["systemctl", "list-unit-files", "--type=timer", "--no-legend", "--plain"]).splitlines() if l.strip()]
+    units = sorted({t[:-len(".timer")] for t in timers if t.endswith(".timer") and want.fullmatch(t)})
+    out = ["# HELP job_last_summary What the last run of a scheduled job did (text in the summary label)",
+           "# TYPE job_last_summary gauge"]
+    for u in units:
+        lines = last_run_lines(u)
+        if lines is None:
+            continue
+        out.append('job_last_summary{unit="%s",summary="%s"} 1' % (esc(u), esc(summary(u, lines))))
+    if os.path.isdir(TEXTFILE):
+        tmp = os.path.join(TEXTFILE, "job-summary.prom.tmp")
+        with open(tmp, "w") as f:
+            f.write("\n".join(out) + "\n")
+        os.replace(tmp, os.path.join(TEXTFILE, "job-summary.prom"))
+    else:
+        print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()

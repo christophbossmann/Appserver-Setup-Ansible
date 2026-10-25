@@ -1,0 +1,53 @@
+---
+# The authentik database from the dump set. Runs right after the authentik stack and BEFORE
+# authentik_bootstrap: the worker re-applies this host's blueprints on start (providers,
+# redirect URIs, brand) and authentik_bootstrap its passwords + outpost token — also a copy of
+# another host's database ends up with this host's URLs. Users, groups, MFA devices and the
+# users' OIDC subjects come from the dump (immich/nextcloud logins keep their links).
+- name: Authentik database from the box
+  when: "'authentik' in _br_restore"
+  vars:
+    _ak: [authentik-server, authentik-worker, authentik-ldap]
+  block:
+    - name: Authentik — which of its app containers exist
+      ansible.builtin.shell: "docker ps -a --format '{{ '{{.Names}}' }}' | grep -xE '{{ _ak | join('|') }}' || true"
+      register: _br_ak_ctrs
+      changed_when: false
+
+    - name: Authentik — stop server, worker, outpost (release the database)
+      ansible.builtin.command:
+        argv: "{{ ['docker', 'stop'] + _br_ak_ctrs.stdout_lines }}"
+      changed_when: true
+      when: _br_ak_ctrs.stdout_lines | length > 0
+
+    - name: Authentik — restore the database
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/pg_restore_dump.yml"
+      vars:
+        prd_container: authentik-postgres
+        prd_user: authentik
+        prd_db: authentik
+        prd_dump: "{{ box_restore_work_dir }}/{{ _br_set }}/authentik.dump"
+
+  always:
+    - name: Authentik — start server, worker, outpost again
+      ansible.builtin.command:
+        argv: "{{ ['docker', 'start'] + _br_ak_ctrs.stdout_lines }}"
+      changed_when: true
+      when: (_br_ak_ctrs.stdout_lines | default([])) | length > 0
+
+- name: Authentik — ready again (migrations of the restored database done)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ authentik_http_port }}/-/health/ready/"
+    status_code: [200, 204]
+  register: _br_ak_ready
+  until: _br_ak_ready is not failed
+  retries: 60
+  delay: 5
+  when: "'authentik' in _br_restore"
+
+- name: Authentik — restored once on this host
+  ansible.builtin.copy:
+    dest: "{{ box_restore_state_dir }}/authentik.done"
+    content: "{{ {'set': _br_set, 'time': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')} | to_nice_json }}\n"
+    mode: "0644"
+  when: "'authentik' in _br_restore"

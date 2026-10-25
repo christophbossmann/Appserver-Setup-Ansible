@@ -1,0 +1,43 @@
+---
+# Restore ONE database from a pg_dump custom-format file on the host (DESTRUCTIVE: --clean).
+# Shared by the local restores (immich-/nextcloud-restore-local.yml) and the restore from the
+# Storage Box (roles/box_restore). The caller stops the apps that use the database first.
+# Expects: prd_container, prd_user (superuser of the instance), prd_db, prd_dump (host path).
+#
+# NO --no-owner: the dump records the app role as owner; restoring as the superuser re-applies
+# it, so the least-privilege app role keeps access (--no-owner would leave everything owned by
+# the superuser -> "permission denied" in the app). Extensions in the dump (e.g. vchord for
+# immich) are recreated as superuser.
+- name: "Restore the {{ prd_db }} database (pg_restore --clean, DESTRUCTIVE)"
+  ansible.builtin.shell: >-
+    docker exec -i {{ prd_container }} pg_restore -U {{ prd_user }}
+    -d {{ prd_db }} --clean --if-exists < {{ prd_dump }}
+  args: { executable: /bin/bash }
+  register: _prd_restore
+  changed_when: true
+  failed_when: false   # --clean emits benign "does not exist" notices; inspect the output
+
+- name: "pg_restore messages ({{ prd_db }})"
+  ansible.builtin.debug:
+    msg: "{{ (_prd_restore.stderr_lines | default([]))[-15:] }}"
+  when: (_prd_restore.stderr_lines | default([])) | length > 0
+
+# Belt-and-suspenders: reassign anything in public not owned by the DB owner (datdba) back to
+# it — e.g. an old --no-owner dump. Idempotent (touches only mismatches).
+- name: "Every restored object in {{ prd_db }} is owned by its DB role"
+  ansible.builtin.shell: |
+    docker exec -i {{ prd_container }} psql -U {{ prd_user }} -d {{ prd_db }} -v ON_ERROR_STOP=1 <<'SQL'
+    DO $$
+    DECLARE r record; dbowner text;
+    BEGIN
+      SELECT datdba::regrole::text INTO dbowner FROM pg_database WHERE datname = current_database();
+      FOR r IN SELECT tablename AS n FROM pg_tables WHERE schemaname='public' AND tableowner <> dbowner LOOP
+        EXECUTE format('ALTER TABLE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+      FOR r IN SELECT sequencename AS n FROM pg_sequences WHERE schemaname='public' AND sequenceowner <> dbowner LOOP
+        EXECUTE format('ALTER SEQUENCE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+      FOR r IN SELECT viewname AS n FROM pg_views WHERE schemaname='public' AND viewowner <> dbowner LOOP
+        EXECUTE format('ALTER VIEW public.%I OWNER TO %I', r.n, dbowner); END LOOP;
+    END $$;
+    SQL
+  args: { executable: /bin/bash }
+  changed_when: true

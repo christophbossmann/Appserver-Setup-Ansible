@@ -104,19 +104,13 @@
           become: false
           when: nc_restore_db | bool
 
-        - name: Restore the database (pg_restore --clean, DESTRUCTIVE)
-          # NO --no-owner: the dump (made by the superuser) records owner=nextcloud;
-          # restoring as the superuser re-applies that ownership so the least-privilege
-          # `nextcloud` app role keeps access. --no-owner would leave every object owned
-          # by the restoring superuser -> the app gets "permission denied".
-          ansible.builtin.shell: >-
-            cat {{ _remote_dump }} |
-            docker exec -i {{ nextcloud_db_host | default('postgres') }}
-            pg_restore -U {{ nextcloud_db_admin_user | default(postgres_user) }}
-            -d {{ nextcloud_db_name }} --clean --if-exists
-          args: { executable: /bin/bash }
-          register: _pg_restore
-          failed_when: false   # --clean emits benign "does not exist" notices; inspect output
+        - name: Restore the database + owner fix (shared with the restore from the Storage Box)
+          ansible.builtin.include_tasks: tasks/pg_restore_dump.yml
+          vars:
+            prd_container: "{{ nextcloud_db_host | default('postgres') }}"
+            prd_user: "{{ nextcloud_db_admin_user | default(postgres_user) }}"
+            prd_db: "{{ nextcloud_db_name }}"
+            prd_dump: "{{ _remote_dump }}"
           when: nc_restore_db | bool
 
         # NOTE — no OIDC re-link step needed here (unlike immich-restore-local.yml):
@@ -124,29 +118,6 @@
         # SSO login re-attaches to the NC account by USERNAME, not by the Authentik
         # `sub`. A rebuilt/declarative Authentik keeps the same usernames -> the links
         # survive without restoring the Authentik DB and without clearing anything.
-
-        - name: Ensure every restored object is owned by the Nextcloud DB role
-          # Belt-and-suspenders: if any object ends up owned by the restoring
-          # superuser (e.g. an old --no-owner dump), the least-privilege `nextcloud`
-          # app role gets "permission denied". Reassign anything in public not owned
-          # by the DB owner back to it. Idempotent (touches only mismatches).
-          ansible.builtin.shell: |
-            docker exec -i {{ nextcloud_db_host | default('postgres') }} psql -U {{ nextcloud_db_admin_user | default(postgres_user) }} -d {{ nextcloud_db_name }} <<'SQL'
-            DO $$
-            DECLARE r record; dbowner text;
-            BEGIN
-              SELECT datdba::regrole::text INTO dbowner FROM pg_database WHERE datname = current_database();
-              FOR r IN SELECT tablename AS n FROM pg_tables WHERE schemaname='public' AND tableowner <> dbowner LOOP
-                EXECUTE format('ALTER TABLE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
-              FOR r IN SELECT sequencename AS n FROM pg_sequences WHERE schemaname='public' AND sequenceowner <> dbowner LOOP
-                EXECUTE format('ALTER SEQUENCE public.%I OWNER TO %I', r.n, dbowner); END LOOP;
-              FOR r IN SELECT viewname AS n FROM pg_views WHERE schemaname='public' AND viewowner <> dbowner LOOP
-                EXECUTE format('ALTER VIEW public.%I OWNER TO %I', r.n, dbowner); END LOOP;
-            END $$;
-            SQL
-          args: { executable: /bin/bash }
-          changed_when: true
-          when: nc_restore_db | bool
 
         - name: Fix ownership of restored files (www-data uid 33)
           ansible.builtin.command:

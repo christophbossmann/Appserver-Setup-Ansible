@@ -130,7 +130,8 @@
       ansible.builtin.shell: |
         set -eu
         conf='{{ storagebox_config_file }}'
-        get() { awk -v s="[{{ item.name }}]" -v k="$1" '$0==s {f=1; next} /^\[/ {f=0} f && $1==k {print $3}' "$conf" 2>/dev/null; }
+        # no config yet (a fresh server): nothing to reuse — not an error under set -e
+        get() { [ -f "$conf" ] || return 0; awk -v s="[{{ item.name }}]" -v k="$1" '$0==s {f=1; next} /^\[/ {f=0} f && $1==k {print $3}' "$conf"; }
         for k in password password2; do
           want=$( [ "$k" = password ] && printf '%s' "$P1" || printf '%s' "$P2" )
           have=$(get "$k")

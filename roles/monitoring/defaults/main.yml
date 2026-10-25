@@ -87,6 +87,10 @@ monitoring_pitr_metrics_oncalendar: "*-*-* *:05:00"
 #   /var/run/reboot-required) — the "Reboot pending" / "Security updates pending" hints. Hourly.
 monitoring_updates_metrics_enabled: true
 monitoring_updates_metrics_oncalendar: "hourly"
+# job-summary-metrics : "what did the last run do" per scheduled job (journal of its last run,
+#   one rule per job, else its last line) -> "Last run did" column of the Scheduled jobs dashboard
+monitoring_job_summary_enabled: true
+monitoring_job_summary_oncalendar: "*-*-* *:0/5:20"
 
 #   snapshot-metrics : btrfs/snapper snapshots of every config — when taken, retention, and
 #   how much space deleting them would free: per single snapshot and per SET (all of a

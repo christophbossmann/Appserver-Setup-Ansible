@@ -37,6 +37,10 @@ storagebox_backup_dump_keep: 4
 # The timer fires daily; the script itself decides whether the newest set is old enough.
 storagebox_backup_dumps_oncalendar: "*-*-* 03:50:00"
 storagebox_backup_dump_workdir: "{{ backup_dump_dir | default('/opt/backups') }}/storagebox-dumps"
+# With each set: nextcloud-config.json (instanceid, secret, passwordsalt from config.php) —
+# what a restore of Nextcloud needs besides its database. Holds secrets: only onto an
+# encrypted target (storagebox_backup_remote = an rclone crypt remote).
+storagebox_backup_nextcloud_config: "{{ storagebox_backup_remote | default('') | length > 0 }}"
 # name = file name on the box; container/user/db = where pg_dump runs.
 storagebox_backup_databases:
   - { name: authentik, container: authentik-postgres, user: authentik, db: authentik }

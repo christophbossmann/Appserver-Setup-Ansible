@@ -241,6 +241,7 @@ Dedicated roles:
 | `postgres_pitr` | WAL archiving + daily base backups (point-in-time recovery) per postgres instance |
 | `storagebox` | Hetzner Storage Box mounted via rclone (large immich originals live there) |
 | `storagebox_backup` | Copies that survive the server: immich thumbnails mirrored nightly, `pg_dump` sets every 4 days, onto the Storage Box |
+| `box_restore` | Opt-in in a `server-all` run: immich / nextcloud / authentik state from the Storage Box (see *Rebuild from the Storage Box*) |
 | `backup_restic` | Nightly cloud backup (restic over rclone) |
 | `cockpit` | Cockpit web console (apt/systemd) |
 | `claude_playground` | Sandboxed Claude Code runtime: rootless Docker, root broker (`playgroundctl`), public demo route, WebDAV for workspace + memory files |
@@ -306,6 +307,49 @@ puts both in one place: what fires now, when each rule last fired, every rule's 
 evaluation, and every healthchecks.io check with its last ping and when the next is due.
 It reads Grafana's API as a Viewer service account and healthchecks.io with a read-only key
 (`vault_healthchecks_readonly_key`) — never with credentials that can change anything.
+
+---
+
+## Rebuild from the Storage Box
+
+A rebuilt server decides **per app** what happens to its old state in its own Storage Box
+folder (`storagebox_root_path`), in the same `server-all.yml` run that installs it
+(`roles/box_restore`):
+
+```bash
+ansible-playbook playbooks/server-all.yml --limit <host> \
+  -e restore_apps=immich:RESTORE,nextcloud:RESTORE,authentik:RESTORE \
+  -e restore_confirm=YES --ask-vault-pass 2>&1 | tee ~/run.log
+```
+
+| App | `FRESH` | `RESTORE` |
+|---|---|---|
+| immich | old folder renamed aside, starts empty | originals used where they are; database + thumbnails from the dump set; photos newer than the dump imported again |
+| nextcloud | old data folder renamed aside, installs empty | database + data (set aside for the installer, which needs an empty folder, and put back), instanceid / secret / passwordsalt, file scan |
+| authentik | installs new (blueprints) | database; blueprints + `authentik_bootstrap` re-apply the host's URLs, providers, passwords |
+
+- An app not listed is left alone; write the list without spaces (`-e` splits on them).
+- **Nothing on the box is deleted or overwritten** — old folders are renamed aside
+  (`<folder>.before-fresh-<stamp>`) or used in place. In every rebuild `backup/db-dumps` goes
+  aside too (`.before-rebuild-<stamp>`, after the restore read from it), so the new server's
+  dump rotation cannot push out the last good sets; the thumbnail mirror stays in use after
+  `immich:RESTORE` (it matches the restored database), else it goes aside as well. Remove the
+  `*.before-*` folders by hand once everything checks out.
+- The dumps come from the newest set of `roles/storagebox_backup` (every 4 days; a fresh one:
+  `storagebox-backup dumps --force`), or `-e restore_dump_set=<YYYYmmdd-HHMMSS>`.
+- Needs the encrypted box layout (`immich_storage_encrypted`, `nextcloud_data_external` +
+  `nextcloud_storage_encrypted`). Each app is restored once per host
+  (`/var/lib/box-restore/<app>.done`; again only with `-e restore_force=true`). Skipped in check
+  mode. Without the switch, a rebuilt server stops before the Nextcloud install when the box
+  already holds Nextcloud data. Encoded videos are not on the box — immich rebuilds them
+  (Job Queues → Transcode Videos → Missing).
+- **Testing it with another host's state** (e.g. PROD's on DEV): copy that host's folder into
+  this host's folder on the box first — encrypted bytes, one key pair for the whole box —
+  then restore as usual, the same path as a real disaster recovery:
+  ```bash
+  rclone --config /root/.config/rclone/storagebox.conf copy storagebox:prod storagebox:dev \
+    --create-empty-src-dirs --transfers 8 --checkers 16
+  ```
 
 ---
 
