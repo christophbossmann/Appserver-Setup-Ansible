@@ -108,6 +108,18 @@
           delay: 5
           changed_when: false
 
+        # The container healthcheck runs INSIDE the container — it stayed green on 2026-10-24
+        # while the published port refused every connection (Caddy: 502). Check the way the
+        # reverse proxy reaches immich.
+        - name: Verify immich answers on its published port (the way Caddy reaches it)
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ immich_port }}/api/server/ping"
+            status_code: 200
+          register: _iping
+          until: _iping.status == 200
+          retries: 12
+          delay: 5
+
         - name: Verify the running image is the new version
           ansible.builtin.command: "docker inspect immich-server -f {{ '{{.Config.Image}}' }}"
           register: _iimg

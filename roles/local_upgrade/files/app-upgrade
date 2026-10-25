@@ -376,6 +376,8 @@ def cmd_run(instance):
         return 0 if rc == 0 else 1
     if rc == 0 and svc.get("kind") != "host":   # rescan now: the new image's findings + update targets replace the stale ones
         subprocess.run(["systemctl", "start", "--no-block", "trivy-metrics.service"], capture_output=True)
+    if rc == 0:   # earlier failed attempts of this service are settled now — else "Scheduled job failed" keeps firing
+        subprocess.run(["systemctl", "reset-failed", "app-upgrade@%s:*" % name], capture_output=True)
     print("=== %s: %s ===" % (name, "upgraded to " + version if rc == 0 else
                              "FAILED (rc=%d) — the playbook rolled back if it got that far, see above" % rc), flush=True)
     return 0 if rc == 0 else 1

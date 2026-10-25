@@ -24,6 +24,12 @@
 #     the upgrade where the service has file-based state.
 # The images of the previous versions are pulled FIRST: if one cannot be had (registry
 # down, Docker Hub limit), nothing is changed.
+#
+# A rollback that stopped AFTER the data went back (e.g. a failing step at the end) is
+# finished with -e rollback_finish_only=true: it skips the destructive part (stop, PITR,
+# snapshots, previous images) and only checks the result and does the bookkeeping (versions
+# into the config + on the host, the record used up). Never re-run a full rollback for that —
+# it would take the database back to the anchor once more.
 # Controller preflight: fail fast if the SSH key needs a passphrase but isn't in an agent.
 - import_playbook: preflight-ssh-agent.yml
   when: not (upgrade_local_run | default(false) | bool)
@@ -37,6 +43,8 @@
     upgrade_keep_old: false
     upgrade_health_retries: 60
     upgrade_settle_seconds: 20
+    rollback_finish_only: false
+    _rb_do: "{{ not (rollback_finish_only | bool) }}"
     _biz: postgres-business
     _occ: ["docker", "exec", "-u", "www-data", "nextcloud", "php", "occ"]
     _rbdir: /var/lib/app-upgrade/rollback
@@ -106,6 +114,7 @@
 
     # ---- 1. the previous images must be available BEFORE anything changes --------------------
     - name: Pull the images of the previous versions
+      when: _rb_do | bool
       ansible.builtin.shell: |
         set -e
         {% for r in _joint %}
@@ -120,7 +129,7 @@
 
     # ---- 2a. immich / nextcloud / postgres_business: the shared instance as a whole ----------
     - name: Shared database instance
-      when: _kind == 'business'
+      when: _kind == 'business' and (_rb_do | bool)
       vars:
         _set: "{{ _joint | map(attribute='service') | list }}"
       block:
@@ -157,19 +166,26 @@
             vsr_config: "{{ _vs.key }}"
             vsr_number: "{{ _vs.value }}"
 
+        # Resolved ONCE into own names: a task var that falls back to itself
+        # (immich_version: "{{ ... else immich_version }}") is a recursive template.
+        - name: The app versions to deploy (the one from before where it goes back, else the current one)
+          ansible.builtin.set_fact:
+            _rb_immich_version: "{{ (_joint | selectattr('service', 'equalto', 'immich') | first).from if 'immich' in _set else immich_version }}"
+            _rb_nextcloud_version: "{{ (_joint | selectattr('service', 'equalto', 'nextcloud') | first).from if 'nextcloud' in _set else nextcloud_version }}"
+
         - name: Immich in the version from before (if it goes back) — else as it is
           ansible.builtin.include_role:
             name: compose_stack
           vars:
             stack: immich
-            immich_version: "{{ (_joint | selectattr('service', 'equalto', 'immich') | first).from if 'immich' in _set else immich_version }}"
+            immich_version: "{{ _rb_immich_version }}"
 
         - name: Nextcloud in the version from before (if it goes back) — else as it is
           ansible.builtin.include_role:
             name: compose_stack
           vars:
             stack: nextcloud
-            nextcloud_version: "{{ (_joint | selectattr('service', 'equalto', 'nextcloud') | first).from if 'nextcloud' in _set else nextcloud_version }}"
+            nextcloud_version: "{{ _rb_nextcloud_version }}"
 
         - name: Wait until nextcloud answers (installed, not upgrading)
           ansible.builtin.command:
@@ -185,6 +201,16 @@
             argv: "{{ _occ + ['maintenance:mode', '--off'] }}"
           changed_when: true
 
+        - name: Verify nextcloud serves HTTP on its published port (status.php)
+          ansible.builtin.command:
+            argv: [curl, -sf, -H, "Host: {{ nextcloud_hostname }}",
+                   "http://127.0.0.1:{{ nextcloud_port }}/status.php"]
+          register: _nchttp
+          changed_when: false
+          until: _nchttp.rc == 0 and ('"installed":true' in (_nchttp.stdout | regex_replace('\\s', '')))
+          retries: 24
+          delay: 5
+
         - name: Nextcloud file index matches the files (volume and database are from the same moment)
           ansible.builtin.command:
             argv: "{{ _occ + ['files:scan', '--all'] }}"
@@ -199,6 +225,16 @@
           delay: 5
           changed_when: false
 
+        # the way Caddy reaches it (the container healthcheck runs inside — see immich-upgrade.yml)
+        - name: Verify immich answers on its published port
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ immich_port }}/api/server/ping"
+            status_code: 200
+          register: _iping
+          until: _iping.status == 200
+          retries: 12
+          delay: 5
+
         - name: Lift immich maintenance mode (the restored database may still have it set)
           ansible.builtin.command: docker exec immich-server immich-admin disable-maintenance-mode
           changed_when: true
@@ -212,22 +248,24 @@
             immich_reimport_confirm: "YES"
             immich_reimport_min_age_min: 0
 
-        - name: Immich files and database must match now
-          ansible.builtin.shell: |
-            set -e
-            systemctl start immich-storage-metrics.service
-            p=/var/lib/node_exporter/textfile/immich-storage.prom
-            grep -q '^immich_storage_scan_success 1' $p
-            awk '/^immich_storage_(orphan|missing)_files\{dir="(library|upload)"\}/ { s += $NF } END { print s + 0 }' $p
-          args:
-            executable: /bin/bash
-          register: _ri_check
-          changed_when: false
-          failed_when: _ri_check.rc != 0 or (_ri_check.stdout_lines[-1] | int) > 0
+    # Outside the block: also the check of rollback_finish_only.
+    - name: Immich files and database must match now
+      when: _kind == 'business'
+      ansible.builtin.shell: |
+        set -e
+        systemctl start immich-storage-metrics.service
+        p=/var/lib/node_exporter/textfile/immich-storage.prom
+        grep -q '^immich_storage_scan_success 1' $p
+        awk '/^immich_storage_(orphan|missing)_files\{dir="(library|upload)"\}/ { s += $NF } END { print s + 0 }' $p
+      args:
+        executable: /bin/bash
+      register: _ri_check
+      changed_when: false
+      failed_when: _ri_check.rc != 0 or (_ri_check.stdout_lines[-1] | int) > 0
 
     # ---- 2b. authentik: its own instance --------------------------------------------------------
     - name: Authentik
-      when: _kind == 'authentik'
+      when: _kind == 'authentik' and (_rb_do | bool)
       ansible.builtin.include_tasks: tasks/authentik_rollback.yml
       vars:
         _akpg: authentik-postgres
@@ -238,7 +276,7 @@
 
     # ---- 2c. everything else: previous image (+ state copy) ---------------------------------------
     - name: Previous image (+ state copy)
-      when: _kind == 'stack'
+      when: _kind == 'stack' and (_rb_do | bool)
       ansible.builtin.include_tasks: tasks/stack_upgrade_rollback.yml
       vars:
         _svc: "{{ _cat.upgrade_catalog[_rb.service] | combine({'state_paths': _rb.state_paths}) }}"

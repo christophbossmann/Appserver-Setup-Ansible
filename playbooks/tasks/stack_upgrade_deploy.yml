@@ -56,7 +56,8 @@
     executable: /bin/bash
   register: _svc_verify
   until: _svc_verify.rc == 0
-  retries: 6
+  # 2 min: a scrape-based check waits for the next scrape (blackbox every 60 s)
+  retries: 24
   delay: 5
   changed_when: false
   loop: "{{ _svc.verify | default([]) }}"

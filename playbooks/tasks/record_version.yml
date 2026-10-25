@@ -39,3 +39,24 @@
           'previous': (_old.previous if _chained else rec_previous),
           'source': ('host' if (upgrade_local_run | default(false) | bool) else 'controller'),
           'time': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')} | to_nice_json }}
+
+# A run from the CONTROLLER wrote the version into the private config, but the on-host
+# upgrade page reads its own copy of it (roles/local_upgrade, synced only by a
+# --tags local_upgrade run). Without this the page would still see the old value — e.g.
+# after a rollback from the laptop it refused the next upgrade as "already installed".
+- name: The on-host upgrade config copy
+  when: not (upgrade_local_run | default(false) | bool)
+  vars:
+    _lu_copy: "{{ local_upgrade_dir | default('/opt/ansible-local') }}/config/group_vars/all/{{ rec_file }}"
+  block:
+    - name: Is there an on-host config copy?
+      ansible.builtin.stat:
+        path: "{{ _lu_copy }}"
+      register: _lu_copy_st
+
+    - name: "Keep it in step: {{ rec_var }} = {{ rec_value }}"
+      ansible.builtin.lineinfile:
+        path: "{{ _lu_copy }}"
+        regexp: '^{{ rec_var }}:'
+        line: '{{ rec_var }}: "{{ rec_value }}"'
+      when: _lu_copy_st.stat.exists

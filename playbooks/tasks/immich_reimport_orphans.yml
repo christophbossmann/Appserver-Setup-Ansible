@@ -75,6 +75,58 @@
       changed_when: false
       check_mode: false
 
+    # An orphan can be the very file a DB row misses, only at another path (e.g. moved by the
+    # storage template after the DB moment). Uploading it would be a "duplicate" (same
+    # checksum) and the CLI's --delete-duplicates would remove the ONLY copy. So: an orphan
+    # whose SHA1 equals the checksum of a missing file goes back to that path instead.
+    - name: Put back orphans that are a missing file at another path (same checksum)
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import hashlib, json, os, subprocess
+        root, tmp = {{ _ri_root | to_json }}, {{ _ri_tmp.path | to_json }}
+        confirm = {{ (_ri_confirm | bool) | ternary('True', 'False') }}
+        def lines(p): return open(p).read().splitlines() if os.path.exists(p) else []
+        missing = [f for d in ('library', 'upload') for f in lines(os.path.join(tmp, 'missing-%s.txt' % d))]
+        out = []
+        if missing:
+            q = ("SELECT \"originalPath\", encode(checksum, 'hex') FROM asset WHERE \"originalPath\" = ANY(ARRAY[%s])"
+                 % ','.join("'" + ('/data' + f[len(root):]).replace("'", "''") + "'" for f in missing))
+            rows = subprocess.run(['docker', 'exec', {{ _ri_db | to_json }}, 'psql', '-U', {{ _ri_dbuser | to_json }},
+                                   '-d', {{ immich_db_name | to_json }}, '-XAt', '-c', q],
+                                  capture_output=True, text=True, check=True).stdout.splitlines()
+            want = {}
+            for r in rows:
+                p, _, h = r.partition('|')
+                want.setdefault(h, root + p[len('/data'):])
+            for d in ('library', 'upload'):
+                p = os.path.join(tmp, 'orphans-%s.txt' % d)
+                keep = []
+                for f in lines(p):
+                    h = hashlib.sha1(open(f, 'rb').read()).hexdigest()
+                    dst = want.pop(h, None)
+                    if dst and not os.path.exists(dst):
+                        if confirm:
+                            os.makedirs(os.path.dirname(dst), exist_ok=True)
+                            os.rename(f, dst)
+                        out.append([f, dst])
+                    else:
+                        keep.append(f)
+                if confirm:
+                    open(p, 'w').write(''.join(k + '\n' for k in keep))
+        print(json.dumps(out))
+        PY
+      args: { executable: /bin/bash }
+      register: _ri_putback
+      changed_when: (_ri_confirm | bool) and (_ri_putback.stdout | from_json | length) > 0
+      check_mode: false
+
+    - name: Orphans that are a missing file
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Put back' if (_ri_confirm | bool) else 'Would put back (dry run)' }}:
+          {{ _ri_putback.stdout | from_json | map('join', ' -> ') | list }}
+      when: (_ri_putback.stdout | from_json | length) > 0
+
     - name: Read the Immich users (id + storage label)
       ansible.builtin.command:
         argv: [docker, exec, "{{ _ri_db }}", psql, -U, "{{ _ri_dbuser }}", -d, "{{ immich_db_name }}", -XAt,

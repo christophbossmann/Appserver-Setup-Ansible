@@ -226,6 +226,26 @@
           changed_when: false
           failed_when: _imchk.rc != 0 or ('assets ' ~ (_assets_before.stdout | trim)) not in _imchk.stdout_lines
 
+        # the way Caddy reaches it (the container healthcheck runs inside — see immich-upgrade.yml)
+        - name: Verify immich answers on its published port
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ immich_port }}/api/server/ping"
+            status_code: 200
+          register: _iping
+          until: _iping.status == 200
+          retries: 12
+          delay: 5
+
+        - name: Verify nextcloud serves HTTP on its published port (status.php)
+          ansible.builtin.command:
+            argv: [curl, -sf, -H, "Host: {{ nextcloud_hostname }}",
+                   "http://127.0.0.1:{{ nextcloud_port }}/status.php"]
+          register: _nchttp
+          changed_when: false
+          until: _nchttp.rc == 0 and ('"installed":true' in (_nchttp.stdout | regex_replace('\\s', '')))
+          retries: 24
+          delay: 5
+
         - name: Verify nextcloud reads its database
           ansible.builtin.command:
             argv: "{{ _occ + ['user:list'] }}"

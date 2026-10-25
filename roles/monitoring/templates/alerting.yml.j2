@@ -157,7 +157,9 @@ contactPoints:
         type: webhook
         disableResolveMessage: true
         settings:
-          url: "{{ healthchecks_ping_url | default('https://hc-ping.com') }}/{{ healthchecks_ping_key }}/{{ healthchecks_prefix }}-grafana-watchdog"
+          # fallbacks = roles/healthchecks defaults (not loaded when monitoring runs alone,
+          # e.g. an on-host ntfy/grafana upgrade)
+          url: "{{ healthchecks_ping_url | default('https://hc-ping.com') }}/{{ healthchecks_ping_key | default(vault_healthchecks_ping_key | default('')) }}/{{ healthchecks_prefix | default(inventory_hostname | lower) }}-grafana-watchdog"
           httpMethod: POST
           # nothing but "alive" in the ping body
           message: "alive"

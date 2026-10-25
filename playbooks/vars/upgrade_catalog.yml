@@ -88,6 +88,8 @@ upgrade_catalog:
     file: monitoring.yml
     role: monitoring
     containers: [grafana]
+    verify:
+      - "curl -sf -m 5 -o /dev/null http://127.0.0.1:{{ grafana_port | default(3000) }}/api/health"
     state_paths: ["{{ grafana_data_dir | default('/opt/monitoring/grafana-data') }}"]   # sqlite db (dashboards, users), migrated by new versions
   prometheus:
     playbook: stack-upgrade.yml
@@ -96,6 +98,8 @@ upgrade_catalog:
     file: monitoring.yml
     role: monitoring
     containers: [prometheus]
+    verify:
+      - "curl -sf -m 5 -o /dev/null http://127.0.0.1:{{ prometheus_port | default(9090) }}/-/ready"
   node_exporter:
     playbook: stack-upgrade.yml
     images: [prom/node-exporter]
@@ -103,6 +107,14 @@ upgrade_catalog:
     file: monitoring.yml
     role: monitoring
     containers: [node-exporter]
+    verify:
+      # not published: Prometheus scrapes it on the container network — every target of the
+      # job must be "up" with a scrape AFTER the container (re)started (an old sample does not count)
+      - >-
+        python3 -c "import json,subprocess,urllib.request;
+        st=json.loads(subprocess.check_output(['docker','inspect','node-exporter']))[0]['State']['StartedAt'][:19];
+        t=[x for x in json.load(urllib.request.urlopen('http://127.0.0.1:{{ prometheus_port | default(9090) }}/api/v1/targets?state=active'))['data']['activeTargets'] if x['labels']['job']=='node-exporter'];
+        raise SystemExit(0 if t and all(x['health']=='up' and x['lastScrape'][:19]>st for x in t) else 1)"
   ntfy:
     playbook: stack-upgrade.yml
     images: [binwiederhier/ntfy]
@@ -110,6 +122,8 @@ upgrade_catalog:
     file: monitoring.yml
     role: monitoring
     containers: [ntfy]
+    verify:
+      - "curl -sf -m 5 http://127.0.0.1:{{ ntfy_port | default(2586) }}/v1/health | grep -q '\"healthy\":true'"
     state_paths: ["{{ ntfy_data_dir | default('/opt/monitoring/ntfy-data') }}"]   # sqlite (users, tokens, message cache), migrated by new versions
   blackbox_exporter:
     playbook: stack-upgrade.yml
@@ -118,6 +132,14 @@ upgrade_catalog:
     file: monitoring.yml
     role: monitoring
     containers: [blackbox]
+    verify:
+      # not published: Prometheus scrapes it on the container network — every target of the
+      # job must be "up" with a scrape AFTER the container (re)started (an old sample does not count)
+      - >-
+        python3 -c "import json,subprocess,urllib.request;
+        st=json.loads(subprocess.check_output(['docker','inspect','blackbox']))[0]['State']['StartedAt'][:19];
+        t=[x for x in json.load(urllib.request.urlopen('http://127.0.0.1:{{ prometheus_port | default(9090) }}/api/v1/targets?state=active'))['data']['activeTargets'] if x['labels']['job']=='blackbox'];
+        raise SystemExit(0 if t and all(x['health']=='up' and x['lastScrape'][:19]>st for x in t) else 1)"
   postgres_exporter:
     playbook: stack-upgrade.yml
     images: [quay.io/prometheuscommunity/postgres-exporter]
@@ -132,6 +154,14 @@ upgrade_catalog:
     file: monitoring.yml
     role: monitoring
     containers: [cadvisor]
+    verify:
+      # not published: Prometheus scrapes it on the container network — every target of the
+      # job must be "up" with a scrape AFTER the container (re)started (an old sample does not count)
+      - >-
+        python3 -c "import json,subprocess,urllib.request;
+        st=json.loads(subprocess.check_output(['docker','inspect','cadvisor']))[0]['State']['StartedAt'][:19];
+        t=[x for x in json.load(urllib.request.urlopen('http://127.0.0.1:{{ prometheus_port | default(9090) }}/api/v1/targets?state=active'))['data']['activeTargets'] if x['labels']['job']=='cadvisor'];
+        raise SystemExit(0 if t and all(x['health']=='up' and x['lastScrape'][:19]>st for x in t) else 1)"
   dozzle:
     playbook: stack-upgrade.yml
     images: [amir20/dozzle]
@@ -139,6 +169,8 @@ upgrade_catalog:
     file: dozzle.yml
     stack: dozzle
     containers: [dozzle]
+    verify:
+      - "curl -sf -m 5 -o /dev/null http://127.0.0.1:{{ dozzle_port | default(8095) }}/"
   headplane:
     playbook: stack-upgrade.yml
     images: [ghcr.io/tale/headplane]
@@ -147,6 +179,9 @@ upgrade_catalog:
     file: headplane.yml
     stack: headplane
     containers: [headplane]
+    verify:
+      # 2xx/3xx (the UI may redirect to its login) — a refused port or 5xx fails
+      - "curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:{{ headplane_port | default(8093) }}/admin/ | grep -qE '^[23]'"
   # --- file-based state: generic playbook + state copy --------------------------------------
   headscale:
     playbook: stack-upgrade.yml
@@ -156,6 +191,8 @@ upgrade_catalog:
     file: headscale.yml
     stack: headscale
     containers: [headscale]
+    verify:
+      - "curl -sf -m 5 -o /dev/null http://127.0.0.1:{{ headscale_port | default(8099) }}/health"
     state_paths: ["{{ headscale_data_dir | default('/opt/headscale') }}/data"]   # sqlite db + node keys of the tailnet
   acme_dns:
     playbook: stack-upgrade.yml
