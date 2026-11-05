@@ -75,9 +75,11 @@ dns:
     []
 {% endfor %}
 
-# ACL policy from a file (empty path = allow-all default; tighten later).
+# ACL policy: in headscale's database (editable in Headplane), seeded / enforced from the repo by
+# roles/headscale_bootstrap (headscale_policy, headscale_policy_enforce). mode file + empty path =
+# allow-all without a policy.
 policy:
-  mode: file
+  mode: {{ headscale_policy_mode | default('database') }}
   path: ""
 
 # TLS handled by Caddy -> leave headscale's own TLS OFF.

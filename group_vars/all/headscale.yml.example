@@ -121,3 +121,12 @@ headscale_keys_dir: "~/.ansible/headscale-keys"
 headscale_preauthkey_expiration: "8760h"     # 1 year
 # headplane API key lifetime.
 headscale_apikey_expiration: "8760h"         # 1 year
+
+# --- Exit node + ACL policy (roles/headscale_bootstrap, README "Tailscale VPN") ---
+# The server's own node is the tailnet's internet exit (devices choose it themselves).
+headscale_exit_node: true
+# The policy lives in headscale's database (edit it in Headplane). headscale_policy (role
+# defaults: everyone may reach the tailnet + use the exit node; the server's exit route is
+# auto-approved) is written only when there is none yet; true = the repo version on every run.
+# headscale_policy_enforce: false
+# headscale_policy: { acls: [...], autoApprovers: { exitNode: ["server@"] } }

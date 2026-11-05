@@ -62,5 +62,11 @@ data_domains:
   - { name: docker,     path: /var/lib/docker,     subdirs: [], snapshot: false, migrate_stop: [docker.socket, docker.service, containerd.service] }
   - { name: containerd, path: /var/lib/containerd, subdirs: [], snapshot: false, migrate_stop: [docker.socket, docker.service, containerd.service] }
 
+# Extra block devices (set per host in host_vars, e.g. btrfs_extra_devices: [/dev/vdb]) join the
+# ROOT btrfs (roles/data_storage/tasks/extra_devices.yml): one pool, data single, metadata raid1.
+# Empty devices and the rest of a previous install (old btrfs member, partner gone) are added
+# automatically; anything else stops — -e btrfs_extra_devices_wipe=YES wipes it.
+# btrfs_extra_devices: []
+
 # Daily snapshots per data domain, kept 14 days (manual + anchor snapshots are exempt).
 data_snapshot_timeline_daily: 14

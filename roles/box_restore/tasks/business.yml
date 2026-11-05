@@ -218,6 +218,23 @@
         mode: "0644"
       when: "'nextcloud' in _br_restore"
 
+    # ---- headscale: its ACL policy (Headplane edits) — users are declarative, devices log in again
+    - name: Headscale — the policy from the dump set
+      ansible.builtin.shell: >-
+        docker exec -i headscale headscale policy set -f /dev/stdin
+        < {{ box_restore_work_dir }}/{{ _br_set }}/headscale-policy.json
+      args: { executable: /bin/bash }
+      changed_when: true
+      when: "'headscale' in _br_restore"
+
+    - name: Headscale — restored once on this host
+      ansible.builtin.copy:
+        dest: "{{ box_restore_state_dir }}/headscale.done"
+        content: "{{ {'set': _br_set, 'time': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')} | to_nice_json }}
+"
+        mode: "0644"
+      when: "'headscale' in _br_restore"
+
     # A big restore is a new starting point: take a PITR anchor right away (when PITR is set
     # up already — on a fresh server roles/postgres_pitr takes the first one later this run).
     - name: Fresh PITR base backup of the business instance

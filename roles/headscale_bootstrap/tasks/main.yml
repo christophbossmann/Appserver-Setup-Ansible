@@ -153,6 +153,37 @@
       when: not (_hs_apicreate.skipped | default(false))
       no_log: true
 
+    # ---- ACL policy: seed (no policy yet) or enforce (headscale_policy_enforce) -------------
+    - name: The policy headscale has now
+      ansible.builtin.command: docker exec headscale headscale policy get
+      register: _hs_pol
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: headscale_policy_mode | default('database') == 'database'
+
+    - name: Write the repo policy (none yet, or headscale_policy_enforce)
+      ansible.builtin.command:
+        argv: [docker, exec, -i, headscale, headscale, policy, set, -f, /dev/stdin]
+        stdin: "{{ headscale_policy | to_nice_json }}"
+      register: _hs_pol_set
+      changed_when: true
+      when:
+        - headscale_policy_mode | default('database') == 'database'
+        # no policy yet = anything that is not a JSON object ("Error: loading ACL policy …", empty, {})
+        - (headscale_policy_enforce | bool)
+          or _hs_pol.rc != 0
+          or not ((_hs_pol.stdout | default('') | trim).startswith('{'))
+          or (_hs_pol.stdout | default('') | trim | regex_replace('\\s', '')) == '{}'
+        - (_hs_pol.stdout | default('') | trim | regex_replace('\\s', '')) != (headscale_policy | to_json | regex_replace('\\s', ''))
+
+    - name: Policy
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Written from the repo (' ~ ('enforced' if (headscale_policy_enforce | bool) else 'there was none yet') ~ ')'
+             if (_hs_pol_set is changed) else 'Kept as it is in headscale (edit in Headplane; enforce: -e headscale_policy_enforce=true)' }}
+      when: headscale_policy_mode | default('database') == 'database'
+
     - name: Headscale bootstrap ready
       ansible.builtin.debug:
         msg: >-

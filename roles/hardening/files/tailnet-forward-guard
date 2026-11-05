@@ -1,0 +1,20 @@
+#!/bin/sh
+# Managed by Ansible (roles/hardening) — tailnet forward guard (see the task in roles/hardening).
+#   tailnet-forward-guard start|stop
+# Forwarded traffic that comes in on tailscale0 may only leave through the public interface
+# (read from the default route, or TAILNET_GUARD_IF). mangle/FORWARD runs before filter, so this
+# holds whatever order tailscaled / docker / ufw put their filter chains in. Any older guard
+# rule (e.g. for an interface name that changed) is removed first, so the rule exists once.
+set -eu
+mode="${1:-start}"
+IF="${TAILNET_GUARD_IF:-$(ip -4 route show default | awk '{print $5; exit}')}"
+for t in iptables ip6tables; do
+  $t -t mangle -S FORWARD | grep -- '-i tailscale0 ' | sed 's/^-A //' | while read -r rule; do
+    # shellcheck disable=SC2086
+    $t -t mangle -D $rule
+  done
+  [ "$mode" = stop ] && continue
+  [ -n "$IF" ] || { echo "tailnet-forward-guard: no default route — cannot tell the public interface" >&2; exit 1; }
+  $t -t mangle -I FORWARD 1 -i tailscale0 ! -o "$IF" -j DROP
+done
+[ "$mode" = stop ] && echo "guard removed" || echo "guard: forwarded tailnet traffic only out via $IF"

@@ -34,6 +34,36 @@
     quiet: true
   when: _stor_req | bool
 
+# Extra block devices join the root btrfs first, so everything below already has the space.
+- name: Extra block devices for the root btrfs
+  ansible.builtin.include_tasks: extra_devices.yml
+  loop: "{{ btrfs_extra_devices | default([]) }}"
+  loop_control: { loop_var: _xdev }
+  when:
+    - _stor_is_btrfs | bool
+    - (btrfs_extra_devices | default([])) | length > 0
+
+# With 2+ devices the metadata goes from DUP (twice on one device) to raid1 (once on each) —
+# same space, survives either device. A one-time balance of the metadata only (minutes).
+- name: Metadata raid1 across the devices (once)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    n="$(btrfs filesystem show / | grep -c 'devid')"
+    prof="$(btrfs filesystem df / | awk -F'[,:]' '/^Metadata/ {gsub(/ /, "", $2); print $2}')"
+    if [ "$n" -ge 2 ] && [ "$prof" != RAID1 ]; then
+      {% if ansible_check_mode %}echo "WOULD CONVERT metadata $prof -> raid1"{% else %}btrfs balance start -mconvert=raid1,soft / >/dev/null; echo "CONVERTED metadata $prof -> raid1"{% endif %}
+    else
+      echo "OK metadata $prof on $n device(s)"
+    fi
+  args:
+    executable: /bin/bash
+  register: _stor_meta
+  changed_when: "'CONVERTED' in _stor_meta.stdout"
+  check_mode: false
+  when:
+    - _stor_is_btrfs | bool
+    - (btrfs_extra_devices | default([])) | length > 0
+
 - name: Ensure the base data root exists
   ansible.builtin.file:
     path: "{{ data_root }}"

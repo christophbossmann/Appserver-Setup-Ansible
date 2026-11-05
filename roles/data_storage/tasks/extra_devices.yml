@@ -1,0 +1,58 @@
+---
+# Extra block devices (btrfs_extra_devices, host_vars) become part of the ROOT btrfs: one pool,
+# every subvolume (root, data volumes, docker, cache, archive) grows with it — no new mounts,
+# no decisions which data goes where. Data stays `single` (spread over the devices), metadata
+# is converted to `raid1` once (on both devices instead of twice on one).
+#
+# Per device, decided on the spot:
+#   member of the running root btrfs                 nothing to do
+#   empty (no signature, no partitions)              added
+#   a member of an OLD btrfs whose other devices      the rest of a previous install (the system
+#   are missing, not mounted                          disk was reinstalled): wiped + added — no
+#                                                     switch needed, nothing on it is readable
+#   anything else (a complete foreign btrfs, ext4,    STOP — only -e btrfs_extra_devices_wipe=YES
+#   partitions, mounted)                              wipes it (never a mounted one or a member)
+# Never changes anything in check mode.
+- name: "Extra device {{ _xdev }} for the root btrfs"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    D='{{ _xdev }}'
+    CHECK='{{ ansible_check_mode | ternary("yes", "no") }}'
+    FORCE='{{ ((btrfs_extra_devices_wipe | default("")) == "YES") | ternary("yes", "no") }}'
+    [ -b "$D" ] || { echo "FAILED: $D is not a block device (booked + attached? name changed?)"; exit 1; }
+    ROOT_UUID="$(findmnt -no UUID /)"
+    TYPE="$(blkid -p -s TYPE -o value "$D" 2>/dev/null || true)"
+    UUID="$(blkid -p -s UUID -o value "$D" 2>/dev/null || true)"
+
+    if [ "$TYPE" = btrfs ] && [ "$UUID" = "$ROOT_UUID" ]; then echo "MEMBER $D"; exit 0; fi
+    if findmnt -rn -S "$D" >/dev/null 2>&1; then echo "FAILED: $D is mounted ($(findmnt -rn -S "$D" -o TARGET | head -1)) — left alone"; exit 1; fi
+
+    parts="$(lsblk -nro NAME "$D" | tail -n +2 | wc -l)"
+    sigs="$(wipefs -n "$D" 2>/dev/null | tail -n +2 | wc -l)"
+    why=""
+    if [ "$parts" = 0 ] && [ "$sigs" = 0 ]; then
+      what=empty
+    elif [ "$TYPE" = btrfs ] && [ "$parts" = 0 ] && btrfs filesystem show "$UUID" 2>&1 | grep -qi 'missing'; then
+      what=stale; why="member of the old btrfs $UUID whose other device(s) are gone (previous install)"
+    elif [ "$FORCE" = yes ]; then
+      what=forced; why="type=${TYPE:-?} partitions=$parts signatures=$sigs, wiped on request (btrfs_extra_devices_wipe=YES)"
+    else
+      echo "FAILED: $D is not empty and not the rest of a previous install: type=${TYPE:-unknown} uuid=${UUID:--} partitions=$parts signatures=$sigs."
+      echo "Look at it first; to wipe it and add it anyway: -e btrfs_extra_devices_wipe=YES"
+      exit 1
+    fi
+    if [ "$CHECK" = yes ]; then echo "WOULD ADD $D ($what${why:+: $why})"; exit 0; fi
+
+    [ "$what" = empty ] || wipefs -a "$D" >/dev/null
+    btrfs device add "$D" / >/dev/null
+    echo "ADDED $D ($what${why:+: $why})"
+  args:
+    executable: /bin/bash
+  register: _xdev_res
+  changed_when: "'ADDED' in _xdev_res.stdout"
+  check_mode: false
+
+- name: "Extra device {{ _xdev }}: result"
+  ansible.builtin.debug:
+    msg: "{{ _xdev_res.stdout_lines }}"
+  when: "'MEMBER' not in _xdev_res.stdout"

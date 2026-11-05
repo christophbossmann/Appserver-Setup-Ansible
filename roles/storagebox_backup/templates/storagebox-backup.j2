@@ -80,6 +80,17 @@ PY
     echo "saved nextcloud config values"
   fi
 {% endif %}
+{% if storagebox_backup_headscale_policy | bool %}
+  # Headscale's ACL policy lives in its database (edited in Headplane) — the one piece of it a
+  # rebuild should keep (users are declarative, devices simply log in again).
+  if [ -n "$(docker ps -q --filter name=^headscale$)" ] \
+     && docker exec headscale headscale policy get > "$dir/headscale-policy.json" 2>/dev/null \
+     && [ -s "$dir/headscale-policy.json" ]; then
+    chmod 600 "$dir/headscale-policy.json"; echo "saved headscale policy"
+  else
+    rm -f "$dir/headscale-policy.json"
+  fi
+{% endif %}
   "${RCLONE[@]}" copy "$dir" "$REMOTE/db-dumps/$stamp" --transfers 4
   "${RCLONE[@]}" check "$dir" "$REMOTE/db-dumps/$stamp" --one-way 2>&1 | tail -1
   # only now, with the new set safely on the box, drop the oldest ones

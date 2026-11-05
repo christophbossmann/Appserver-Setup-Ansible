@@ -41,6 +41,8 @@ storagebox_backup_dump_workdir: "{{ backup_dump_dir | default('/opt/backups') }}
 # what a restore of Nextcloud needs besides its database. Holds secrets: only onto an
 # encrypted target (storagebox_backup_remote = an rclone crypt remote).
 storagebox_backup_nextcloud_config: "{{ storagebox_backup_remote | default('') | length > 0 }}"
+# With each set: headscale-policy.json (the ACL policy from headscale's database, Headplane edits).
+storagebox_backup_headscale_policy: "{{ storagebox_backup_remote | default('') | length > 0 }}"
 # name = file name on the box; container/user/db = where pg_dump runs.
 storagebox_backup_databases:
   - { name: authentik, container: authentik-postgres, user: authentik, db: authentik }

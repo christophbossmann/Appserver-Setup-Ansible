@@ -721,6 +721,72 @@
   when: hardening_docker_ufw_compat | default(true) | bool
   notify: Reload UFW
 
+# Tailnet forward guard. tailscaled puts its own ts-forward chain FIRST in filter/FORWARD and
+# accepts every packet coming in on tailscale0 — whatever its destination, before DOCKER-USER and
+# UFW. As soon as this node routes anything for the tailnet (an exit node, or routes advertised
+# by hand), a device could reach the containers' private addresses (172.x, every port, the
+# databases too). The mangle table runs before filter, so this rule holds regardless of chain
+# order and of tailscale / ufw restarts: forwarded tailnet traffic may ONLY leave through the
+# public interface. Always on (harmless without forwarding); off only for a host that is meant
+# to be a subnet router (hardening_tailnet_forward_guard: false).
+- name: Tailnet forward guard (forwarded tailnet traffic only out to the internet)
+  vars:
+    _xg_on: "{{ hardening_tailnet_forward_guard | default(true) | bool }}"
+  block:
+    # the public interface is read from the default route when the unit starts (not from Ansible
+    # facts — they are not always gathered here); hardening_public_interface pins it
+    - name: Tailnet forward guard script
+      ansible.builtin.copy:
+        src: tailnet-forward-guard
+        dest: /usr/local/sbin/tailnet-forward-guard
+        mode: "0755"
+      register: _xg_script
+      when: _xg_on | bool
+
+    - name: Tailnet forward guard unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/tailscale-exit-guard.service
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/hardening) — see the task "Tailnet forward guard"
+          [Unit]
+          Description=Tailnet forward guard: forwarded tailnet traffic only out to the internet
+          Wants=network-online.target
+          After=network-online.target
+          Before=tailscaled.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          {% if hardening_public_interface is defined %}
+          Environment=TAILNET_GUARD_IF={{ hardening_public_interface }}
+          {% endif %}
+          ExecStart=/usr/local/sbin/tailnet-forward-guard start
+          ExecStop=/usr/local/sbin/tailnet-forward-guard stop
+
+          [Install]
+          WantedBy=multi-user.target
+      register: _xg_unit
+      when: _xg_on | bool
+
+    - name: Tailnet forward guard active
+      ansible.builtin.systemd:
+        name: tailscale-exit-guard.service
+        enabled: true
+        state: "{{ 'restarted' if (_xg_unit is changed or _xg_script is changed) else 'started' }}"
+        daemon_reload: "{{ _xg_unit is changed }}"
+      when:
+        - _xg_on | bool
+        - not ansible_check_mode
+
+    - name: Guard switched off (hardening_tailnet_forward_guard false) — unit stopped, rule removed
+      ansible.builtin.systemd:
+        name: tailscale-exit-guard.service
+        enabled: false
+        state: stopped
+      failed_when: false
+      when: not (_xg_on | bool)
+
 - name: Enable UFW
   community.general.ufw:
     state: enabled

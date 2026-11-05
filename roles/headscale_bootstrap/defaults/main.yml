@@ -1,0 +1,24 @@
+---
+# Exit node: this host's own tailscale node (roles/tailscale_enrol) offers itself as the
+# tailnet's way into the internet (devices pick it: `tailscale set --exit-node=<host>` or in
+# the app). Its route is approved by the policy below (autoApprovers), the firewall lets the
+# forwarded traffic out to the internet only (roles/hardening) — not into the docker networks.
+headscale_exit_node: false
+
+# ACL policy — headscale keeps it in its DATABASE (headscale_policy_mode), so it can be edited in
+# Headplane. headscale_policy is the starting point: written when headscale has none yet (a new
+# install); afterwards Headplane's version stays. headscale_policy_enforce: true writes the repo
+# version on every run (Headplane edits are overwritten) — one-off: -e headscale_policy_enforce=true.
+# Every dump set on the Storage Box carries the live policy (headscale-policy.json); a restore
+# (restore_apps=headscale:RESTORE) puts it back.
+headscale_policy_mode: database
+headscale_policy_enforce: false
+headscale_policy:
+  acls:
+    # everyone in the tailnet reaches everything in it (as before) ...
+    - { action: accept, src: ["*"], dst: ["*:*"] }
+    # ... and may use an exit node (internet through it)
+    - { action: accept, src: ["*"], dst: ["autogroup:internet:*"] }
+  # the server's exit-node route needs no manual approval
+  autoApprovers:
+    exitNode: ["{{ headscale_server_enrol_user | default('server') }}@"]

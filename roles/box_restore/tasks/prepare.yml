@@ -4,13 +4,14 @@
     that:
       - restore_confirm | default('') == 'YES'
       - _br_modes | length > 0
-      - _br_modes.keys() | list | difference(['immich', 'nextcloud', 'authentik']) | length == 0
+      - _br_modes.keys() | list | difference(['immich', 'nextcloud', 'authentik', 'headscale']) | length == 0
+      - (_br_modes.headscale | default('RESTORE')) == 'RESTORE'
       - _br_modes.values() | list | difference(['FRESH', 'RESTORE']) | length == 0
       - storagebox_enabled | default(false) | bool
       - _br_crypt | length > 0
     fail_msg: >-
-      restore_apps needs <app>:<MODE> pairs without spaces — apps immich, nextcloud, authentik;
-      modes FRESH, RESTORE (got {{ _br_modes }}) — plus -e restore_confirm=YES and the Storage Box
+      restore_apps needs <app>:<MODE> pairs without spaces — apps immich, nextcloud, authentik,
+      headscale (RESTORE only: its ACL policy); modes FRESH, RESTORE (got {{ _br_modes }}) — plus -e restore_confirm=YES and the Storage Box
       with its rclone crypt remote on this host.
 
 - name: The app's box layout must be the encrypted one
@@ -76,8 +77,10 @@
 
     - name: Every restored app needs its dump in the set
       ansible.builtin.assert:
-        that: (_br_restore | map('regex_replace', '$', '.dump') | difference(_br_files.stdout_lines)) | length == 0
-        fail_msg: "Dump set {{ _br_set }} lacks {{ _br_restore | map('regex_replace', '$', '.dump') | difference(_br_files.stdout_lines) }}"
+        that: (_br_need | difference(_br_files.stdout_lines)) | length == 0
+        fail_msg: "Dump set {{ _br_set }} lacks {{ _br_need | difference(_br_files.stdout_lines) }}"
+      vars:
+        _br_need: "{{ _br_restore | reject('equalto', 'headscale') | map('regex_replace', '$', '.dump') | list + (['headscale-policy.json'] if 'headscale' in _br_restore else []) }}"
 
     - name: Plan
       ansible.builtin.debug:
@@ -90,8 +93,9 @@
       ansible.builtin.command:
         argv: >-
           {{ _br_rclone + ['copy', _br_backup ~ '/db-dumps/' ~ _br_set, box_restore_work_dir ~ '/' ~ _br_set]
-             + (_br_restore | map('regex_replace', '$', '.dump') | map('regex_replace', '^', '--include=') | list)
-             + (['--include=nextcloud-config.json'] if 'nextcloud' in _br_restore else []) }}
+             + (_br_restore | reject('equalto', 'headscale') | map('regex_replace', '$', '.dump') | map('regex_replace', '^', '--include=') | list)
+             + (['--include=nextcloud-config.json'] if 'nextcloud' in _br_restore else [])
+             + (['--include=headscale-policy.json'] if 'headscale' in _br_restore else []) }}
       changed_when: true
 
     - name: Dump dir readable by root only

@@ -113,3 +113,18 @@
           (tailscale ip -4 = '{{ _ts_enrol_prefix_ip.stdout | default('') | trim }}'). Headscale may be
           down or the pre-auth key invalid — the .int convergence would derive empty records.
         quiet: true
+
+    # Exit node (headscale_exit_node, roles/headscale_bootstrap): offer / stop offering this node
+    # as the tailnet's internet exit. The policy's autoApprovers approve the route; the firewall
+    # rule for the forwarded traffic is roles/hardening's.
+    - name: Does this node offer itself as exit node?
+      ansible.builtin.shell: |
+        tailscale debug prefs 2>/dev/null | python3 -c 'import json,sys; r=json.load(sys.stdin).get("AdvertiseRoutes") or []; print("yes" if "0.0.0.0/0" in r else "no")'
+      register: _ts_exit
+      changed_when: false
+      check_mode: false
+
+    - name: "Exit node: {{ 'offer' if (headscale_exit_node | default(false) | bool) else 'stop offering' }}"
+      ansible.builtin.command: "tailscale set --advertise-exit-node={{ (headscale_exit_node | default(false) | bool) | lower }}"
+      changed_when: true
+      when: (_ts_exit.stdout | trim == 'yes') != (headscale_exit_node | default(false) | bool)

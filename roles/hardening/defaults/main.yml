@@ -163,3 +163,8 @@ apt_lock_wait_seconds: 300
 # system_hostname; hardening_set_hostname: false leaves the installer's name alone.
 hardening_set_hostname: true
 system_hostname: "{{ inventory_hostname | lower | replace('_', '-') }}"
+
+# Forwarded tailnet traffic (in on tailscale0) may only leave through the public interface —
+# never into the docker networks (tailscaled's own chain would accept it, see the task). Set it
+# false only for a host meant to be a subnet router.
+hardening_tailnet_forward_guard: true

@@ -190,6 +190,20 @@ and to make selected services reachable **only** over the VPN.
   hardening role's `hardening_ufw_full_access_ranges` for defence in depth.
 - Every service container binds `127.0.0.1` — the only ways in are the Caddy route
   (tailscale) or an SSH tunnel (`ssh -L <port>:127.0.0.1:<port> ansible@<host>`).
+- **Exit node** (`headscale_exit_node: true`, roles/headscale_bootstrap + tailscale_enrol): the
+  server offers itself as its tailnet's way into the internet — pick it on a device
+  (`tailscale set --exit-node=<host>` or in the app) and the traffic leaves with the server's IP.
+  Who may use it is the headscale **policy**: kept in headscale's database, so it can be edited in
+  **Headplane**; `headscale_policy` in the repo is only the starting point (written when there is
+  none yet) — `headscale_policy_enforce: true` writes the repo version on every run. The live
+  policy is saved with every dump set on the Storage Box (`restore_apps=headscale:RESTORE`).
+  IPv4 only (IPv6 forwarding stays off).
+- **Tailnet forward guard** (roles/hardening, always on): tailscaled's own `ts-forward` chain
+  accepts every forwarded packet from `tailscale0` before docker/UFW see it — a mangle rule lets
+  forwarded tailnet traffic leave ONLY through the public interface, never into the docker
+  networks. The headscale policy already refuses private targets through an exit node (the
+  internet is `autogroup:internet`, which excludes private ranges); the guard is the second
+  layer. Off only for a host meant to be a subnet router (`hardening_tailnet_forward_guard: false`).
 
 ---
 
@@ -343,6 +357,9 @@ ansible-playbook playbooks/server-all.yml --limit <host> \
   mode. Without the switch, a rebuilt server stops before the Nextcloud install when the box
   already holds Nextcloud data. Encoded videos are not on the box — immich rebuilds them
   (Job Queues → Transcode Videos → Missing).
+- Extra local block storage (`btrfs_extra_devices`, host_vars) joins the root btrfs. After a
+  reinstall of the system disk it carries the rest of the OLD filesystem — recognised (its partner
+  is missing) and wiped + added again automatically; anything else on it stops the run.
 - **Testing it with another host's state** (e.g. PROD's on DEV): copy that host's folder into
   this host's folder on the box first — encrypted bytes, one key pair for the whole box —
   then restore as usual, the same path as a real disaster recovery:
